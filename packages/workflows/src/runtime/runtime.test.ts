@@ -5,6 +5,7 @@ import {
 	type EngineClient,
 } from "@drawers/core";
 import { createWorkflowRun } from "./index";
+import { createSchemaRegistry } from "./structured/registry";
 import type { ProgressEvent } from "./types";
 
 /**
@@ -163,6 +164,33 @@ describe("createWorkflowRun — cores → gate-limit math (floor at 1)", () => {
 
 	test("cores=1 → still floored at 1", () => {
 		expect(limitForCores(1)).toBe(1);
+	});
+});
+
+describe("createWorkflowRun — registry injection", () => {
+	test("an injected registry IS the run's registry (no new instance created)", () => {
+		const registry = createSchemaRegistry();
+		const run = createWorkflowRun({
+			runner: makeRunner(),
+			parentSessionID: "ses_p",
+			runId: "run_reg",
+			registry,
+		});
+		expect(run.registry).toBe(registry);
+	});
+
+	test("without an injected registry, the run creates and exposes its own", () => {
+		const run = createWorkflowRun({
+			runner: makeRunner(),
+			parentSessionID: "ses_p",
+			runId: "run_default_reg",
+		});
+		// Behaves like a real registry: round-trips a stored value.
+		run.registry.store("ses_child", { v: 1 });
+		expect(run.registry.resultFor("ses_child")).toEqual({
+			present: true,
+			value: { v: 1 },
+		});
 	});
 });
 

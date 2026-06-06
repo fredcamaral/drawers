@@ -51,4 +51,15 @@ describe("createIdGenerator", () => {
 		}
 		expect(live.size).toBe(10_000);
 	});
+
+	test("honors a custom prefix when supplied", () => {
+		const gen = createIdGenerator({ prefix: "wf_" });
+		const id = gen.next(new Set());
+		expect(id).toMatch(/^wf_[a-z0-9]{8}$/);
+	});
+
+	test("defaults to the bg_ prefix when none supplied", () => {
+		const gen = createIdGenerator({});
+		expect(gen.next(new Set())).toMatch(/^bg_[a-z0-9]{8}$/);
+	});
 });

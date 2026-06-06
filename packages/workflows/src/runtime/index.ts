@@ -61,6 +61,14 @@ export interface WorkflowRunDeps {
 	 * captures each settled non-null live result for the new journal.
 	 */
 	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
+	/**
+	 * Structured-output schema/result registry. When provided (Phase 4: a single
+	 * plugin-level registry behind the global `structured_output` tool, shared
+	 * across concurrent runs since sessionIDs are globally unique), the run uses
+	 * THIS instance instead of minting its own — and `run.registry` returns it.
+	 * Absent: the run creates its own (the standalone Phase 3 behavior).
+	 */
+	registry?: SchemaRegistry;
 }
 
 /** The terminal outcome of a workflow run (spec §2.3, §3.3). */
@@ -137,9 +145,10 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 
 	const budget = deps.budget ?? defaultBudget();
 
-	// One schema/result registry per run, shared by the agent primitive and (in
-	// Phase 4) the global structured_output tool.
-	const registry = createSchemaRegistry();
+	// One schema/result registry, shared by the agent primitive and the global
+	// structured_output tool. Phase 4 injects a plugin-level registry shared across
+	// runs; absent, the run owns a standalone one (Phase 3 behavior).
+	const registry = deps.registry ?? createSchemaRegistry();
 
 	// The real agent primitive over the core runner.
 	const innerAgent = createAgentPrimitive({

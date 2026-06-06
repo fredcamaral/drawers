@@ -593,7 +593,7 @@ interface SessionRunner {
 
 #### Task 4.1.2: Plugin shell, engine assembly, run store, global structured_output
 
-- [ ] Done
+- [x] Done — strict TDD. Deviations: engine constructor is SYNC + `ready(): Promise<void>` recovery seam (startRun/dispose await it internally — closes the statusOf-vs-unfinished-load race); `stopRun` landed early (trivial via the settle path); two documented RunRecord⇄BgTask widenings (store + queue read only the minimal validated shape); queue `renderHint` overridden to point at `workflow_status`; core ids.ts gained `prefix?` (default "bg_" — additive).
 
 **Context:** Mirror the background-agents plugin shape (`packages/background-agents/src/index.ts` + `engine.ts:86-164`). Core pieces all exist: `adaptSdkClient`, `createSessionRunner`, `createTaskStore` (generic — validates only id/parentSessionID/status, persistence.ts:104-126), `createNotificationQueue`. Library: `createWorkflowRun` (runtime/index.ts:43-85). Deviation (a): plugin entry is `src/plugin/index.ts` with the SINGLE export `WorkflowsPlugin: Plugin`.
 

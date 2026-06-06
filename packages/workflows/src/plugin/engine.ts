@@ -1,0 +1,446 @@
+/**
+ * Engine factory for the workflows plugin (Task 4.1.2).
+ *
+ * `createWorkflowEngine` assembles the collaborators a workflow host needs into
+ * one wired unit:
+ *   - a core {@link SessionRunner} over the adapted SDK client, configured with
+ *     an UNLIMITED {@link ConcurrencyManager} (`defaultConcurrency: 0`) — the
+ *     per-run workflow gate inside {@link createWorkflowRun} is the authoritative
+ *     limiter (elaboration deviation e), so the runner must not double-cap;
+ *   - a {@link createTaskStore} for the runner's child tasks at
+ *     `<dataDir>/workflow-tasks`;
+ *   - a SECOND {@link createTaskStore} for {@link RunRecord}s at
+ *     `<dataDir>/workflow-runs` (the store validates only id/parentSessionID/
+ *     status, so the wider RunRecord round-trips through one documented widening);
+ *   - ONE {@link createSchemaRegistry} shared across every run, behind the single
+ *     global `structured_output` tool the plugin entry registers;
+ *   - a {@link createNotificationQueue} whose `markNotified` persists the flag
+ *     through the run store, seeded from recovered terminal records.
+ *
+ * `startRun` persists the script source, creates+persists a `running` record,
+ * fires `run.run(source)` DETACHED, and returns `{ runId, scriptPath, name }`
+ * IMMEDIATELY — the parent is never blocked. On settle the record is updated and
+ * a terminal {@link TaskNotice} is pushed into the queue.
+ *
+ * Startup recovery: records left `running` by a dead process flip to
+ * `error("interrupted by restart")` (children are NOT relaunched); terminal
+ * records seed the notification queue and stay readable via `statusOf`.
+ */
+
+import { dirname, join } from "node:path";
+import {
+	type Clock,
+	ConcurrencyManager,
+	createIdGenerator,
+	createNotificationQueue,
+	createSessionRunner,
+	createTaskStore,
+	type EngineClient,
+	type FsFacade,
+	type IdGenerator,
+	type NotificationQueue,
+	type SessionRunner,
+	type TaskNotice,
+	type TaskStore,
+} from "@drawers/core";
+import { createWorkflowRun, type WorkflowRun } from "../runtime/index";
+import { parseScript } from "../runtime/meta";
+import {
+	createSchemaRegistry,
+	type SchemaRegistry,
+} from "../runtime/structured/registry";
+import type { ProgressEvent } from "../runtime/types";
+
+/** Structured logger surface — `client.app.log`-backed in the plugin entry. */
+export interface EngineLogger {
+	debug(msg: string, meta?: Record<string, unknown>): void;
+	info(msg: string, meta?: Record<string, unknown>): void;
+	warn(msg: string, meta?: Record<string, unknown>): void;
+	error(msg: string, meta?: Record<string, unknown>): void;
+}
+
+/** Terminal-or-live status of a workflow run. */
+export type RunStatus = "running" | "completed" | "error" | "cancelled";
+
+/**
+ * The persisted record of one workflow run. Stored through {@link createTaskStore},
+ * whose validation only requires `id`/`parentSessionID`/`status` — the remaining
+ * fields ride along verbatim (the store serializes the whole object). The store's
+ * type is `BgTask`, so save/load cross ONE documented widening (see {@link RunStore}).
+ */
+export interface RunRecord {
+	id: string;
+	parentSessionID: string;
+	status: RunStatus;
+	description: string;
+	createdAt: number;
+	completedAt?: number;
+	scriptPath: string;
+	args?: unknown;
+	returnValue?: unknown;
+	error?: string;
+	agentCount?: number;
+}
+
+/** In-memory handle for a run: live run (absent for recovered records), record, progress. */
+export interface RunHandle {
+	run?: WorkflowRun;
+	record: RunRecord;
+	progress: ProgressEvent[];
+}
+
+/** Arguments to launch a run. */
+export interface StartRunArgs {
+	source: string;
+	args?: unknown;
+	parentSessionID: string;
+}
+
+/** What `startRun` returns synchronously (before the run settles). */
+export interface StartRunResult {
+	runId: string;
+	scriptPath: string;
+	name: string;
+}
+
+export interface CreateWorkflowEngineOptions {
+	/** The engine's structural SDK surface (already wrapped with adaptSdkClient). */
+	client: EngineClient;
+	/** Project directory; saved-workflow lookup (`.opencode/workflows`) lands in 4.1.3. */
+	directory: string;
+	/**
+	 * Persistence base dir. Resolution: explicit `dataDir` →
+	 * `$OPENCODE_DRAWERS_DATA_DIR` → XDG default, namespaced for workflows.
+	 */
+	dataDir?: string;
+	/** Toast callback for terminal notices. */
+	onNotify?: (notice: TaskNotice) => void;
+	logger?: EngineLogger;
+	/** Injectable fs facade for both stores + script files; tests pass in-memory. */
+	fs?: FsFacade;
+	/** Injectable clock; defaults to `Date.now`. */
+	clock?: Clock;
+	/** Injectable runId generator; defaults to a `wf_`-prefixed core generator. */
+	ids?: IdGenerator;
+}
+
+export interface WorkflowEngine {
+	/** Live + recovered run handles, keyed by runId. */
+	runs: Map<string, RunHandle>;
+	/** The run-record persistence store. */
+	runStore: RunStore;
+	/** The per-parent terminal-notice queue. */
+	queue: NotificationQueue;
+	/** The ONE schema registry behind the global structured_output tool. */
+	registry: SchemaRegistry;
+	/** Resolves once startup recovery has been applied + the queue seeded. */
+	ready(): Promise<void>;
+	/** Persist the script, create the record, fire the run detached; returns immediately. */
+	startRun(args: StartRunArgs): Promise<StartRunResult>;
+	/** Abort a live run, flip its record to cancelled, queue a notice. */
+	stopRun(runId: string): void;
+	/** Snapshot of a run handle (record + progress), or undefined when unknown. */
+	statusOf(runId: string): RunHandle | undefined;
+	/** Forward an SDK event to the runner's completion gate. */
+	handleEvent(
+		event: Parameters<SessionRunner["handleEvent"]>[0],
+	): Promise<void>;
+	/** Drain every store + the runner. Call before process exit. */
+	dispose(): Promise<void>;
+}
+
+/**
+ * The run-record store: a typed wrapper around a core {@link TaskStore}. The
+ * single documented widening lives here — a {@link RunRecord} is NOT a `BgTask`,
+ * but the store only validates id/parentSessionID/status (all present on a record)
+ * and serializes the whole object, so the extra fields round-trip intact.
+ */
+interface RunStore {
+	save(record: RunRecord): Promise<void>;
+	load(): Promise<RunRecord[]>;
+	dispose(): Promise<void>;
+}
+
+const RUN_PREFIX = "wf_";
+const SUBDIR_TASKS = "workflow-tasks";
+const SUBDIR_RUNS = "workflow-runs";
+const SUBDIR_SCRIPTS = "workflow-scripts";
+
+const defaultClock: Clock = { now: () => Date.now() };
+
+/** Resolve the base data dir: explicit → env → undefined (store's XDG default). */
+function resolveDataDir(explicit?: string): string | undefined {
+	if (explicit !== undefined) {
+		return explicit;
+	}
+	const env = process.env.OPENCODE_DRAWERS_DATA_DIR;
+	return env && env.length > 0 ? env : undefined;
+}
+
+/** Cheap meta-name extraction: parse JUST for the name, fall back to "workflow". */
+function extractName(source: string): string {
+	try {
+		return parseScript(source).meta.name;
+	} catch {
+		return "workflow";
+	}
+}
+
+/** The retrieval hint naming the workflow_status tool for a run. */
+function runHint(runId: string): string {
+	return `workflow_status run_id=${runId} for the result`;
+}
+
+/** Wrap a core TaskStore as a typed RunStore (the one documented widening). */
+function createRunStore(opts: {
+	baseDir?: string;
+	fs?: FsFacade;
+	clock: Clock;
+	logger?: EngineLogger;
+}): RunStore {
+	const storeLogger = opts.logger
+		? {
+				debug: (msg: string, meta?: Record<string, unknown>) =>
+					opts.logger?.debug(msg, meta),
+				error: (msg: string, meta?: Record<string, unknown>) =>
+					opts.logger?.error(msg, meta),
+			}
+		: undefined;
+	const store: TaskStore = createTaskStore({
+		baseDir: opts.baseDir,
+		fs: opts.fs,
+		clock: opts.clock,
+		logger: storeLogger,
+	});
+	return {
+		// RunRecord carries id/parentSessionID/status (the store's only validated
+		// fields) plus extra fields the store serializes verbatim. Widen across the
+		// BgTask-typed surface here, once.
+		save: (record) =>
+			store.save(record as unknown as Parameters<TaskStore["save"]>[0]),
+		load: async () => (await store.load()) as unknown as RunRecord[],
+		dispose: () => store.dispose(),
+	};
+}
+
+export function createWorkflowEngine(
+	opts: CreateWorkflowEngineOptions,
+): WorkflowEngine {
+	const clock = opts.clock ?? defaultClock;
+	const fs = opts.fs;
+	const logger = opts.logger;
+	const base = resolveDataDir(opts.dataDir);
+	const ids = opts.ids ?? createIdGenerator({ prefix: RUN_PREFIX });
+
+	const subdir = (name: string) => (base ? join(base, name) : undefined);
+	const scriptsDir = subdir(SUBDIR_SCRIPTS);
+
+	const storeLogger = logger
+		? {
+				debug: (msg: string, meta?: Record<string, unknown>) =>
+					logger.debug(msg, meta),
+				error: (msg: string, meta?: Record<string, unknown>) =>
+					logger.error(msg, meta),
+			}
+		: undefined;
+
+	// (1) The child-task store + the unlimited runner (deviation e: the workflow
+	// gate inside each run is authoritative, so the runner must NOT cap).
+	const taskStore = createTaskStore({
+		baseDir: subdir(SUBDIR_TASKS),
+		fs,
+		clock,
+		logger: storeLogger,
+	});
+	const runner = createSessionRunner({
+		client: opts.client,
+		concurrency: new ConcurrencyManager({ defaultConcurrency: 0 }),
+		ids: createIdGenerator(),
+		clock,
+		persist: (task) => taskStore.save(task),
+		logger: storeLogger,
+	});
+
+	// (2) The run-record store + ONE shared registry.
+	const runStore = createRunStore({
+		baseDir: subdir(SUBDIR_RUNS),
+		fs,
+		clock,
+		logger,
+	});
+	const registry = createSchemaRegistry();
+
+	// (3) In-memory run handles, keyed by runId.
+	const runs = new Map<string, RunHandle>();
+
+	// (4) The terminal-notice queue. markNotified flips + re-persists the record.
+	const queue = createNotificationQueue({
+		onNotify: opts.onNotify,
+		markNotified: async (runId) => {
+			const handle = runs.get(runId);
+			if (handle) {
+				// `notified` is a BgTask-shaped flag the queue persists through; the
+				// record round-trips it like any extra field.
+				(handle.record as RunRecord & { notified?: boolean }).notified = true;
+				await runStore.save(handle.record);
+			}
+		},
+		logger: storeLogger,
+		// A run notice points at workflow_status, not bg_output.
+		renderHint: (task) => runHint(task.id),
+	});
+
+	function liveRunIds(): ReadonlySet<string> {
+		return new Set(runs.keys());
+	}
+
+	/** Build the TaskNotice-bearing BgTask shim the queue needs from a record. */
+	function noticePush(record: RunRecord): void {
+		// The queue's push() reads id/parentSessionID/description/status/timestamps —
+		// all present on a RunRecord. Cross the BgTask-typed surface once, here.
+		queue.push(record as unknown as Parameters<NotificationQueue["push"]>[0]);
+	}
+
+	function persistRecord(record: RunRecord): void {
+		void runStore.save(record).catch((err: unknown) => {
+			logger?.error("run record persist failed", {
+				runId: record.id,
+				err: err instanceof Error ? err.message : String(err),
+			});
+		});
+	}
+
+	/** Settle a record from a finished run, persist, and queue the terminal notice. */
+	function settleRecord(
+		handle: RunHandle,
+		patch: Partial<RunRecord> & { status: RunStatus },
+	): void {
+		Object.assign(handle.record, patch, { completedAt: clock.now() });
+		persistRecord(handle.record);
+		noticePush(handle.record);
+	}
+
+	async function startRun(args: StartRunArgs): Promise<StartRunResult> {
+		const runId = ids.next(liveRunIds());
+		const name = extractName(args.source);
+		const scriptPath = scriptsDir
+			? join(scriptsDir, `${runId}.js`)
+			: `${SUBDIR_SCRIPTS}/${runId}.js`;
+
+		// Persist the script source BEFORE execution (the spec's "persisted script
+		// path"). Ensure the directory exists first (in-memory fs no-ops mkdir).
+		if (fs) {
+			await fs.mkdir(dirname(scriptPath), { recursive: true });
+			await fs.writeFile(scriptPath, args.source, "utf-8");
+		}
+
+		const record: RunRecord = {
+			id: runId,
+			parentSessionID: args.parentSessionID,
+			status: "running",
+			description: name,
+			createdAt: clock.now(),
+			scriptPath,
+			args: args.args,
+		};
+		const handle: RunHandle = { record, progress: [] };
+		runs.set(runId, handle);
+		persistRecord(record);
+
+		const run = createWorkflowRun({
+			runner,
+			parentSessionID: args.parentSessionID,
+			runId,
+			args: args.args,
+			registry,
+			onProgress: (e) => {
+				handle.progress.push(e);
+				logger?.debug("workflow progress", { runId, event: e });
+			},
+		});
+		handle.run = run;
+
+		// Fire DETACHED — never await the run. On settle, update the record.
+		void run
+			.run(args.source)
+			.then((result) => {
+				// A stopRun() may have already flipped the record to cancelled; do not
+				// clobber a terminal record with the run's own (also-terminal) result.
+				if (handle.record.status !== "running") {
+					return;
+				}
+				settleRecord(handle, {
+					status: result.status,
+					returnValue: result.returnValue,
+					error: result.error,
+					agentCount: result.agentCount,
+				});
+			})
+			.catch((err: unknown) => {
+				// createWorkflowRun.run() never rejects, but fence defensively.
+				if (handle.record.status !== "running") {
+					return;
+				}
+				settleRecord(handle, {
+					status: "error",
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+
+		return { runId, scriptPath, name };
+	}
+
+	function stopRun(runId: string): void {
+		const handle = runs.get(runId);
+		if (handle?.record.status !== "running") {
+			return;
+		}
+		handle.run?.abort();
+		settleRecord(handle, { status: "cancelled" });
+	}
+
+	function statusOf(runId: string): RunHandle | undefined {
+		return runs.get(runId);
+	}
+
+	// Startup recovery: load persisted records, flip stale `running` → error, seed
+	// the queue from terminal records. Runs as a promise `ready()` awaits.
+	const readyPromise = (async () => {
+		const recovered = await runStore.load();
+		const seed: RunRecord[] = [];
+		for (const record of recovered) {
+			if (record.status === "running") {
+				record.status = "error";
+				record.error = "interrupted by restart";
+				record.completedAt = clock.now();
+				persistRecord(record);
+			}
+			runs.set(record.id, { record, progress: [] });
+			seed.push(record);
+		}
+		// seed() re-queues terminal && !notified records silently (no toast storm).
+		queue.seed(seed as unknown as Parameters<NotificationQueue["seed"]>[0]);
+		logger?.info("workflow engine recovered", { recovered: recovered.length });
+	})();
+
+	return {
+		runs,
+		runStore,
+		queue,
+		registry,
+		ready: () => readyPromise,
+		startRun: async (args) => {
+			await readyPromise;
+			return startRun(args);
+		},
+		stopRun,
+		statusOf,
+		handleEvent: (event) => runner.handleEvent(event),
+		dispose: async () => {
+			await readyPromise;
+			await runner.dispose();
+			await taskStore.dispose();
+			await runStore.dispose();
+		},
+	};
+}
