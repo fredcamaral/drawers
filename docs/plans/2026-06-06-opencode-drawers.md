@@ -69,7 +69,7 @@
 
 #### Task 1.1.2: Regenerate API refs and audit the typed SDK surface
 
-- [ ] Done
+- [x] Done — all 13 surfaces typed ✅ (see `docs/sdk-surface-audit.md`). Notables: `session.status` IS typed but only reports `idle|retry|busy` (not a completion oracle — pair with output validation per decision 2); `AssistantMessage.tokens` exposes input/output/reasoning/cache + cost (Epic 4.3 budget spike unblocked); per-prompt `tools: {[name]: boolean}` recursion guard fully typed.
 
 **Context:** The local skill mandates a gate: regenerate `references/hooks.md` and `references/events.md` from the installed SDK before any hook code (`.claude/skills/opencode-plugin-dev/SKILL.md:61-72`, script at `.claude/skills/opencode-plugin-dev/scripts/extract-plugin-api.ts`). The engine design assumes specific SDK capabilities; each must be confirmed typed or the design adjusts NOW, not in Phase 2.
 
