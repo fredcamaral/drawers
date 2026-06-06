@@ -1,37 +1,47 @@
 /**
- * `chat.message` flush hook + TUI toast notifier.
+ * `chat.message` flush hook + TUI toast notifier — the passive presentation
+ * layer over {@link NotificationQueue} / {@link TaskNotice}.
  *
- * Decision 1 of the plan: background-task completions never actively wake the
- * parent. They wait in the per-parent {@link NotificationQueue} until the
- * parent sends its NEXT message, at which point opencode invokes the
- * `chat.message` hook — the passive drain point. This module owns that drain.
+ * Decision 1 of the plan: background-task (and, from Phase 4, workflow)
+ * completions never actively wake the parent. They wait in the per-parent
+ * {@link NotificationQueue} until the parent sends its NEXT message, at which
+ * point opencode invokes the `chat.message` hook — the passive drain point.
+ * This module owns that drain. It is generic over the queue/notice types and
+ * carries nothing task-domain-specific in code: the only domain-flavored bits
+ * (the visible summary wording and the synthetic-hint framing) are factored out
+ * as an optional {@link NotifyRenderOptions}, defaulting to the original
+ * background-agents text so existing call sites stay bit-identical.
  *
  * CRITICAL: `chat.message` runs inside the prompt pipeline. A THROW here kills
  * the user's message before it reaches the model. So the entire hook body is
  * fenced in try/catch and never propagates — a queue or render failure logs and
  * the message proceeds untouched. Logging is `client.app.log`-backed (injected
- * as {@link EngineLogger}); never `console`.
+ * as {@link NotificationQueueLogger}); never `console`.
  *
  * On a non-empty flush the hook pushes EXACTLY two parts onto `output.parts`
  * (mutated in place — never reassigned, per the hook contract):
  *   1. ONE visible {@link TextPart}: one human-readable line per notice
  *      (`✅ bg_abc12345 'description' completed in 32s`);
  *   2. ONE `synthetic: true` {@link TextPart}: the model-only retrieval hints,
- *      one per notice, so the assistant knows to call `bg_output`.
+ *      one per notice, so the assistant knows to call the retrieval tool.
  *
  * Visible-first, synthetic-second: the human reads the summary; the model reads
  * both but acts on the synthetic instruction.
  */
 
-import type { NotificationQueue, TaskNotice, TaskStatus } from "@drawers/core";
 import type { Hooks } from "@opencode-ai/plugin";
-import type { EngineLogger } from "../engine";
+import type {
+	NotificationQueue,
+	NotificationQueueLogger,
+	TaskNotice,
+} from "./notify";
+import type { TaskStatus } from "./types";
 
 /**
  * The hook output's `parts` element type, derived from the plugin's own `Hooks`
  * surface. `@opencode-ai/plugin` does not re-export `Part`/`TextPart`, so we lift
  * the rendered part type straight from the `chat.message` signature rather than
- * reaching into `@opencode-ai/sdk` (not a direct dependency of this package).
+ * reaching into `@opencode-ai/sdk`.
  */
 type ChatMessageHook = NonNullable<Hooks["chat.message"]>;
 type ChatMessageOutput = Parameters<ChatMessageHook>[1];
@@ -56,6 +66,17 @@ const STATUS_VARIANT: Record<TaskStatus, ToastVariant> = {
 	error: "error",
 	cancelled: "info",
 };
+
+/**
+ * Domain-flavored rendering hooks. Every field defaults to the original
+ * background-agents wording, so a call site that passes nothing renders
+ * bit-identically. A different domain (e.g. the workflows plugin) overrides only
+ * the strings it wants to reword without re-implementing the layout.
+ */
+export interface NotifyRenderOptions {
+	/** Visible toast title, given a terminal notice. Default: `Background task <status>`. */
+	toastTitle?: (notice: TaskNotice) => string;
+}
 
 /** Humanize a millisecond duration into a compact `32s` / `4m12s` / `120ms` form. */
 function humanizeDuration(ms: number): string {
@@ -83,6 +104,11 @@ function visibleLine(notice: TaskNotice): string {
 	return notice.durationMs !== undefined
 		? `${base} in ${humanizeDuration(notice.durationMs)}`
 		: base;
+}
+
+/** Default toast title: `Background task <status>`. */
+function defaultToastTitle(notice: TaskNotice): string {
+	return `Background task ${notice.status}`;
 }
 
 /**
@@ -120,7 +146,7 @@ function makeTextPart(opts: {
  */
 export function createChatMessageHook(
 	queue: NotificationQueue,
-	logger?: EngineLogger,
+	logger?: NotificationQueueLogger,
 ): NonNullable<Hooks["chat.message"]> {
 	return async (input, output) => {
 		try {
@@ -156,7 +182,7 @@ export function createChatMessageHook(
 		} catch (err) {
 			// chat.message is prompt-pipeline: a throw kills the user's message.
 			// Swallow + log; the message proceeds without notices.
-			logger?.error("chat.message flush hook failed", {
+			logger?.error?.("chat.message flush hook failed", {
 				err: err instanceof Error ? err.message : String(err),
 			});
 		}
@@ -177,14 +203,21 @@ export type ShowToast = (data: {
  * Build the `onNotify` callback for the engine: render each terminal notice as
  * a TUI toast. Toast failures (sync throw OR rejected promise) are swallowed and
  * logged — a toast must NEVER break completion teardown.
+ *
+ * @param showToast the TUI toast sink (structural `client.tui.showToast`).
+ * @param logger    optional structured logger for swallowed-failure reporting.
+ * @param render    optional domain wording overrides; defaults reproduce the
+ *                  original background-agents text bit-for-bit.
  */
 export function createToastNotifier(
 	showToast: ShowToast,
-	logger?: EngineLogger,
+	logger?: NotificationQueueLogger,
+	render?: NotifyRenderOptions,
 ): (notice: TaskNotice) => void {
+	const toastTitle = render?.toastTitle ?? defaultToastTitle;
 	return (notice) => {
 		const variant = STATUS_VARIANT[notice.status] ?? "info";
-		const title = `Background task ${notice.status}`;
+		const title = toastTitle(notice);
 		const message =
 			notice.durationMs !== undefined
 				? `${notice.taskId} '${notice.description}' in ${humanizeDuration(notice.durationMs)}`
@@ -193,14 +226,14 @@ export function createToastNotifier(
 			const result = showToast({ body: { title, message, variant } });
 			if (result && typeof result.then === "function") {
 				result.catch((err: unknown) => {
-					logger?.error("tui.showToast rejected", {
+					logger?.error?.("tui.showToast rejected", {
 						id: notice.taskId,
 						err: err instanceof Error ? err.message : String(err),
 					});
 				});
 			}
 		} catch (err) {
-			logger?.error("tui.showToast threw", {
+			logger?.error?.("tui.showToast threw", {
 				id: notice.taskId,
 				err: err instanceof Error ? err.message : String(err),
 			});

@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { NotificationQueue, TaskNotice, TaskStatus } from "@drawers/core";
-import type { EngineLogger } from "../engine";
-import { createChatMessageHook, createToastNotifier } from "./notifications";
+import {
+	createChatMessageHook,
+	createToastNotifier,
+	type NotificationQueue,
+	type NotificationQueueLogger,
+	type TaskNotice,
+	type TaskStatus,
+} from "./index";
 
 /** Rendered text-part shape the hook pushes — for typed test assertions. */
 interface TextPartShape {
@@ -40,13 +45,13 @@ function makeQueue(
 	};
 }
 
-function makeLogger(): EngineLogger & { errors: Array<[string, unknown]> } {
+function makeLogger(): NotificationQueueLogger & {
+	errors: Array<[string, unknown]>;
+} {
 	const errors: Array<[string, unknown]> = [];
 	return {
 		errors,
 		debug: () => {},
-		info: () => {},
-		warn: () => {},
 		error: (msg, meta) => {
 			errors.push([msg, meta]);
 		},

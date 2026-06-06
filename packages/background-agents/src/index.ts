@@ -21,13 +21,13 @@
  * All logging goes through `client.app.log` (structured JSON) — never `console`.
  */
 
-import { adaptSdkClient } from "@drawers/core";
-import type { Plugin } from "@opencode-ai/plugin";
-import { createEngine, type EngineLogger } from "./engine";
 import {
+	adaptSdkClient,
 	createChatMessageHook,
 	createToastNotifier,
-} from "./hooks/notifications";
+} from "@drawers/core";
+import type { Plugin } from "@opencode-ai/plugin";
+import { createEngine, type EngineLogger } from "./engine";
 import { createBgCancelTool } from "./tools/cancel";
 import { createBgListTool } from "./tools/list";
 import { createBgOutputTool } from "./tools/output";

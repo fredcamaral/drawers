@@ -11,10 +11,16 @@ export type { IdGenerator, IdGeneratorOptions } from "./ids";
 export { createIdGenerator } from "./ids";
 export type {
 	NotificationQueue,
+	NotificationQueueLogger,
 	NotificationQueueOpts,
 	TaskNotice,
 } from "./notify";
 export { createNotificationQueue } from "./notify";
+export type { NotifyRenderOptions, ShowToast } from "./notify-hooks";
+export {
+	createChatMessageHook,
+	createToastNotifier,
+} from "./notify-hooks";
 export type {
 	FsFacade,
 	TaskStore,
