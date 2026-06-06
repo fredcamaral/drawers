@@ -219,7 +219,7 @@ interface SessionRunner {
 
 #### Task 1.4.1: Atomic per-task persistence with restart recovery
 
-- [ ] Done
+- [x] Done — recovery wired as `SessionRunnerDeps.recoveredTasks?: BgTask[]` (construction-time DI, not an interface method). Slot policy: recovered running tasks occupy NO concurrency slot (re-acquiring could deadlock startup if recovered > limit; original process's slots died with it). `save()` snapshots the task before enqueueing — the gate mutates BgTask in place, so a queued write must capture call-time state.
 
 **Context:** better-async persists one whole-file JSON with read-modify-write, no locking, silent `{}` on corruption, and drops fields needed for resume (`.references/better-opencode-async-agents/src/storage.ts:77-121`, `src/manager/index.ts:325-339`) — all three defects to avoid. OMO persists nothing.
 
@@ -236,7 +236,7 @@ interface SessionRunner {
 
 #### Task 1.4.2: Notification queue with passive-flush contract
 
-- [ ] Done
+- [x] Done — dedup key is `taskId + ":" + completedAt`, not taskId alone (a resumed task legitimately re-completes with a fresh completedAt; taskId-only would swallow the second notice). `seed()` never fires onNotify (no toast storm on restart). `TaskNotice` lives in notify.ts, not types.ts — presentation shapes stay out of the engine contract.
 
 **Context:** Decision 1: no active parent-wake. The passive channel is OMO's "Channel B": pending notices injected when the parent's next user message flows through the `chat.message` hook (`.references/oh-my-opencode/src/features/background-agent/manager.ts:2144-2153`). Toasts via the typed TUI surface confirmed in Task 1.1.2. better-async's dedup-with-priority exists because it has three competing notifiers (`.references/better-opencode-async-agents/src/manager/notifications.ts:15-230`) — our single-winner `tryComplete` means at most one notice per task, so dedup is a simple seen-set.
 
