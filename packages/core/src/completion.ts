@@ -42,10 +42,22 @@ export interface IntervalHandle {
 export type TimerFactory = (cb: () => void, ms: number) => TimerHandle;
 export type IntervalFactory = (cb: () => void, ms: number) => IntervalHandle;
 
+/**
+ * A part as returned inside `session.messages` (audit row c). Narrowed to the
+ * fields the gate (`type`/`text`) and `readOutput` (`synthetic`, tool `state`)
+ * actually read; everything else on the real SDK `Part` is ignored.
+ */
+export interface GatePart {
+	type: string;
+	text?: string;
+	synthetic?: boolean;
+	state?: { status: string; output?: string; error?: string };
+}
+
 /** A message as returned by `session.messages` (audit row c), narrowed. */
 export interface GateMessage {
 	info: { role: "user" | "assistant" };
-	parts: Array<{ type: string; text?: string }>;
+	parts: GatePart[];
 }
 
 export interface CompletionConfig {
@@ -113,6 +125,14 @@ export interface CompletionGate {
 	): boolean;
 	handleEvent(event: Event): Promise<void>;
 	awaitCompletion(taskId: string, timeoutMs?: number): Promise<BgTask>;
+	/**
+	 * Reset per-turn completion bookkeeping for a task being resumed: drops the
+	 * cached output validation for its session (a positive from the PREVIOUS turn
+	 * must not validate the new turn), clears get-miss and defer-timer state, and
+	 * restarts the idle/stale activity clock at `now`. Call AFTER the task is back
+	 * to `running` with a fresh `startedAt`, before the new prompt is dispatched.
+	 */
+	resetForResume(task: BgTask): void;
 	/** Begin the safety poll. Idempotent. */
 	start(): void;
 	dispose(): Promise<void>;
@@ -548,6 +568,21 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		});
 	}
 
+	function resetForResume(task: BgTask): void {
+		if (task.sessionID) {
+			validatedSessions.delete(task.sessionID);
+		}
+		getMisses.delete(task.id);
+		const dt = deferTimers.get(task.id);
+		if (dt) {
+			dt.clear();
+			deferTimers.delete(task.id);
+		}
+		// Restart the grace/stale clock so a stale idle from the previous turn
+		// can't instantly complete the new one.
+		lastActivity.set(task.id, clock.now());
+	}
+
 	async function dispose(): Promise<void> {
 		disposed = true;
 		pollHandle?.clear();
@@ -566,5 +601,12 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		waiters.clear();
 	}
 
-	return { tryComplete, handleEvent, awaitCompletion, start, dispose };
+	return {
+		tryComplete,
+		handleEvent,
+		awaitCompletion,
+		resetForResume,
+		start,
+		dispose,
+	};
 }

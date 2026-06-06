@@ -17,13 +17,24 @@ import {
 	type CompletionGate,
 	createCompletionGate,
 	type GateMessage,
+	type GatePart,
 	type IntervalFactory,
 	type TimerFactory,
 } from "./completion";
 import type { ConcurrencyManager } from "./concurrency";
 import { WaiterCancelledError } from "./concurrency";
 import type { IdGenerator } from "./ids";
-import type { BgTask, Clock, LaunchRequest, SessionRunner } from "./types";
+import {
+	type BgTask,
+	type Clock,
+	isTerminal,
+	type LaunchRequest,
+	type ReadOpts,
+	type SessionRunner,
+	type TaskOutput,
+	type TaskOutputMessage,
+	type TaskOutputPart,
+} from "./types";
 
 // --- minimal structural SDK surface (audit rows a/b/d) --------------------
 
@@ -99,15 +110,6 @@ export interface SessionRunnerDeps {
 	startPoll?: boolean;
 }
 
-/**
- * Extends the public interface with a launch-path-only cancellation seam.
- * `markCancelled` is the minimal hook Task 1.3.2 needs so launch's re-checks
- * are testable; Task 1.3.3 replaces it with the real `cancel()` implementation.
- */
-export interface SessionRunnerInternal extends SessionRunner {
-	markCancelled(taskId: string): void;
-}
-
 const DEFAULT_MAX_DEPTH = 2;
 /** Concurrency key seed when a request carries no model. */
 const DEFAULT_MODEL_KEY = "default";
@@ -156,9 +158,7 @@ const defaultInterval: IntervalFactory = (cb, ms) => {
 	};
 };
 
-export function createSessionRunner(
-	deps: SessionRunnerDeps,
-): SessionRunnerInternal {
+export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 	const { client, concurrency, ids, clock } = deps;
 	const persist = deps.persist;
 	const maxDepth = deps.config?.maxDepth ?? DEFAULT_MAX_DEPTH;
@@ -254,6 +254,33 @@ export function createSessionRunner(
 		return { ...guard, ...(req.toolsOverride ?? {}) };
 	}
 
+	/**
+	 * Fire-and-forget `promptAsync` whose failure routes through the gate (error
+	 * flip releases the slot). Shared by launch step (7) and resume so both apply
+	 * the same recursion-guard tools logic and the same `.catch` → error+release.
+	 */
+	function dispatchPrompt(
+		task: BgTask,
+		sessionID: string,
+		prompt: string,
+		tools: Record<string, boolean>,
+	): void {
+		client.session
+			.promptAsync({
+				path: { id: sessionID },
+				body: {
+					agent: task.agent,
+					...(task.model ? { model: toPromptModel(task.model) } : {}),
+					tools,
+					parts: [{ type: "text", text: prompt }],
+				},
+			})
+			.catch((err: unknown) => {
+				deps.logger?.error?.("promptAsync failed", { id: task.id });
+				gate.tryComplete(task.id, "error", errorMessage(err));
+			});
+	}
+
 	async function launch(req: LaunchRequest): Promise<BgTask> {
 		// (1) depth guard — before any slot/registration.
 		if (req.depth >= maxDepth) {
@@ -276,6 +303,7 @@ export function createSessionRunner(
 			createdAt: clock.now(),
 			depth: req.depth,
 			concurrencyKey,
+			model: req.model,
 		};
 		tasks.set(id, task);
 		await maybePersist(task);
@@ -351,20 +379,7 @@ export function createSessionRunner(
 
 		// (7) fire-and-forget prompt. Failure routes through the gate (error flip
 		// releases the slot).
-		client.session
-			.promptAsync({
-				path: { id: sessionID },
-				body: {
-					agent: req.agent,
-					...(req.model ? { model: toPromptModel(req.model) } : {}),
-					tools: buildTools(req),
-					parts: [{ type: "text", text: req.prompt }],
-				},
-			})
-			.catch((err: unknown) => {
-				deps.logger?.error?.("promptAsync failed", { id: task.id });
-				gate.tryComplete(id, "error", errorMessage(err));
-			});
+		dispatchPrompt(task, sessionID, req.prompt, buildTools(req));
 
 		// (8) resolve at running — never await completion.
 		return task;
@@ -380,31 +395,215 @@ export function createSessionRunner(
 	}
 
 	/**
-	 * Launch-path cancellation seam. Routes through the gate's synchronous flip:
-	 * the gate's `freeSlot` cancels a still-queued waiter (so the launch acquire
-	 * rejects with `WaiterCancelledError`) or releases a held slot. The launch
-	 * flow's re-checks then see `task.status === "cancelled"`.
+	 * Cancel a task. Routes through the gate's synchronous flip (the single
+	 * terminal-transition path): the gate's `freeSlot` cancels a still-queued
+	 * waiter (so the launch acquire rejects with `WaiterCancelledError`) or
+	 * releases a held slot, and aborts a live session in detached teardown.
+	 *
+	 * Already-terminal → no-op: resolve with the current state (never reject, no
+	 * second teardown — the gate's mutex denies the flip). Otherwise join the
+	 * detached teardown via `awaitCompletion` so the caller observes the released
+	 * slot and persisted state at resolve time (the 1.3.3 sharp edge).
 	 */
-	function markCancelled(taskId: string): void {
-		gate.tryComplete(taskId, "cancelled");
+	async function cancel(taskId: string): Promise<BgTask> {
+		const task = tasks.get(taskId);
+		if (!task) {
+			throw new Error(`Unknown task: ${taskId}`);
+		}
+		// Won the flip → join teardown. Lost it (already terminal) → no-op; the
+		// task is already torn down, so awaitCompletion resolves immediately.
+		gate.tryComplete(taskId, "cancelled", "cancelled by user");
+		return gate.awaitCompletion(taskId);
+	}
+
+	/**
+	 * Resume a terminal task with a new prompt on its existing session. No
+	 * pending-resume queue in v1: a non-terminal task rejects with
+	 * `taskStillRunning`. A missing session rejects with `sessionExpired` and the
+	 * task stays terminal. On success the task re-acquires its concurrency slot,
+	 * resets to `running` (fresh `startedAt`, cleared error/completedAt/notified),
+	 * and the completion machinery picks it up like any running task.
+	 */
+	async function resume(taskId: string, prompt: string): Promise<BgTask> {
+		const task = tasks.get(taskId);
+		if (!task) {
+			throw new Error(`Unknown task: ${taskId}`);
+		}
+		if (!isTerminal(task.status)) {
+			throw new Error(`taskStillRunning: ${taskId} is ${task.status}`);
+		}
+		const sessionID = task.sessionID;
+		if (!sessionID) {
+			throw new Error(`sessionExpired: ${taskId} has no session`);
+		}
+		// Verify the session still exists before touching any slot/state.
+		try {
+			await client.session.get({ path: { id: sessionID } });
+		} catch {
+			throw new Error(`sessionExpired: ${taskId} session ${sessionID} is gone`);
+		}
+
+		// Re-acquire the concurrency slot on the original model (same derivation as
+		// launch). Mirror launch's cancel-during-acquire handling.
+		const modelKey = task.model ?? DEFAULT_MODEL_KEY;
+		const acquire = concurrency.acquire(modelKey);
+		inflightAcquire.set(taskId, { model: modelKey, waiterId: acquire.id });
+		try {
+			await acquire;
+		} catch (err) {
+			inflightAcquire.delete(taskId);
+			if (err instanceof WaiterCancelledError) {
+				// Cancelled mid-acquire: stays/returns terminal. The task is already
+				// terminal from before resume, so flip is a no-op; ensure cancelled.
+				gate.tryComplete(taskId, "cancelled", "cancelled by user");
+				return gate.awaitCompletion(taskId);
+			}
+			throw err;
+		}
+		inflightAcquire.delete(taskId);
+		heldSlots.set(taskId, modelKey);
+
+		// Reset terminal bookkeeping and promote to running via the constrained
+		// intermediate setter (NOT a new status write path).
+		task.startedAt = clock.now();
+		task.completedAt = undefined;
+		task.error = undefined;
+		task.notified = undefined;
+		await setIntermediate(task, "running");
+
+		// Invalidate the gate's per-turn caches so a stale idle / cached positive
+		// from the previous turn can't instantly complete the new one.
+		gate.resetForResume(task);
+
+		// Dispatch the new prompt with the same recursion-guard logic as launch.
+		dispatchPrompt(task, sessionID, prompt, { ...SPAWN_GUARD });
+
+		return task;
+	}
+
+	/**
+	 * Read a task's output. Pending (no session) returns an empty summary without
+	 * calling the client. `summaryText` is the concatenated text of the LAST
+	 * assistant message. `full: true` adds the filtered transcript (synthetic
+	 * parts dropped, tool results capped). A terminal task whose session is gone
+	 * degrades gracefully to the task's recorded error/empty — never rejects.
+	 */
+	async function readOutput(
+		taskId: string,
+		opts?: ReadOpts,
+	): Promise<TaskOutput> {
+		const task = tasks.get(taskId);
+		if (!task) {
+			throw new Error(`Unknown task: ${taskId}`);
+		}
+		const sessionID = task.sessionID;
+		if (!sessionID) {
+			// No session yet (pending) — nothing to fetch.
+			return { status: task.status, summaryText: "" };
+		}
+
+		let messages: GateMessage[];
+		try {
+			const res = await client.session.messages({ path: { id: sessionID } });
+			messages = res.data ?? [];
+		} catch {
+			// Unreachable session (e.g. expired terminal) — degrade gracefully.
+			return { status: task.status, summaryText: task.error ?? "" };
+		}
+
+		const summaryText = lastAssistantText(messages);
+		if (!opts?.full) {
+			return { status: task.status, summaryText };
+		}
+		return {
+			status: task.status,
+			summaryText,
+			messages: filterTranscript(messages),
+		};
 	}
 
 	return {
 		launch,
 		list,
-		markCancelled,
 		awaitCompletion: (taskId, timeoutMs) =>
 			gate.awaitCompletion(taskId, timeoutMs),
-		cancel(): Promise<BgTask> {
-			throw new Error("not implemented");
-		},
-		resume(): Promise<BgTask> {
-			throw new Error("not implemented");
-		},
-		readOutput(): Promise<never> {
-			throw new Error("not implemented");
-		},
+		cancel,
+		resume,
+		readOutput,
 		handleEvent: (event) => gate.handleEvent(event),
 		dispose: () => gate.dispose(),
 	};
+}
+
+// --- output reading helpers ------------------------------------------------
+
+const TOOL_TEXT_CAP = 2000;
+const ERROR_HEAD = 1200;
+const ERROR_TAIL = 600;
+const ERROR_PATTERN = /error|fail|exception|denied|timeout/i;
+
+/** Concatenated text of the last assistant message (its text parts only). */
+function lastAssistantText(messages: GateMessage[]): string {
+	for (let i = messages.length - 1; i >= 0; i -= 1) {
+		const m = messages[i];
+		if (m?.info.role !== "assistant") {
+			continue;
+		}
+		return m.parts
+			.filter((p) => p.type === "text" && !p.synthetic && p.text)
+			.map((p) => p.text ?? "")
+			.join("");
+	}
+	return "";
+}
+
+/** Extract the displayable text of a tool part (completed output / error). */
+function toolText(part: GatePart): string {
+	const state = part.state;
+	if (!state) {
+		return "";
+	}
+	return state.output ?? state.error ?? "";
+}
+
+/**
+ * Cap a tool result. Plain truncation at {@link TOOL_TEXT_CAP}, except results
+ * matching {@link ERROR_PATTERN}, which keep head + tail with a marker so the
+ * actual failure (often at the end) survives.
+ */
+function capToolText(text: string): string {
+	if (text.length <= TOOL_TEXT_CAP) {
+		return text;
+	}
+	if (ERROR_PATTERN.test(text)) {
+		const dropped = text.length - ERROR_HEAD - ERROR_TAIL;
+		return `${text.slice(0, ERROR_HEAD)}…[truncated ${dropped} chars]…${text.slice(text.length - ERROR_TAIL)}`;
+	}
+	return text.slice(0, TOOL_TEXT_CAP);
+}
+
+/**
+ * Filter a transcript for `readOutput({ full: true })`: drop synthetic parts,
+ * keep user/assistant text and tool parts, cap tool-result text. Messages left
+ * with no parts after filtering are dropped.
+ */
+function filterTranscript(messages: GateMessage[]): TaskOutputMessage[] {
+	const out: TaskOutputMessage[] = [];
+	for (const m of messages) {
+		const parts: TaskOutputPart[] = [];
+		for (const p of m.parts) {
+			if (p.synthetic) {
+				continue;
+			}
+			if (p.type === "text" && p.text) {
+				parts.push({ type: "text", text: p.text });
+			} else if (p.type === "tool") {
+				parts.push({ type: "tool", text: capToolText(toolText(p)) });
+			}
+		}
+		if (parts.length > 0) {
+			out.push({ role: m.info.role, parts });
+		}
+	}
+	return out;
 }

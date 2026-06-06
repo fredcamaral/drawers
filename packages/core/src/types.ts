@@ -37,6 +37,8 @@ export interface BgTask {
 	error?: string;
 	depth: number; // recursion guard
 	concurrencyKey: string;
+	model?: string; // launch `model` string (provider/model), retained so resume
+	// can re-acquire the same concurrency slot. Added in Task 1.3.4.
 	notified?: boolean; // notification-queue flush state (Epic 1.4)
 }
 
@@ -55,10 +57,23 @@ export interface ReadOpts {
 	full?: boolean;
 }
 
+/** A single part of a filtered transcript message (Task 1.3.4). */
+export interface TaskOutputPart {
+	type: string;
+	text: string;
+}
+
+/** A filtered transcript message: role + text/tool parts only. */
+export interface TaskOutputMessage {
+	role: "user" | "assistant";
+	parts: TaskOutputPart[];
+}
+
 export interface TaskOutput {
 	status: TaskStatus;
 	summaryText: string;
-	messages?: unknown[]; // refined in Task 1.3.4
+	/** Present only when `readOutput` is called with `{ full: true }`. */
+	messages?: TaskOutputMessage[];
 }
 
 export interface SessionRunner {

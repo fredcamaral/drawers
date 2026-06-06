@@ -196,7 +196,7 @@ interface SessionRunner {
 
 #### Task 1.3.4: Cancel, resume, and output reading
 
-- [ ] Done
+- [x] Done — contract additions: `BgTask.model?` (resume re-acquires the right slot), `TaskOutput.messages` refined to `TaskOutputMessage[]`, gate gained `resetForResume(task)` (invalidates output-validation cache + restarts activity clock so a stale idle can't complete the new turn). `markCancelled` seam deleted; `cancel()` joins detached teardown via `awaitCompletion` so callers observe released slot + persisted state.
 
 **Context:** Cancel = `client.session.abort` + terminal flip (better-async `task-lifecycle.ts:216-224` — but it bypasses its own status helper; we route everything through `tryComplete`). Resume re-prompts the existing session and re-acquires concurrency (OMO `manager.ts:1240+`). Output reading walks `session.messages` with filtering (better-async `src/tools/output.ts`).
 
