@@ -72,6 +72,12 @@ function makeClient() {
 				abortCalls.push({ id: opts.path.id });
 				return Promise.resolve({ data: true });
 			},
+			messages() {
+				return Promise.resolve({ data: [] });
+			},
+			get() {
+				return Promise.resolve({ data: { id: "ses" } });
+			},
 		},
 	};
 
@@ -310,6 +316,9 @@ describe("createSessionRunner — cancel-between-create-and-prompt", () => {
 		// Now resolve create — the post-await re-check must see cancellation.
 		h.resolveCreate("ses_orphan");
 		const result = await launched;
+		// The orphan abort + slot release now run in the completion gate's
+		// detached teardown (one microtask hop after the cancelled flip).
+		await flush();
 
 		expect(result.status).toBe("cancelled");
 		expect(h.abortCalls).toEqual([{ id: "ses_orphan" }]);

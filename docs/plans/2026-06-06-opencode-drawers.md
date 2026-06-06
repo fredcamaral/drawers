@@ -179,7 +179,7 @@ interface SessionRunner {
 
 #### Task 1.3.3: Completion gate, mutex, and safety net
 
-- [ ] Done
+- [x] Done — `completion.ts` (`createCompletionGate`) owns tryComplete/idle-gating/poll/stale; runner wires it via injected collaborators. Key finding: `session.idle` must NOT count as last-activity (it perpetually resets the grace window — caught by tests). Deviation: teardown is DETACHED from the synchronous flip; callers needing post-teardown state must join via `awaitCompletion` (sharp edge for 1.3.4's cancel). Orphan-abort on cancel-before-create stays in the launch path (gate can't abort a session that didn't exist at flip time). 640× rerun race-clean.
 
 **Context:** The race-correctness core. Verified design from OMO: `session.idle` handler requires status `running` + min-idle elapsed, defers-and-re-checks if too early (`.references/oh-my-opencode/src/features/background-agent/session-idle-event-handler.ts:35-52`); validates session has ≥1 non-empty assistant/tool message before completing (`manager.ts:2159-2217`); `tryCompleteTask` does a synchronous `status !== "running" → return false` check-and-flip **before any await** — JS single-threadedness is the mutex (`manager.ts:2443-2501`); slot released before async teardown to prevent leaks (`:2466-2469`).
 
