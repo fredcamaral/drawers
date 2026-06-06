@@ -311,7 +311,7 @@ interface SessionRunner {
 
 #### Task 2.1.2: `bg_task` tool — launch and resume
 
-- [ ] Done
+- [x] Done — core's resume errors are plain `Error`s with stable message prefixes (`taskStillRunning:`/`sessionExpired:`); tool detects via `startsWith`. Worth typing as error classes if a third consumer appears.
 
 **Context:** Tool registration shape: `.claude/skills/opencode-plugin-dev/references/custom-tools.md` (`tool()` helper, `tool.schema.*` = Zod, `ToolContext.sessionID`/`abort`/`metadata`). Core surface: `SessionRunner.launch(LaunchRequest)` (`packages/core/src/types.ts`) and `resume(taskId, prompt)` — resume only on terminal tasks, rejects `taskStillRunning`/`sessionExpired` (session-runner.ts, Task 1.3.4). Recursion guard is core-side (launch's tools override) — but depth must be INFERRED here: the runner's `list()` exposes tasks with `sessionID`; if the calling `context.sessionID` matches a tracked task's child session, this call is from a child.
 
@@ -328,7 +328,7 @@ interface SessionRunner {
 
 #### Task 2.1.3: `bg_output`, `bg_cancel`, `bg_list` tools
 
-- [ ] Done
+- [x] Done — abort race with balanced add/remove listeners (leak-asserted in test); `bg_cancel` coerces `all === true` (Zod defaults don't fire on raw execute paths); `bg_list` uses the `Clock` seam. Registration wired in the entry by the orchestrator. Note: core's launch SPAWN_GUARD already hides all four tools from child sessions.
 
 **Context:** Core surface: `readOutput(taskId, { full? })` → `{ status, summaryText, messages? }`; `awaitCompletion(taskId, timeoutMs)` resolves on terminal/rejects on timeout; `cancel(taskId)` resolves post-teardown, no-ops terminal tasks; `list(parentSessionID?)`. (`packages/core/src/types.ts`, tasks 1.3.3/1.3.4.)
 

@@ -10,7 +10,7 @@
  * engine (store recovery + notification queue wiring), and returns the hooks:
  *   - `event` → `runner.handleEvent` so the completion gate sees the live
  *     session.idle / session.error stream;
- *   - `tool: {}` — placeholder filled by Tasks 2.1.2 / 2.1.3.
+ *   - `tool` — the `bg_*` family (task/output/cancel/list).
  *
  * All logging goes through `client.app.log` (structured JSON) — never `console`.
  */
@@ -18,6 +18,10 @@
 import { adaptSdkClient } from "@drawers/core";
 import type { Plugin } from "@opencode-ai/plugin";
 import { createEngine, type EngineLogger } from "./engine";
+import { createBgCancelTool } from "./tools/cancel";
+import { createBgListTool } from "./tools/list";
+import { createBgOutputTool } from "./tools/output";
+import { createBgTaskTool } from "./tools/task";
 
 const SERVICE = "opencode-drawer-agents";
 
@@ -56,7 +60,11 @@ export const BackgroundAgentsPlugin: Plugin = async ({ client }) => {
 		event: async ({ event }) => {
 			await runner.handleEvent(event);
 		},
-		// Tools land in Tasks 2.1.2 (bg_task) and 2.1.3 (bg_output/cancel/list).
-		tool: {},
+		tool: {
+			bg_task: createBgTaskTool(runner),
+			bg_output: createBgOutputTool(runner),
+			bg_cancel: createBgCancelTool(runner),
+			bg_list: createBgListTool(runner),
+		},
 	};
 };
