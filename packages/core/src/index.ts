@@ -39,6 +39,7 @@ export type {
 	SessionRunner,
 	TaskOutput,
 	TaskStatus,
+	TextPartInput,
 } from "./types";
 export {
 	isTerminal,

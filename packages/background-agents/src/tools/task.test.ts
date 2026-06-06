@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { BgTask, LaunchRequest, SessionRunner } from "@drawers/core";
+import type { ForkMessage } from "../fork/transcript";
 import { createBgTaskTool } from "./task";
 
 /**
@@ -125,6 +126,7 @@ function launchArgs(over: Record<string, unknown> = {}) {
 		agent: "build",
 		model: undefined,
 		task_id: undefined,
+		fork: false,
 		...over,
 	} as Parameters<ReturnType<typeof createBgTaskTool>["execute"]>[0];
 }
@@ -317,5 +319,93 @@ describe("bg_task tool — resume", () => {
 		await expect(
 			tool.execute(launchArgs({ task_id: "bg_old", prompt: "go" }), context),
 		).rejects.toThrow("ECONNRESET");
+	});
+});
+
+describe("bg_task tool — fork", () => {
+	/** A fetchMessages spy: records the sessionID it was called with. */
+	function makeFetch(messages: ForkMessage[]) {
+		const calls: string[] = [];
+		const fetchMessages = async (sessionID: string) => {
+			calls.push(sessionID);
+			return messages;
+		};
+		return { fetchMessages, calls };
+	}
+
+	const userMsg = (text: string): ForkMessage => ({
+		info: { role: "user" },
+		parts: [{ type: "text", text }],
+	});
+
+	test("fork:true injects the built transcript as a synthetic context part", async () => {
+		const runner = makeRunner();
+		const { fetchMessages, calls } = makeFetch([
+			userMsg("the secret is zanzibar"),
+		]);
+		const tool = createBgTaskTool(runner, { fetchMessages });
+		const { context } = makeContext({ sessionID: "ses_parent" });
+
+		await tool.execute(launchArgs({ fork: true }), context);
+
+		// fetched the parent session's transcript.
+		expect(calls).toEqual(["ses_parent"]);
+
+		const req = runner.launched[0];
+		expect(req?.contextParts).toBeDefined();
+		expect(req?.contextParts).toHaveLength(1);
+		const part = req?.contextParts?.[0];
+		expect(part?.type).toBe("text");
+		expect(part?.synthetic).toBe(true);
+		// the transcript carries the parent fact + the fork header.
+		expect(part?.text).toContain("zanzibar");
+		expect(part?.text.toLowerCase()).toContain("forked");
+	});
+
+	test("fork:true with an empty transcript launches WITHOUT contextParts", async () => {
+		const runner = makeRunner();
+		// No messages → buildForkTranscript returns "" → no context part.
+		const { fetchMessages, calls } = makeFetch([]);
+		const tool = createBgTaskTool(runner, { fetchMessages });
+		const { context } = makeContext({ sessionID: "ses_parent" });
+
+		await tool.execute(launchArgs({ fork: true }), context);
+
+		expect(calls).toEqual(["ses_parent"]);
+		expect(runner.launched).toHaveLength(1);
+		expect(runner.launched[0]?.contextParts).toBeUndefined();
+	});
+
+	test("transcript-builder throw (drift guard) → honest error string, no launch", async () => {
+		const runner = makeRunner();
+		// A non-empty input whose only part carries payload under an unknown type
+		// trips buildForkTranscript's drift guard (it throws).
+		const driftMsg: ForkMessage = {
+			info: { role: "assistant" },
+			parts: [{ type: "mystery_kind", text: "payload that should extract" }],
+		};
+		const { fetchMessages } = makeFetch([driftMsg]);
+		const tool = createBgTaskTool(runner, { fetchMessages });
+		const { context } = makeContext();
+
+		const result = await tool.execute(launchArgs({ fork: true }), context);
+		const text = typeof result === "string" ? result : result.output;
+
+		expect(text.toLowerCase()).toContain("fork");
+		expect(text.toLowerCase()).toContain("schema");
+		// no launch happened — we refuse to send a blind context.
+		expect(runner.launched).toHaveLength(0);
+	});
+
+	test("fork:false never calls fetchMessages", async () => {
+		const runner = makeRunner();
+		const { fetchMessages, calls } = makeFetch([userMsg("irrelevant")]);
+		const tool = createBgTaskTool(runner, { fetchMessages });
+		const { context } = makeContext();
+
+		await tool.execute(launchArgs({ fork: false }), context);
+
+		expect(calls).toHaveLength(0);
+		expect(runner.launched[0]?.contextParts).toBeUndefined();
 	});
 });

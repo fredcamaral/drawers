@@ -32,6 +32,7 @@ import {
 	type TaskNotice,
 	type TaskStore,
 } from "@drawers/core";
+import type { ForkMessage } from "./fork/transcript";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
 export interface EngineLogger {
@@ -60,6 +61,16 @@ export interface Engine {
 	runner: SessionRunner;
 	store: TaskStore;
 	queue: NotificationQueue;
+	/**
+	 * Fetch a session's messages in the {@link ForkMessage} shape the fork
+	 * transcript builder consumes. Built on the same adapted client the runner
+	 * uses (`session.messages`). The engine's `EngineClient` statically narrows
+	 * the part/message fields the runner reads, but the live objects still carry
+	 * `info.summary` / `parts[].tool` / compaction parts at runtime — so the
+	 * result is widened to `ForkMessage[]` here (the single honest widening point,
+	 * matching where the adapter narrowed). Returns `[]` on an unreadable session.
+	 */
+	fetchSessionMessages(sessionID: string): Promise<ForkMessage[]>;
 }
 
 const clock: Clock = { now: () => Date.now() };
@@ -131,5 +142,23 @@ export async function createEngine(opts: CreateEngineOptions): Promise<Engine> {
 
 	queue.seed(recoveredTasks);
 
-	return { runner, store, queue };
+	const fetchSessionMessages = async (
+		sessionID: string,
+	): Promise<ForkMessage[]> => {
+		try {
+			const res = await client.session.messages({ path: { id: sessionID } });
+			// The adapter narrows away `info.summary`/`parts[].tool`/compaction
+			// parts that the fork builder reads, but the runtime objects still carry
+			// them. Widen through `unknown` — the one honest widening point.
+			return (res.data ?? []) as unknown as ForkMessage[];
+		} catch (err) {
+			logger?.warn("fetchSessionMessages failed", {
+				sessionID,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return [];
+		}
+	};
+
+	return { runner, store, queue, fetchSessionMessages };
 }

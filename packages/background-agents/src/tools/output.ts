@@ -115,7 +115,21 @@ export function createBgOutputTool(runner: SessionRunner) {
 		},
 		async execute(args, context: ToolContext) {
 			const { task_id, full, block } = args;
-			const timeoutMs = Math.min(Math.max(args.timeout_ms, 0), MAX_TIMEOUT_MS);
+			// Zod `.default()` does NOT reliably fire on opencode's raw execute path
+			// when the model omits the arg (same artifact bg_cancel handles for
+			// `all`): `args.timeout_ms` can arrive `undefined`/`NaN`. A `NaN` here
+			// previously reached the completion gate's timer as `setTimeout(cb, NaN)`
+			// → fires after ~1ms → block returns "still running" instantly → the
+			// model gives up → parent turn ends → the child session is Aborted.
+			// Coerce defensively: non-finite → the default.
+			const rawTimeout = args.timeout_ms;
+			const timeoutMs = Math.min(
+				Math.max(
+					Number.isFinite(rawTimeout) ? rawTimeout : DEFAULT_TIMEOUT_MS,
+					0,
+				),
+				MAX_TIMEOUT_MS,
+			);
 
 			if (block) {
 				const blocked = await blockUntilDone(

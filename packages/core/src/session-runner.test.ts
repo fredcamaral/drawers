@@ -246,6 +246,58 @@ describe("createSessionRunner — launch happy path", () => {
 	});
 });
 
+describe("createSessionRunner — contextParts ordering", () => {
+	test("contextParts are prepended BEFORE the task-prompt part", async () => {
+		const h = makeClient();
+		const concurrency = new ConcurrencyManager();
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+
+		const launched = runner.launch(
+			baseReq({
+				prompt: "do the task",
+				contextParts: [
+					{ type: "text", text: "forked parent context", synthetic: true },
+				],
+			}),
+		);
+		await flush();
+		h.resolveCreate("ses_child");
+		await launched;
+
+		const parts = at(h.promptCalls, 0).body.parts;
+		// context part first, prompt part last.
+		expect(parts).toEqual([
+			{ type: "text", text: "forked parent context", synthetic: true },
+			{ type: "text", text: "do the task" },
+		]);
+	});
+
+	test("no contextParts → only the prompt part (unchanged behavior)", async () => {
+		const h = makeClient();
+		const concurrency = new ConcurrencyManager();
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+
+		const launched = runner.launch(baseReq({ prompt: "just the task" }));
+		await flush();
+		h.resolveCreate("ses_child");
+		await launched;
+
+		expect(at(h.promptCalls, 0).body.parts).toEqual([
+			{ type: "text", text: "just the task" },
+		]);
+	});
+});
+
 describe("createSessionRunner — cancel-during-acquire", () => {
 	test("waiter cancelled before slot grant: task cancelled, no session.create, no slot leak", async () => {
 		const h = makeClient();

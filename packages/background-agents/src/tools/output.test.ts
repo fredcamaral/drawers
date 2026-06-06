@@ -77,6 +77,62 @@ describe("createBgOutputTool", () => {
 		expect(out).toContain("do not retry");
 	});
 
+	test("omitted timeout_ms forwards the default (not NaN) to awaitCompletion", async () => {
+		// Regression: opencode's raw execute path does NOT always apply Zod
+		// `.default()`, so `args.timeout_ms` can arrive undefined/NaN. A NaN reached
+		// the gate's `setTimeout(cb, NaN)` → fired after ~1ms → block returned "still
+		// running" instantly → the model gave up → child session was Aborted.
+		let seenTimeout: number | undefined;
+		const runner = makeRunner({
+			awaitCompletion: async (_id, timeoutMs) => {
+				seenTimeout = timeoutMs;
+				return {
+					id: "bg_x",
+					parentSessionID: "ses_parent",
+					description: "d",
+					agent: "build",
+					status: "completed",
+					createdAt: 1,
+					depth: 0,
+					concurrencyKey: "k",
+				};
+			},
+			readOutput: async () => ({ status: "completed", summaryText: "ok" }),
+		});
+		const tool = createBgOutputTool(runner);
+		// block:true with NO timeout_ms — exactly what the model sent live.
+		await run(tool, { task_id: "bg_x", block: true }, makeContext());
+		expect(seenTimeout).toBe(60_000);
+		expect(Number.isNaN(seenTimeout)).toBe(false);
+	});
+
+	test("explicit NaN/non-finite timeout_ms is coerced to the default", async () => {
+		let seenTimeout: number | undefined;
+		const runner = makeRunner({
+			awaitCompletion: async (_id, timeoutMs) => {
+				seenTimeout = timeoutMs;
+				return {
+					id: "bg_x",
+					parentSessionID: "ses_parent",
+					description: "d",
+					agent: "build",
+					status: "completed",
+					createdAt: 1,
+					depth: 0,
+					concurrencyKey: "k",
+				};
+			},
+			readOutput: async () => ({ status: "completed", summaryText: "ok" }),
+		});
+		const tool = createBgOutputTool(runner);
+		await run(
+			tool,
+			{ task_id: "bg_x", block: true, timeout_ms: Number.NaN },
+			makeContext(),
+		);
+		expect(seenTimeout).toBe(60_000);
+	});
+
 	test("block-abort path: abort fired mid-wait wins the race and removes its listener", async () => {
 		const controller = new AbortController();
 		let listenerCount = 0;

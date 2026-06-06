@@ -42,6 +42,18 @@ export interface BgTask {
 	notified?: boolean; // notification-queue flush state (Epic 1.4)
 }
 
+/**
+ * A single text part for a prompt's `parts` array. Lives here (not in
+ * session-runner.ts) so consumers building {@link LaunchRequest.contextParts}
+ * can reference it without importing the runner module.
+ */
+export interface TextPartInput {
+	type: "text";
+	text: string;
+	/** Model-only context (e.g. forked transcript); excluded from UI display. */
+	synthetic?: boolean;
+}
+
 export interface LaunchRequest {
 	parentSessionID: string;
 	description: string;
@@ -51,6 +63,12 @@ export interface LaunchRequest {
 	depth: number;
 	toolsOverride?: Record<string, boolean>;
 	noSpawnTools?: boolean; // default true
+	/**
+	 * Extra parts prepended BEFORE the task-prompt part in the launch
+	 * `promptAsync` call. Used to inject forked parent context (Epic 2.3). Order
+	 * is guaranteed: context parts first, prompt part last.
+	 */
+	contextParts?: TextPartInput[];
 }
 
 export interface ReadOpts {

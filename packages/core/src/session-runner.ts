@@ -34,7 +34,10 @@ import {
 	type TaskOutput,
 	type TaskOutputMessage,
 	type TaskOutputPart,
+	type TextPartInput,
 } from "./types";
+
+export type { TextPartInput } from "./types";
 
 // --- minimal structural SDK surface (audit rows a/b/d) --------------------
 
@@ -46,11 +49,6 @@ export interface SessionCreateBody {
 export interface PromptModel {
 	providerID: string;
 	modelID: string;
-}
-
-export interface TextPartInput {
-	type: "text";
-	text: string;
 }
 
 export interface SessionPromptAsyncBody {
@@ -333,7 +331,15 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		sessionID: string,
 		prompt: string,
 		tools: Record<string, boolean>,
+		contextParts?: TextPartInput[],
 	): void {
+		// Context parts (e.g. a forked parent transcript) come FIRST; the task
+		// prompt is always the LAST part. Ordering is load-bearing — the model must
+		// read the reference context before the instruction.
+		const parts: TextPartInput[] = [
+			...(contextParts ?? []),
+			{ type: "text", text: prompt },
+		];
 		client.session
 			.promptAsync({
 				path: { id: sessionID },
@@ -341,7 +347,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 					agent: task.agent,
 					...(task.model ? { model: toPromptModel(task.model) } : {}),
 					tools,
-					parts: [{ type: "text", text: prompt }],
+					parts,
 				},
 			})
 			.catch((err: unknown) => {
@@ -447,8 +453,14 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		await setIntermediate(task, "running");
 
 		// (7) fire-and-forget prompt. Failure routes through the gate (error flip
-		// releases the slot).
-		dispatchPrompt(task, sessionID, req.prompt, buildTools(req));
+		// releases the slot). Context parts (forked transcript) are prepended.
+		dispatchPrompt(
+			task,
+			sessionID,
+			req.prompt,
+			buildTools(req),
+			req.contextParts,
+		);
 
 		// (8) resolve at running — never await completion.
 		return task;

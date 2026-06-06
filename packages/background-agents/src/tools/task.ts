@@ -19,8 +19,19 @@
 
 import type { BgTask, SessionRunner } from "@drawers/core";
 import { tool } from "@opencode-ai/plugin";
+import { buildForkTranscript, type ForkMessage } from "../fork/transcript";
 
 const DEFAULT_AGENT = "build";
+
+/**
+ * Optional collaborators for `bg_task`. `fetchMessages` is the seam the engine
+ * exposes ({@link Engine.fetchSessionMessages}) so a `fork: true` launch can
+ * read the parent session's transcript and inject it as context. Omitted in
+ * unit tests that never exercise fork.
+ */
+export interface BgTaskToolDeps {
+	fetchMessages?: (sessionID: string) => Promise<ForkMessage[]>;
+}
 
 /**
  * Resume errors core raises are plain `Error`s whose `message` is prefixed with
@@ -63,7 +74,11 @@ function resumeResultText(taskTask: BgTask): string {
 	].join(" ");
 }
 
-export function createBgTaskTool(runner: SessionRunner) {
+export function createBgTaskTool(
+	runner: SessionRunner,
+	deps: BgTaskToolDeps = {},
+) {
+	const fetchMessages = deps.fetchMessages;
 	return tool({
 		description:
 			"Launch a background agent task that runs independently of this turn, " +
@@ -93,9 +108,17 @@ export function createBgTaskTool(runner: SessionRunner) {
 					"Resume an existing terminal task instead of launching a new " +
 						"one. When set, only `prompt` is used.",
 				),
+			fork: tool.schema
+				.boolean()
+				.default(false)
+				.describe(
+					"Fork this session's context into the child: the parent's " +
+						"transcript is injected as reference context before the task " +
+						"prompt. Only applies to launch (ignored on resume).",
+				),
 		},
 		async execute(args, context) {
-			const { description, prompt, agent, model, task_id } = args;
+			const { description, prompt, agent, model, task_id, fork } = args;
 
 			// --- RESUME mode -------------------------------------------------
 			if (task_id !== undefined) {
@@ -144,6 +167,31 @@ export function createBgTaskTool(runner: SessionRunner) {
 
 			context.metadata({ title: description });
 
+			// Fork: inject the parent session's transcript as a synthetic context
+			// part. An empty transcript ("") → launch WITHOUT contextParts (don't
+			// ship an empty header). A transcript-builder throw is the schema-drift
+			// guard — surface it as an honest error string; do NOT launch blind.
+			let contextParts:
+				| Array<{ type: "text"; text: string; synthetic: true }>
+				| undefined;
+			if (fork === true && fetchMessages) {
+				let transcript: string;
+				try {
+					const messages = await fetchMessages(context.sessionID);
+					transcript = buildForkTranscript(messages);
+				} catch (err) {
+					return (
+						"Cannot fork parent context: the transcript builder failed " +
+						`(${errorMessage(err)}). This usually means the SDK message ` +
+						"schema drifted. Not launching to avoid sending a child a blind " +
+						"or corrupt context."
+					);
+				}
+				if (transcript.length > 0) {
+					contextParts = [{ type: "text", text: transcript, synthetic: true }];
+				}
+			}
+
 			try {
 				const launched = await runner.launch({
 					parentSessionID: context.sessionID,
@@ -152,6 +200,7 @@ export function createBgTaskTool(runner: SessionRunner) {
 					agent,
 					model,
 					depth,
+					contextParts,
 				});
 				return launchResultText(launched);
 			} catch (err) {

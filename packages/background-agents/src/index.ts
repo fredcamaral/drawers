@@ -64,7 +64,7 @@ export const BackgroundAgentsPlugin: Plugin = async ({ client }) => {
 		logger,
 	);
 
-	const { runner, queue } = await createEngine({
+	const { runner, queue, fetchSessionMessages } = await createEngine({
 		client: adaptSdkClient(client),
 		logger,
 		onNotify,
@@ -78,7 +78,9 @@ export const BackgroundAgentsPlugin: Plugin = async ({ client }) => {
 		},
 		"chat.message": createChatMessageHook(queue, logger),
 		tool: {
-			bg_task: createBgTaskTool(runner),
+			bg_task: createBgTaskTool(runner, {
+				fetchMessages: fetchSessionMessages,
+			}),
 			bg_output: createBgOutputTool(runner),
 			bg_cancel: createBgCancelTool(runner),
 			bg_list: createBgListTool(runner),
