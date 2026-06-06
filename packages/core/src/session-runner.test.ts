@@ -462,6 +462,174 @@ describe("createSessionRunner — promptAsync rejection (.catch path)", () => {
 	});
 });
 
+describe("createSessionRunner — onSessionCreated hook", () => {
+	/**
+	 * A makeClient variant that records create/prompt into a shared `seq` array so
+	 * a test can assert the hook fires strictly between them. The hook itself
+	 * pushes its own marker; assertions compare against the seq order.
+	 */
+	function makeOrderedClient(seq: string[]) {
+		let createDeferred = defer<{ data?: { id: string } }>();
+		let promptDeferred = defer<void>();
+		const promptCalls: PromptCall[] = [];
+		const abortCalls: AbortCall[] = [];
+		const client: EngineClient = {
+			session: {
+				create() {
+					seq.push("create");
+					return createDeferred.promise;
+				},
+				promptAsync(opts) {
+					seq.push("promptAsync");
+					promptCalls.push({ id: opts.path.id, body: opts.body });
+					return promptDeferred.promise;
+				},
+				abort(opts) {
+					abortCalls.push({ id: opts.path.id });
+					return Promise.resolve({ data: true });
+				},
+				messages() {
+					return Promise.resolve({ data: [] });
+				},
+				get() {
+					return Promise.resolve({ data: { id: "ses" } });
+				},
+			},
+		};
+		return {
+			client,
+			promptCalls,
+			abortCalls,
+			resolveCreate: (id: string) => createDeferred.resolve({ data: { id } }),
+			resolvePrompt: () => promptDeferred.resolve(),
+			reset: () => {
+				createDeferred = defer();
+				promptDeferred = defer();
+			},
+		};
+	}
+
+	test("hook fires between create resolving and promptAsync dispatch (order log)", async () => {
+		const seq: string[] = [];
+		const h = makeOrderedClient(seq);
+		const concurrency = new ConcurrencyManager();
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+
+		const launched = runner.launch(
+			baseReq({
+				onSessionCreated: () => {
+					seq.push("onSessionCreated");
+				},
+			}),
+		);
+		await flush();
+		h.resolveCreate("ses_child");
+		await launched;
+
+		expect(seq).toEqual(["create", "onSessionCreated", "promptAsync"]);
+	});
+
+	test("hook receives the real child sessionID", async () => {
+		const seq: string[] = [];
+		const h = makeOrderedClient(seq);
+		const concurrency = new ConcurrencyManager();
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+
+		let seen: string | undefined;
+		const launched = runner.launch(
+			baseReq({
+				onSessionCreated: (sessionID) => {
+					seen = sessionID;
+				},
+			}),
+		);
+		await flush();
+		h.resolveCreate("ses_real_child");
+		await launched;
+
+		expect(seen).toBe("ses_real_child");
+	});
+
+	test("absent hook → unchanged launch behavior (create + prompt, slot held)", async () => {
+		const seq: string[] = [];
+		const h = makeOrderedClient(seq);
+		const concurrency = new ConcurrencyManager();
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+		const model = "anthropic/opus";
+
+		const launched = runner.launch(baseReq({ model }));
+		await flush();
+		h.resolveCreate("ses_child");
+		const task = await launched;
+
+		expect(task.status).toBe("running");
+		expect(seq).toEqual(["create", "promptAsync"]);
+		expect(concurrency.runningCount(model)).toBe(1);
+	});
+
+	test("throwing hook: launch rejects with the callback error, slot released, task terminal error, orphan session aborted, no promptAsync", async () => {
+		const seq: string[] = [];
+		const h = makeOrderedClient(seq);
+		// limit 1 so a follow-up launch proves the slot was released.
+		const concurrency = new ConcurrencyManager({ defaultConcurrency: 1 });
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+		const model = "anthropic/opus";
+
+		const launched = runner.launch(
+			baseReq({
+				model,
+				onSessionCreated: () => {
+					throw new Error("registration blew up");
+				},
+			}),
+		);
+		await flush();
+		h.resolveCreate("ses_orphan");
+
+		await expect(launched).rejects.toThrow("registration blew up");
+		await flush();
+
+		// task landed terminal error carrying the callback message.
+		const task = at(runner.list(), 0);
+		expect(task.status).toBe("error");
+		expect(task.error).toContain("registration blew up");
+
+		// orphan session aborted; prompt never dispatched.
+		expect(h.abortCalls).toEqual([{ id: "ses_orphan" }]);
+		expect(seq).toEqual(["create"]); // no promptAsync
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		// slot was released → a fresh launch on the limit-1 manager succeeds.
+		h.reset();
+		const next = runner.launch(baseReq({ model, description: "after" }));
+		await flush();
+		h.resolveCreate("ses_next");
+		const nextTask = await next;
+		expect(nextTask.status).toBe("running");
+		expect(concurrency.runningCount(model)).toBe(1);
+	});
+});
+
 describe("createSessionRunner — list", () => {
 	test("returns all tasks in createdAt order, filterable by parent", async () => {
 		const h = makeClient();

@@ -69,6 +69,13 @@ export interface LaunchRequest {
 	 * is guaranteed: context parts first, prompt part last.
 	 */
 	contextParts?: TextPartInput[];
+	/**
+	 * Invoked SYNCHRONOUSLY after the child session is created and BEFORE the
+	 * prompt is dispatched. Lets callers register per-session state (e.g. a
+	 * structured-output schema) with no race against the child's first turn.
+	 * A throw here fails the launch loudly — it is a caller programming error.
+	 */
+	onSessionCreated?: (sessionID: string) => void;
 }
 
 export interface ReadOpts {

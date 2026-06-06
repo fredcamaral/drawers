@@ -1,0 +1,477 @@
+import { describe, expect, test } from "bun:test";
+import {
+	type BgTask,
+	ConcurrencyManager,
+	type LaunchRequest,
+	type ReadOpts,
+	type SessionRunner,
+	type TaskOutput,
+	type TaskStatus,
+} from "@drawers/core";
+import { createAgentPrimitive } from "./agent-call";
+import {
+	createSchemaRegistry,
+	type SchemaRegistry,
+} from "./structured/registry";
+import { SchemaCompileError } from "./structured/validate";
+import {
+	AgentCapError,
+	BudgetExhaustedError,
+	type BudgetView,
+	type ProgressEvent,
+} from "./types";
+
+/**
+ * A deferred completion handle: lets a test control exactly when a launched
+ * task transitions to terminal, so concurrency overlap can be observed.
+ */
+interface Deferred {
+	resolve: (status: TaskStatus) => void;
+}
+
+interface FakeRunnerOpts {
+	/** Status returned by awaitCompletion for every task (when not deferred). */
+	status?: TaskStatus;
+	/** summaryText returned by readOutput. */
+	summaryText?: string;
+	/** When set, launch() throws this. */
+	launchThrows?: Error;
+	/** When set, awaitCompletion() throws this. */
+	awaitThrows?: Error;
+	/** When true, awaitCompletion blocks until the test resolves it. */
+	deferred?: boolean;
+	/** When set, the synthetic sessionID assigned to the launched task. */
+	sessionID?: string;
+	/** When set, resume() throws this (e.g. sessionExpired). */
+	resumeThrows?: Error;
+	/** Invoked when launch() runs, BEFORE awaitCompletion, with the sessionID. */
+	onLaunched?: (sessionID: string) => void;
+}
+
+/** Minimal SessionRunner fake covering only what the primitive touches. */
+class FakeRunner implements SessionRunner {
+	launches: LaunchRequest[] = [];
+	private seq = 0;
+	private inFlight = 0;
+	maxInFlight = 0;
+	private deferreds: Deferred[] = [];
+
+	constructor(private readonly opts: FakeRunnerOpts = {}) {}
+
+	resumes: { id: string; prompt: string }[] = [];
+
+	async launch(req: LaunchRequest): Promise<BgTask> {
+		if (this.opts.launchThrows) {
+			throw this.opts.launchThrows;
+		}
+		this.launches.push(req);
+		this.seq += 1;
+		this.inFlight += 1;
+		this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+		const sessionID = this.opts.sessionID ?? `ses_${this.seq}`;
+		// Mirror core's synchronous onSessionCreated hook (registers schema).
+		req.onSessionCreated?.(sessionID);
+		this.opts.onLaunched?.(sessionID);
+		const task = makeTask(`bg_${this.seq}`, req);
+		task.sessionID = sessionID;
+		return task;
+	}
+
+	async awaitCompletion(taskId: string): Promise<BgTask> {
+		if (this.opts.awaitThrows) {
+			this.inFlight -= 1;
+			throw this.opts.awaitThrows;
+		}
+		if (this.opts.deferred) {
+			const status = await new Promise<TaskStatus>((resolve) => {
+				this.deferreds.push({ resolve });
+			});
+			this.inFlight -= 1;
+			return makeTaskWithStatus(taskId, status);
+		}
+		this.inFlight -= 1;
+		return makeTaskWithStatus(taskId, this.opts.status ?? "completed");
+	}
+
+	/** Resolve the oldest still-blocked deferred completion. */
+	releaseOne(status: TaskStatus = "completed"): void {
+		const next = this.deferreds.shift();
+		if (!next) {
+			throw new Error("no deferred completion to release");
+		}
+		next.resolve(status);
+	}
+
+	pending(): number {
+		return this.deferreds.length;
+	}
+
+	async readOutput(_taskId: string, _opts?: ReadOpts): Promise<TaskOutput> {
+		return {
+			status: this.opts.status ?? "completed",
+			summaryText: this.opts.summaryText ?? "the final text",
+		};
+	}
+
+	async cancel(taskId: string): Promise<BgTask> {
+		return makeTaskWithStatus(taskId, "cancelled");
+	}
+
+	async resume(taskId: string, prompt: string): Promise<BgTask> {
+		if (this.opts.resumeThrows) {
+			throw this.opts.resumeThrows;
+		}
+		this.resumes.push({ id: taskId, prompt });
+		return makeTaskWithStatus(taskId, "running");
+	}
+
+	list(): BgTask[] {
+		return [];
+	}
+
+	async handleEvent(): Promise<void> {}
+
+	async dispose(): Promise<void> {}
+}
+
+function makeTask(id: string, req: LaunchRequest): BgTask {
+	return {
+		id,
+		parentSessionID: req.parentSessionID,
+		description: req.description,
+		agent: req.agent,
+		status: "running",
+		createdAt: 0,
+		depth: req.depth,
+		concurrencyKey: "k",
+		model: req.model,
+	};
+}
+
+function makeTaskWithStatus(id: string, status: TaskStatus): BgTask {
+	return {
+		id,
+		parentSessionID: "parent",
+		description: "d",
+		agent: "build",
+		status,
+		createdAt: 0,
+		depth: 0,
+		concurrencyKey: "k",
+	};
+}
+
+/** Drain the microtask queue so settled promises propagate before asserting. */
+async function flush(): Promise<void> {
+	for (let i = 0; i < 5; i += 1) {
+		await Promise.resolve();
+	}
+}
+
+function budget(total: number | null, remaining = 0): BudgetView {
+	return {
+		total,
+		spent: () => 0,
+		remaining: () => remaining,
+	};
+}
+
+interface HarnessOverrides {
+	runner?: SessionRunner;
+	gate?: ConcurrencyManager;
+	counters?: { agents: number };
+	budget?: BudgetView;
+	currentPhase?: () => string | undefined;
+	liveTasks?: Set<string>;
+	defaults?: { agent: string; awaitTimeoutMs?: number };
+	registry?: SchemaRegistry;
+}
+
+function harness(overrides: HarnessOverrides = {}) {
+	const events: ProgressEvent[] = [];
+	const runner = overrides.runner ?? new FakeRunner();
+	const gate =
+		overrides.gate ?? new ConcurrencyManager({ defaultConcurrency: 5 });
+	const counters = overrides.counters ?? { agents: 0 };
+	const liveTasks = overrides.liveTasks ?? new Set<string>();
+	const registry = overrides.registry ?? createSchemaRegistry();
+	const agent = createAgentPrimitive({
+		runner,
+		parentSessionID: "parent",
+		runId: "run-1",
+		gate,
+		counters,
+		budget: overrides.budget ?? budget(null, Number.POSITIVE_INFINITY),
+		emit: (e) => events.push(e),
+		currentPhase: overrides.currentPhase ?? (() => undefined),
+		liveTasks,
+		defaults: overrides.defaults ?? { agent: "build" },
+		registry,
+	});
+	return { agent, events, runner, gate, counters, liveTasks, registry };
+}
+
+describe("createAgentPrimitive — result mapping", () => {
+	test("completed status resolves to summaryText string", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent } = harness({ runner });
+		expect(await agent("do it")).toBe("DONE");
+	});
+
+	test("error status resolves to null", async () => {
+		const runner = new FakeRunner({ status: "error" });
+		const { agent } = harness({ runner });
+		expect(await agent("do it")).toBeNull();
+	});
+
+	test("cancelled status resolves to null", async () => {
+		const runner = new FakeRunner({ status: "cancelled" });
+		const { agent } = harness({ runner });
+		expect(await agent("do it")).toBeNull();
+	});
+
+	test("launch throwing resolves to null and emits a warn", async () => {
+		const runner = new FakeRunner({ launchThrows: new Error("spawn failed") });
+		const { agent, events } = harness({ runner });
+		expect(await agent("do it")).toBeNull();
+		expect(events.some((e) => e.type === "warn")).toBe(true);
+	});
+
+	test("awaitCompletion throwing resolves to null and emits a warn", async () => {
+		const runner = new FakeRunner({ awaitThrows: new Error("timeout") });
+		const { agent, events } = harness({ runner });
+		expect(await agent("do it")).toBeNull();
+		expect(events.some((e) => e.type === "warn")).toBe(true);
+	});
+});
+
+describe("createAgentPrimitive — caps and budget throw", () => {
+	test("the 1001st call throws AgentCapError", async () => {
+		const { agent } = harness({ counters: { agents: 1000 } });
+		await expect(agent("do it")).rejects.toBeInstanceOf(AgentCapError);
+	});
+
+	test("budget exhaustion throws BudgetExhaustedError", async () => {
+		const { agent } = harness({ budget: budget(100, 0) });
+		await expect(agent("do it")).rejects.toBeInstanceOf(BudgetExhaustedError);
+	});
+});
+
+describe("createAgentPrimitive — structured output (schema)", () => {
+	const SCHEMA = {
+		type: "object",
+		properties: { n: { type: "number" } },
+		required: ["n"],
+	} as const;
+
+	test("a malformed schema detonates with SchemaCompileError (script bug)", async () => {
+		const { agent } = harness();
+		// `type: "bogus"` is not a valid JSON Schema keyword value — ajv rejects it.
+		await expect(
+			agent("do it", { schema: { type: "bogus" } }),
+		).rejects.toBeInstanceOf(SchemaCompileError);
+	});
+
+	test("registers the compiled schema and overrides tools on launch", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_x",
+			// Pre-store a result so completion resolves the object (no nudge).
+			onLaunched: () => registry.store("ses_x", { n: 7 }),
+		});
+		const { agent } = harness({ runner, registry });
+		const result = await agent("do it", { schema: SCHEMA });
+		expect(result).toEqual({ n: 7 });
+		const launch = runner.launches[0];
+		expect(launch?.toolsOverride).toEqual({ structured_output: true });
+		expect(launch?.onSessionCreated).toBeDefined();
+		// Prompt carries the schema-instruction suffix.
+		expect(launch?.prompt).toContain("structured_output");
+		expect(launch?.prompt).toContain(JSON.stringify(SCHEMA));
+	});
+
+	test("resolves the stored object when a result is present", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_y",
+			onLaunched: () => registry.store("ses_y", { n: 9 }),
+		});
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toEqual({ n: 9 });
+		// Cleared in finally.
+		expect(registry.resultFor("ses_y").present).toBe(false);
+		expect(registry.lookup("ses_y")).toBeUndefined();
+	});
+
+	test("no result on completion → nudges once then resolves null", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "completed", sessionID: "ses_z" });
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(runner.resumes.length).toBe(1);
+		expect(runner.resumes[0]?.prompt).toContain("have not returned");
+	});
+
+	test("no result after the nudge → resolves null", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "completed", sessionID: "ses_n" });
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(runner.resumes.length).toBe(1);
+	});
+
+	test("error status → null with no nudge", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "error", sessionID: "ses_e" });
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(runner.resumes.length).toBe(0);
+	});
+
+	test("resume throwing (sessionExpired) → null, degrade, warn", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_r",
+			resumeThrows: new Error("sessionExpired"),
+		});
+		const { agent, events } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(events.some((e) => e.type === "warn")).toBe(true);
+	});
+
+	test("clears the registry entry on completion regardless of outcome", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "completed", sessionID: "ses_c" });
+		const { agent } = harness({ runner, registry });
+		await agent("do it", { schema: SCHEMA });
+		expect(registry.lookup("ses_c")).toBeUndefined();
+		expect(registry.resultFor("ses_c").present).toBe(false);
+	});
+});
+
+describe("createAgentPrimitive — concurrency gate", () => {
+	test("the gate slot is released after the error path", async () => {
+		// Limit-1 gate: if the error path leaked its slot, the next acquire blocks.
+		const gate = new ConcurrencyManager({ defaultConcurrency: 1 });
+		const runner = new FakeRunner({ awaitThrows: new Error("boom") });
+		const { agent } = harness({ runner, gate });
+		expect(await agent("first")).toBeNull();
+		// A direct acquire must succeed synchronously if the slot was freed.
+		expect(gate.runningCount("run-1")).toBe(0);
+		expect(await agent("second")).toBeNull();
+	});
+
+	test("max in-flight launches never exceed the gate limit", async () => {
+		const gate = new ConcurrencyManager({ defaultConcurrency: 2 });
+		const runner = new FakeRunner({ deferred: true });
+		const { agent } = harness({ runner, gate });
+
+		const calls = [agent("a"), agent("b"), agent("c"), agent("d")];
+		// Let microtasks settle so the first two launch and the rest queue.
+		await flush();
+		expect(runner.maxInFlight).toBe(2);
+		expect(runner.launches.length).toBe(2);
+		expect(runner.pending()).toBe(2);
+
+		// Drain: each release frees a slot. The slot is handed to a queued call,
+		// which launches on a later microtask — flush() waits for that chain.
+		for (let i = 0; i < 4; i += 1) {
+			runner.releaseOne();
+			await flush();
+		}
+
+		await Promise.all(calls);
+		// Never more than 2 concurrent launches across the whole drain.
+		expect(runner.maxInFlight).toBe(2);
+		expect(runner.launches.length).toBe(4);
+	});
+});
+
+describe("createAgentPrimitive — progress events", () => {
+	test("start and end events carry label and phase", async () => {
+		const { agent, events } = harness({ currentPhase: () => "Analyze" });
+		await agent("prompt text", { label: "my-label" });
+		const start = events.find((e) => e.type === "agent:start");
+		const end = events.find((e) => e.type === "agent:end");
+		expect(start).toEqual({
+			type: "agent:start",
+			label: "my-label",
+			phase: "Analyze",
+		});
+		expect(end).toEqual({
+			type: "agent:end",
+			label: "my-label",
+			status: "completed",
+		});
+	});
+
+	test("label defaults to the first 60 chars of the prompt", async () => {
+		const long = "x".repeat(100);
+		const { agent, events } = harness();
+		await agent(long);
+		const start = events.find((e) => e.type === "agent:start");
+		expect(start).toEqual({
+			type: "agent:start",
+			label: "x".repeat(60),
+			phase: undefined,
+		});
+	});
+
+	test("explicit opts.phase beats currentPhase()", async () => {
+		const { agent, events } = harness({ currentPhase: () => "Global" });
+		await agent("p", { phase: "Local" });
+		const start = events.find((e) => e.type === "agent:start");
+		expect(start).toMatchObject({ type: "agent:start", phase: "Local" });
+	});
+});
+
+describe("createAgentPrimitive — launch wiring and live tasks", () => {
+	test("launch receives agentType, model, and parent session", async () => {
+		const runner = new FakeRunner();
+		const { agent } = harness({ runner });
+		await agent("prompt", {
+			label: "L",
+			model: "anthropic/claude",
+			agentType: "reviewer",
+		});
+		expect(runner.launches[0]).toEqual({
+			parentSessionID: "parent",
+			description: "L",
+			prompt: "prompt",
+			agent: "reviewer",
+			model: "anthropic/claude",
+			depth: 0,
+		});
+	});
+
+	test("agent defaults to deps.defaults.agent when agentType absent", async () => {
+		const runner = new FakeRunner();
+		const { agent } = harness({ runner, defaults: { agent: "general" } });
+		await agent("prompt");
+		expect(runner.launches[0]?.agent).toBe("general");
+	});
+
+	test("liveTasks holds the id during the call and is empty after", async () => {
+		const runner = new FakeRunner({ deferred: true });
+		const liveTasks = new Set<string>();
+		const { agent } = harness({ runner, liveTasks });
+		const call = agent("p");
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(liveTasks.size).toBe(1);
+		runner.releaseOne();
+		await call;
+		expect(liveTasks.size).toBe(0);
+	});
+
+	test("isolation:worktree emits a warn but still runs", async () => {
+		const runner = new FakeRunner({ summaryText: "OK" });
+		const { agent, events } = harness({ runner });
+		expect(await agent("p", { isolation: "worktree" })).toBe("OK");
+		expect(events.some((e) => e.type === "warn")).toBe(true);
+		expect(runner.launches.length).toBe(1);
+	});
+});

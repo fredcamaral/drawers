@@ -20,7 +20,7 @@
 |-------|-----------|-------|--------|
 | 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
 | 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Complete |
-| 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Epic-level |
+| 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Epic-level |
 | 5 | Both plugins published to npm and installable in a clean project via `"plugin": [...]` | 5.1 | Epic-level |
 
@@ -421,6 +421,42 @@ interface SessionRunner {
 **Dependencies:** Phase 1 (engine contract only)
 **Done when:** valid scripts run; TypeScript syntax, computed meta, and banned builtins each fail with the spec's prescribed behavior.
 
+> **Elaboration deviations (recorded 2026-06-06, post-Phase-2):** (a) Phase 3 introduces the repo's first third-party runtime deps — `acorn` (AST parsing; pure-literal meta validation and TS rejection are not honestly doable with regex) and `ajv` (JSON Schema validation, Epic 3.3). Both are zero-dependency ecosystem standards, scoped to `packages/workflows` only. (b) The "workflow-scoped concurrency key" of Epic 3.2 is a **standalone** `ConcurrencyManager` instance (`{ defaultConcurrency: min(16, cores−2) }`, key = runId) layered ABOVE the runner; the runner injected into the runtime must be configured with `defaultConcurrency: 0` (unlimited) or the workflow gate is not authoritative — Phase 4 wiring requirement, documented in the runtime's deps contract. (c) Epic 3.3's "small hook in core" is `LaunchRequest.onSessionCreated?: (sessionID: string) => void`, invoked SYNCHRONOUSLY between `session.create` resolving and the prompt dispatch (session-runner.ts:420-450) — closes the race where the child calls `structured_output` before the schema registry knows its sessionID.
+
+#### Task 3.1.1: Scaffold `packages/workflows` + pure-literal meta parser
+
+- [x] Done — `ef9323b`; 18 tests. Deviations: root `typecheck` script extended to cover the new package (gate was a no-op otherwise); acorn pinned 8.16.0 exact (repo convention); `whenToUse` included in WorkflowMeta per spec §3.2 (task sketch omitted it).
+
+**Context:** The package does not exist. Mirror `packages/background-agents`' shape: `package.json` (`name: "opencode-drawer-workflows"`, `type: module`, `private: true`, deps `@drawers/core@workspace:*` + `acorn`, devDep `bun-types@1.3.14`) and two-line `tsconfig.json` extending `../../tsconfig.base.json` (see `packages/background-agents/tsconfig.json`). Spec §3.2: every script begins `export const meta = {...}` as a PURE literal — no variables, calls, spreads, or interpolation; `name` + `description` required strings; `phases` optional `{title, detail?, model?}[]`. Spec §3.1: scripts are plain JavaScript — TypeScript syntax fails to parse.
+
+**Implementation vision:** `src/runtime/meta.ts`: `parseScript(source: string): ParsedScript` where `ParsedScript = { meta: WorkflowMeta, bodySource: string }`. Pipeline: (1) `acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" })` — a parse failure (including any TS annotation) surfaces as `ScriptSyntaxError` carrying acorn's message + position; (2) walk top-level nodes: exactly one `ExportNamedDeclaration` declaring `const meta` is required (missing → `MetaError("script must begin with export const meta = {...}")`); any OTHER import/export declaration → error "workflow scripts are self-contained — no imports/exports beyond meta"; (3) pure-literal walk of the meta `ObjectExpression`: allowed nodes are ObjectExpression with non-computed Identifier/string keys, ArrayExpression, and Literal of type string/number/boolean/null; EVERYTHING else (Identifier reference, CallExpression, SpreadElement, TemplateLiteral — even without interpolation — UnaryExpression, etc.) → `MetaError` naming the offending construct and its position; (4) materialize the literal into a JS value (recursive AST→value, NOT eval), validate `name`/`description` are non-empty strings, `phases` entries have string `title`; (5) `bodySource` = source with the meta export statement's `[start, end)` range blanked (replaced by whitespace of equal length so error line numbers in the body still map to the original script). No default export, no `export default meta` variant — one shape only.
+
+**Files:**
+- Create: `packages/workflows/package.json`, `packages/workflows/tsconfig.json`
+- Create: `packages/workflows/src/runtime/meta.ts`
+- Create: `packages/workflows/src/index.ts` (re-exports, grows with the phase)
+- Test: `packages/workflows/src/runtime/meta.test.ts`
+
+**Verification:** `bun test packages/workflows` — named cases: valid meta (full + minimal), TS syntax → ScriptSyntaxError, computed meta (identifier ref, call, spread, template literal, computed key — one case each), missing/empty name or description, stray import, stray second export, body line numbers preserved after blanking.
+
+**Done when:** parser accepts spec-valid scripts and rejects each §3.1/§3.2 violation with a positioned, named error; package typechecks inside the workspace.
+
+#### Task 3.1.2: Sandboxed body evaluation with determinism guards
+
+- [x] Done — 15 tests. Deviations: `WorkflowDate` ctor typed `unknown[]` + cast to `typeof Date` (the zero-arg branch the spec bans is a tsc type error against real Date overloads; documented inline); console shadow joins varargs into ONE narrator string (reconciled to types.ts's `log(message: string)` contract).
+
+**Context:** Spec §3.1: body runs in async context (top-level `await`, and the script's `return` value is the workflow result); `Date.now()`, `Math.random()`, argless `new Date()` THROW; no filesystem/Node APIs. Threat model is resume-cache poisoning (nondeterministic values reaching `agent()` prompts void the §7 replay cache), NOT containment — the author already holds bash. So shadowing by parameter injection is the right weight: no `vm`, no realms. Consumes `bodySource` from 3.1.1.
+
+**Implementation vision:** `src/runtime/evaluate.ts`: `evaluateScript(bodySource, api: RuntimeApi): Promise<unknown>` where `RuntimeApi = { agent, pipeline, parallel, phase, log, args, budget, workflow }` (shapes owned by Epic 3.2; this task takes them as opaque injected values). Build via `AsyncFunction` constructor: parameter list = the 8 API names + the shadow list; body = `"use strict";\n` + bodySource (strict mode makes accidental global writes throw). Shadow list and values: `Date` → wrapper class (extends real Date; constructor with zero args throws `DeterminismError("new Date() is banned in workflow scripts — pass timestamps via args")`, with args passes through; static `now` throws; `parse`/`UTC` pass through), `Math` → `new Proxy(Math, { get })` throwing only on `random`, `globalThis` → frozen empty object (closes the `globalThis.Date.now()` bypass — the cache-poisoning path that parameter shadowing alone would miss), `process`/`require`/`module`/`exports`/`Bun`/`fetch` → `undefined`, `setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask` → throwing stubs ("workflow scripts orchestrate agents; they do not schedule"), `console` → object whose `log`/`warn`/`error`/`info` forward to the injected `log()` (scripts naturally write `console.log`; routing beats throwing). Errors: constructor-time SyntaxError → `ScriptSyntaxError`; runtime throw inside the body propagates as-is (the runner layer in 3.2.3 wraps it with run context). Return: whatever the body `return`s (undefined allowed).
+
+**Files:**
+- Create: `packages/workflows/src/runtime/evaluate.ts`
+- Test: `packages/workflows/src/runtime/evaluate.test.ts`
+
+**Verification:** `bun test packages/workflows` — named cases: body returns value / awaits injected agent stub; `Date.now()` throws DeterminismError; `Math.random()` throws; argless `new Date()` throws but `new Date(123)` and `Math.floor` work; `globalThis.Date` unreachable; `process`/`fetch` undefined; `setTimeout` throws; `console.log` reaches `log()`; strict-mode accidental global throws; thrown body error propagates with message intact.
+
+**Done when:** every banned builtin fails exactly as spec §3.1 prescribes, allowed builtins (`JSON`, `Math.floor`, `Array`…) work untouched, and the body's return value round-trips.
+
 ### Epic 3.2: Orchestration primitives
 
 **Goal:** `agent()` (via `SessionRunner.awaitCompletion` — never parent-wake), `pipeline()` (no barrier, per-item chains, throw→null), `parallel()` (barrier, never rejects), `phase()`/`log()` (progress journal), `args`, concurrency caps (`min(16, cores−2)` via a workflow-scoped concurrency key), 1,000-agent lifetime cap, 4,096-item call cap.
@@ -428,12 +464,98 @@ interface SessionRunner {
 **Dependencies:** Epic 3.1
 **Done when:** spec §3.3/§4/§5/§9 semantics each have a conformance test (incl. degrade-don't-detonate: null propagation vs thrown caps).
 
+#### Task 3.2.1: `agent()` primitive over the core runner
+
+- [x] Done — 17 tests incl. max-in-flight==limit proof against real ConcurrencyManager. Deviations: `AgentPrimitiveDeps` exported as named interface (referenceable by 3.2.3 wiring); `awaitCompletion` timeout maps to null+warn like any throw (degrade) — a timed-out agent is indistinguishable from a crashed one at script level, by design.
+
+**Context:** Spec §3.3 row 1 + §9: `agent(prompt, opts?)` resolves to the subagent's final text, or `null` on terminal failure/cancellation — never rejects for agent-level failure; ONLY caps/budget throw. Core provides everything needed: `runner.launch` (session-runner.ts:359-467), `runner.awaitCompletion`, `runner.readOutput` whose `summaryText` is exactly "last assistant message text" (session-runner.ts:632-644). SPAWN_GUARD already disables `bg_*`/`workflow*` in children (session-runner.ts:130-138) — workflow children inherit that for free. Concurrency: standalone `ConcurrencyManager` (concurrency.ts:56) accepts an arbitrary string key with `defaultConcurrency` — per elaboration deviation (b), key = runId, limit `min(16, cores − 2)`.
+
+**Implementation vision:** `src/runtime/agent-call.ts`: `createAgentPrimitive(deps)` → the `agent` function injected into scripts. Deps: `{ runner: SessionRunner, parentSessionID, runId, gate: ConcurrencyManager, counters: { agents: number }, budget: BudgetView, emit: ProgressEmitter, defaults: { agent: string, awaitTimeoutMs?: number } }`. Flow per call: (1) lifetime check — `counters.agents >= 1000` → throw `AgentCapError` (spec §5: these ARE meant to stop the run); increment BEFORE acquire so queued calls count; (2) budget check — `budget.total !== null && budget.remaining() <= 0` → throw `BudgetExhaustedError` (Phase 3 ships the null-budget default, see 3.2.3; the check exists NOW so 4.3 only swaps the provider); (3) `await gate.acquire(runId)`; (4) `emit({ type: "agent:start", label, phase })` where label = `opts.label ?? prompt.slice(0, 60)`, phase = `opts.phase ?? currentPhase`; (5) `runner.launch({ parentSessionID, description: label, prompt, agent: opts.agentType ?? defaults.agent, model: opts.model, depth: 0 })` — depth 0 is correct: workflow children are first-level children of the host session and SPAWN_GUARD blocks their spawning anyway; (6) `runner.awaitCompletion(task.id, defaults.awaitTimeoutMs ?? 1_800_000)` (30 min; the engine's stale timeout is the real hang-stopper); (7) in `finally`: `gate.release(runId)` — release on EVERY path or the slot leaks; (8) map result: `completed` → `(await runner.readOutput(task.id)).summaryText`; `error`/`cancelled` → `null`; launch() itself throwing (depth guard, client failure) → log via emit + resolve `null` (degrade, don't detonate); (9) `emit({ type: "agent:end", label, status })`. `opts.isolation: 'worktree'` is accepted but ignored with an emitted warning line (OpenCode has no worktree session primitive; honest no-op, documented). `schema` opt is wired in 3.3.2 — here it throws `NotYetSupportedError` so 3.3's RED test exists naturally.
+
+**Files:**
+- Create: `packages/workflows/src/runtime/agent-call.ts`
+- Create: `packages/workflows/src/runtime/types.ts` (`RuntimeApi`, `ProgressEvent`, `BudgetView`, error classes — the phase's internal contract)
+- Test: `packages/workflows/src/runtime/agent-call.test.ts` (FakeRunner implementing `SessionRunner`)
+
+**Verification:** `bun test packages/workflows` — named cases: completed → summaryText; error → null; cancelled → null; launch throw → null; 1001st call throws AgentCapError; gate slot released after error path (acquire again succeeds); concurrent calls beyond limit queue (FakeRunner with deferred completions: max in-flight == limit); start/end events emitted with label+phase.
+
+**Done when:** all §9 null-vs-throw semantics for `agent()` hold under test and the gate provably bounds in-flight launches.
+
+#### Task 3.2.2: `pipeline()` and `parallel()` composition
+
+- [x] Done — 18 tests incl. deferred-controlled no-barrier interleaving proof. Deviation (load-bearing): `parallel` uses `Promise.resolve().then(() => thunk())` not `.then(thunk)` — `.then(nonCallable)` is identity-passthrough per ES spec, so the literal vision one-liner would yield `undefined` (not `null`) for non-function thunks; explicit invocation routes both sync throws and non-callable TypeError into `.catch(() => null)`. ItemCapError's canonical home is compose.ts (carries count/cap); types.ts re-exports.
+
+**Context:** Spec §3.3 rows 2-3, §4, §5, §9. These are PURE composition functions — they never touch the runner; they compose whatever async functions the script passes (usually closures over `agent()`). `pipeline(items, ...stages)`: per-item independent chains, NO barrier between stages, stage signature `(prevResult, originalItem, index)`, a throwing stage drops THAT item to `null` and skips its remaining stages. `parallel(thunks)`: barrier, failing thunk → `null` in the result array, the call itself NEVER rejects. Both: >4096 items/thunks → explicit throw at call time (never silent truncation).
+
+**Implementation vision:** `src/runtime/compose.ts`: two standalone exports, no deps — they get injected into scripts as-is. `pipeline`: validate `items.length <= 4096` (else throw `ItemCapError` with the actual count); `Promise.all(items.map(async (item, i) => { let prev = item; for (const stage of stages) { try { prev = await stage(prev, item, i); } catch { return null; } } return prev; }))` — the per-item loop IS the no-barrier property: nothing synchronizes across items. `parallel`: same cap check; `Promise.all(thunks.map(t => Promise.resolve().then(t).catch(() => null)))` — `Promise.resolve().then(t)` also catches SYNCHRONOUSLY-throwing thunks (a bare `t()` would reject the whole call). Edge cases pinned by tests: empty items/thunks → `[]`; zero stages → items returned as-is; non-function thunk → that slot `null` (it throws inside `.then`, caught); stage throw on item A does not affect item B's chain.
+
+**Files:**
+- Create: `packages/workflows/src/runtime/compose.ts`
+- Test: `packages/workflows/src/runtime/compose.test.ts`
+
+**Verification:** `bun test packages/workflows` — named cases incl. the no-barrier proof: deferred-controlled stages where item B finishes stage 2 while item A is still held in stage 1, asserted via an event order log; stage args `(prev, originalItem, index)` asserted at stage 2+; throw→null isolation; sync-throwing thunk; 4097 items → ItemCapError; never-rejects property for parallel.
+
+**Done when:** the interleaving test proves no barrier exists in `pipeline`, `parallel` provably never rejects, and both caps throw with named errors.
+
+#### Task 3.2.3: Runtime assembly + spec-conformance suite
+
+- [x] Done — 20 new tests (conformance a-j + unit), full suite green. Deviations: meta.ts gained `allowReturnOutsideFunction: true` (LOAD-BEARING — ES-module parse forbade the spec-mandated top-level `return`; latent seam surfaced at first parse→evaluate integration); gate floor `max(1, ...)` (cores=2 would yield 0 = UNLIMITED in ConcurrencyManager); no separate phase progress event — phase titles flow via agent:start only (Phase 4 renders from there).
+
+**Context:** Glue 3.1 + 3.2 into the phase's public surface: `createWorkflowRun`. Spec §2.3/§3.3: `phase(title)` sets the progress group for subsequent `agent()` calls (per-call `opts.phase` wins inside concurrent stages); `log(message)` emits a narrator line; `args` passed verbatim; `budget` present from day one (§6 view; Phase 3 default provider = `{ total: null, spent: () => 0 }` so `remaining()` is `Infinity` — 4.3 swaps in the real token source); `workflow()` throws `NotYetSupportedError("sub-workflows arrive with the workflows plugin (Phase 4)")` — a complete API surface beats a ReferenceError. Cores: `os.availableParallelism()` via `node:os` (Bun implements it), injectable for tests. The conformance suite drives the REAL `createSessionRunner` with the fake-EngineClient pattern from `packages/core/src/session-runner.test.ts:54-100` (`makeClient()` deferreds) — fidelity over a FakeRunner where it matters.
+
+**Implementation vision:** `src/runtime/index.ts`: `createWorkflowRun(deps: { runner, parentSessionID, runId, args?, clock?, cores?, budget?, onProgress?, defaults? })` → `{ run(source: string): Promise<WorkflowResult>, abort(): void }`. `run`: (1) `parseScript` (3.1.1); (2) assemble `RuntimeApi` — `agent` from 3.2.1 (gate = `new ConcurrencyManager({ defaultConcurrency: Math.min(16, (cores ?? availableParallelism()) - 2) })`), `pipeline`/`parallel` from 3.2.2, `phase` = sets a `currentPhase` box read by agent-call at CALL time (the spec's documented race with concurrent stages is why `opts.phase` wins), `log` → progress event `{ type: "log", message }`, `args` verbatim, `budget` view, `workflow` throwing stub; (3) `evaluateScript` (3.1.2); (4) return `WorkflowResult = { meta, returnValue, progress: ProgressEvent[], agentCount, status: "completed" | "error", error? }` — body throw → `status: "error"` with message, NOT a rejection (the Phase 4 tool layer decides presentation). `abort()`: flips an internal flag making subsequent `agent()` calls resolve `null` immediately + `gate.cancelWaiters(runId)` — in-flight children are cancelled via `runner.cancel` on their taskIds (track live taskIds in a Set). Conformance suite (`conformance.test.ts`): scripts as template strings run against the real runner + scripted fake client — (a) meta + `return` round-trip; (b) `agent()` text result from a scripted child transcript; (c) degrade case: child error → `null` → script `.filter(Boolean)` works; (d) `pipeline` over 3 items with one poisoned stage; (e) `phase()`/`log()` ordering in the progress journal; (f) `Date.now()` inside a script → run resolves `status: "error"` with DeterminismError message; (g) budget-stub: `budget.total === null`, `remaining() === Infinity`; (h) cap conformance: cores=4 → limit 2 enforced.
+
+**Files:**
+- Create: `packages/workflows/src/runtime/index.ts`
+- Modify: `packages/workflows/src/index.ts` (public re-exports: `createWorkflowRun`, types, error classes)
+- Test: `packages/workflows/src/runtime/runtime.test.ts`, `packages/workflows/src/runtime/conformance.test.ts`
+
+**Verification:** `bun test packages/workflows` all green; `bun test` (whole repo) green; `bun run typecheck && bun run lint`.
+
+**Done when:** a spec-conformant script executes end-to-end against the real runner in-process with every §3/§4/§5/§9 behavior pinned by a named conformance case. **Library milestone for Epics 3.1-3.2.**
+
 ### Epic 3.3: Structured output
 
 **Goal:** `agent(prompt, { schema })` returns a validated object: a single global `structured_output` tool whose expected JSON Schema is looked up per-session from runner state; mismatch returns a tool error so the model retries (spec's "validation at the tool-call layer").
 **Scope:** `packages/workflows/src/runtime/`, small hook in core for per-session tool state
 **Dependencies:** Epic 3.2
 **Done when:** schema-conformant results resolve as objects; a deliberately nonconforming model response triggers retry-then-error, never a script-level parse failure.
+
+#### Task 3.3.1: Core `onSessionCreated` hook + schema registry + validator
+
+- [x] Done — hook ordering proven via call log (create → hook → promptAsync); throwing hook teardown combines the cancel-across-create orphan-abort idiom + create-rejection gate.tryComplete (the gate's error path alone would leak the session — only `cancelled` aborts); ajv 8.20.0 pinned. registry resultFor carries `present` flag (stored-undefined ≠ never-stored).
+
+**Context:** The race this kills: `agent({ schema })` must have the child's sessionID → schema mapping registered BEFORE the child can call `structured_output` — but the sessionID only exists after `session.create` resolves, and `launch()` dispatches `promptAsync` immediately after (session-runner.ts:455-463). A post-launch registration loses the race. Per elaboration deviation (c): the hook is a SYNCHRONOUS callback in core's launch, between create resolving and the prompt dispatch. Validation: `ajv` (new dep, workflows package only) compiles the JSON Schema once per `agent()` call.
+
+**Implementation vision:** (1) Core: add `onSessionCreated?: (sessionID: string) => void` to `LaunchRequest` (types.ts); in `launch()`, invoke it synchronously right after the cancel-across-create check passes and before `task.sessionID` is assigned/prompt dispatched (session-runner.ts:~448-455); a throwing callback fails the launch loudly (it's a programming error in the caller, not a child failure) — unit test both. (2) Workflows: `src/runtime/structured/registry.ts` — `createSchemaRegistry()`: `register(sessionID, compiledSchema)` / `take(sessionID)` (used by the tool: look up + later store) / `resultFor(sessionID)` / `clear(sessionID)`; a plain Map, no TTL (entries are cleared by agent-call's finally in 3.3.2). (3) `src/runtime/structured/validate.ts` — thin ajv wrapper: `compileSchema(schema: object): CompiledSchema` where `CompiledSchema.validate(value)` returns `{ ok: true } | { ok: false, errors: string }` (ajv error text flattened to one human/model-readable string — this string IS the retry signal the model sees). Invalid schema itself (ajv compile throw) → throw at `agent()` call time: that's a SCRIPT bug and must detonate, not degrade.
+
+**Files:**
+- Modify: `packages/core/src/types.ts` (LaunchRequest), `packages/core/src/session-runner.ts` (sync invoke)
+- Test: `packages/core/src/session-runner.test.ts` (hook timing: called-before-prompt asserted via call-order log; throwing hook fails launch)
+- Create: `packages/workflows/src/runtime/structured/registry.ts`, `packages/workflows/src/runtime/structured/validate.ts`
+- Test: `packages/workflows/src/runtime/structured/registry.test.ts`, `packages/workflows/src/runtime/structured/validate.test.ts`
+- Modify: `packages/workflows/package.json` (ajv)
+
+**Verification:** `bun test packages/core packages/workflows` — hook ordering proven (create → hook → promptAsync in the fake client's call log); valid/invalid value validation; malformed schema compile → throw.
+
+**Done when:** the hook fires synchronously pre-prompt under test, and validation produces model-readable error strings.
+
+#### Task 3.3.2: `structured_output` tool factory + `agent({ schema })` wiring
+
+- [x] Done — 44 tests for the slice; whole repo 304. Deviations: agent captured RED retroactively (stash-based, genuine failures against untouched tests — process slip, disclosed); parse-failure tool string carries the same retry cue as the validation path; `WorkflowRun` now exposes `registry` (Phase 4's global tool must bind the per-run instance — contract documented on the type). Process note recorded: stricter TDD ordering enforcement in future dispatch prompts.
+
+**Context:** Spec §3.3: with `schema`, `agent()` resolves to the VALIDATED object; mismatches surface as tool errors so the MODEL retries — never a script-level parse failure; epic Done-when adds "retry-then-error" for a child that never produces conforming output. The tool is built and tested here as a factory (`ToolDefinition` via the `tool()` helper, same pattern as `packages/background-agents/src/tools/*.ts`); actual registration with opencode is Phase 4's plugin shell. Lesson from Phase 2 (NaN bug, task.ts/output.ts): opencode's raw execute path does NOT apply Zod defaults — coerce every arg defensively.
+
+**Implementation vision:** (1) `src/runtime/structured/tool.ts`: `createStructuredOutputTool(registry)` → `tool({ description, args: { result: tool.schema.string().describe("JSON-encoded value conforming to the required schema") }, execute })`. Execute: registry lookup by `context.sessionID` — miss → error string "no structured output expected for this session"; `JSON.parse(args.result)` failure → error string with the parse message (model retries); validate via 3.3.1 — `ok: false` → return the flattened errors string prefixed "schema validation failed — fix and call structured_output again:" (THE retry mechanism: the model reads the tool result and re-calls); `ok: true` → store in registry, return "accepted". (2) agent-call wiring (replaces 3.2.1's NotYetSupportedError): when `opts.schema` present — compile schema (throw on malformed: script bug); launch with `onSessionCreated: (sid) => registry.register(sid, compiled)`, `toolsOverride: { structured_output: true }` (merged over SPAWN_GUARD, session-runner.ts:319-322), and prompt suffix: "\n\nYou MUST return your result by calling the structured_output tool with a JSON value conforming to this schema:\n<schema JSON>\nYour final text is ignored; only the tool call counts."; on completion — `registry.resultFor(sessionID)` set → resolve the OBJECT; unset (model never called the tool / never passed validation) → ONE nudge: `runner.resume(taskId, "You have not returned a structured result. Call the structured_output tool now…")` + `awaitCompletion` again → result or `null`; `finally`: `registry.clear(sessionID)`. Resume-throws (e.g. session expired) → `null`, degrade. (3) Conformance additions: fake-client child "calls the tool" by the test invoking `execute` with the child's sessionID mid-run — cases: valid-first-try → object; invalid-then-valid (tool returns retry string, second call accepted) → object, and the script never saw a parse error; never-calls → nudge issued (assert resume happened) → null; two concurrent `agent({schema})` calls with different schemas don't cross-validate (registry isolation).
+
+**Files:**
+- Create: `packages/workflows/src/runtime/structured/tool.ts`
+- Modify: `packages/workflows/src/runtime/agent-call.ts` (+ its test), `packages/workflows/src/runtime/index.ts` + `packages/workflows/src/index.ts` (export the tool factory for Phase 4)
+- Test: `packages/workflows/src/runtime/structured/tool.test.ts`, conformance additions in `packages/workflows/src/runtime/conformance.test.ts`
+
+**Verification:** `bun test` (whole repo) green; `bun run typecheck && bun run lint`.
+
+**Done when:** schema-conformant results resolve as validated objects, the invalid→retry→valid loop is proven at the tool layer, never-conforming children degrade to `null` after exactly one nudge, and registry entries never leak. **Phase 3 exit.**
 
 ---
 

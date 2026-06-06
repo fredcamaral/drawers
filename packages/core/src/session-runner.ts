@@ -447,12 +447,34 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			return task;
 		}
 
-		// (6) promote to running.
+		// (6) per-session registration hook. SYNCHRONOUS, between create resolving
+		// and the prompt dispatch, so a caller (e.g. structured-output) registers
+		// the child's sessionID → schema mapping before the child's first turn can
+		// reference it. A throw is a caller programming error and fails the launch
+		// loudly — but the slot and the orphan session must still be torn down. The
+		// gate's error flip releases the held slot (its freeSlot); error teardown
+		// does NOT abort, so abort the freshly-created orphan here, mirroring the
+		// cancel-across-create path above.
+		try {
+			req.onSessionCreated?.(sessionID);
+		} catch (err) {
+			task.sessionID = sessionID;
+			client.session.abort({ path: { id: sessionID } }).catch((abortErr) => {
+				deps.logger?.error?.("orphan abort failed", {
+					id,
+					err: errorMessage(abortErr),
+				});
+			});
+			gate.tryComplete(id, "error", errorMessage(err));
+			throw err;
+		}
+
+		// (7) promote to running.
 		task.sessionID = sessionID;
 		task.startedAt = clock.now();
 		await setIntermediate(task, "running");
 
-		// (7) fire-and-forget prompt. Failure routes through the gate (error flip
+		// (8) fire-and-forget prompt. Failure routes through the gate (error flip
 		// releases the slot). Context parts (forked transcript) are prepended.
 		dispatchPrompt(
 			task,
@@ -462,7 +484,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			req.contextParts,
 		);
 
-		// (8) resolve at running — never await completion.
+		// (9) resolve at running — never await completion.
 		return task;
 	}
 
