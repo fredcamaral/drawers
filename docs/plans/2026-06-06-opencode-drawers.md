@@ -19,7 +19,7 @@
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
 | 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
-| 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Detailed |
+| 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Complete |
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Epic-level |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Epic-level |
 | 5 | Both plugins published to npm and installable in a clean project via `"plugin": [...]` | 5.1 | Epic-level |
@@ -291,7 +291,7 @@ interface SessionRunner {
 
 #### Task 2.1.1: SDK client adapter in core + plugin package scaffold with engine wiring
 
-- [ ] Done
+- [x] Done — `onTaskComplete` seam already existed on `SessionRunnerDeps` (no core contract change). Additions: core package.json gained `exports` (`"."` → `./src/index.ts`) so the bare `@drawers/core` workspace import resolves; `createEngine` gained injectable `fs?` seam (test DI, forwards to store). Flag for later: engine's `markNotified` does an O(n) `list()` scan per flushed notice — add `runner.get(id)` if batches ever bite.
 
 **Context:** The smoke plugin (`packages/core/test-harness/plugin/smoke-plugin.ts:60-77`) hand-rolls the real-SDK→`EngineClient` adapter; both Phase 2 and Phase 4 plugins need the identical adapter — it belongs in core, written once. The full wiring recipe (store→recover→runner→event hook) is proven at `smoke-plugin.ts:79-116`. Core's public surface is exported from `packages/core/src/index.ts`.
 
@@ -311,7 +311,7 @@ interface SessionRunner {
 
 #### Task 2.1.2: `bg_task` tool — launch and resume
 
-- [ ] Done
+- [x] Done — core's resume errors are plain `Error`s with stable message prefixes (`taskStillRunning:`/`sessionExpired:`); tool detects via `startsWith`. Worth typing as error classes if a third consumer appears.
 
 **Context:** Tool registration shape: `.claude/skills/opencode-plugin-dev/references/custom-tools.md` (`tool()` helper, `tool.schema.*` = Zod, `ToolContext.sessionID`/`abort`/`metadata`). Core surface: `SessionRunner.launch(LaunchRequest)` (`packages/core/src/types.ts`) and `resume(taskId, prompt)` — resume only on terminal tasks, rejects `taskStillRunning`/`sessionExpired` (session-runner.ts, Task 1.3.4). Recursion guard is core-side (launch's tools override) — but depth must be INFERRED here: the runner's `list()` exposes tasks with `sessionID`; if the calling `context.sessionID` matches a tracked task's child session, this call is from a child.
 
@@ -328,7 +328,7 @@ interface SessionRunner {
 
 #### Task 2.1.3: `bg_output`, `bg_cancel`, `bg_list` tools
 
-- [ ] Done
+- [x] Done — abort race with balanced add/remove listeners (leak-asserted in test); `bg_cancel` coerces `all === true` (Zod defaults don't fire on raw execute paths); `bg_list` uses the `Clock` seam. Registration wired in the entry by the orchestrator. Note: core's launch SPAWN_GUARD already hides all four tools from child sessions.
 
 **Context:** Core surface: `readOutput(taskId, { full? })` → `{ status, summaryText, messages? }`; `awaitCompletion(taskId, timeoutMs)` resolves on terminal/rejects on timeout; `cancel(taskId)` resolves post-teardown, no-ops terminal tasks; `list(parentSessionID?)`. (`packages/core/src/types.ts`, tasks 1.3.3/1.3.4.)
 
@@ -352,7 +352,7 @@ interface SessionRunner {
 
 #### Task 2.2.1: `chat.message` flush hook + TUI toasts
 
-- [ ] Done
+- [x] Done — Part/TextPart types derived structurally from the `Hooks["chat.message"]` signature itself (no direct `@opencode-ai/sdk` dep added to the plugin package); `createToastNotifier` is a tested unit (sync throw AND rejected promise both swallowed+logged); engine.ts needed no change — 2.1.1's seams sufficed, only index.ts wires onNotify + hook.
 
 **Context:** Hook signature (`.claude/skills/opencode-plugin-dev/references/hooks.md:66-75`): `"chat.message"(input: { sessionID, ... }, output: { message: UserMessage; parts: Part[] })` — mutation is by in-place reference: PUSH onto `output.parts`, never reassign. Core queue: `flushFor(parentSessionID)` drains oldest-first and fire-and-forgets `markNotified` (`packages/core/src/notify.ts`); `seed(tasks)` was already wired at engine construction if 2.1.1 did its job — verify, don't duplicate. Toast surface: `client.tui.showToast` typed per `docs/sdk-surface-audit.md` row h (check exact params there). Notice dedup across restarts is core's job (`notified` flag persisted) — the hook layer stays dumb.
 
@@ -376,7 +376,7 @@ interface SessionRunner {
 
 #### Task 2.3.1: Fork transcript builder (pure)
 
-- [ ] Done
+- [x] Done — real compaction markers found and honored: `AssistantMessage.summary?: boolean` AND `CompactionPart` (`type: "compaction"`); slice after the LAST of either (marker dropped). Drift predicate: zero blocks + any part with unextracted payload (non-text kind carrying `.text`, or tool part with output/error under an unknown status) → throw; all-legitimately-skippable → `""`. SDK shapes restated as local line-referenced interfaces with compile-time `satisfies` grounding (SDK isn't a direct dep of the plugin package).
 
 **Context:** Input is the REAL `session.messages` shape: `{ info: Message, parts: Part[] }[]` — verify part type names against the installed SDK's `types.gen.d.ts` (audit row c/j; known kinds: `text` w/ optional `synthetic`, `tool` w/ `state.{status,output,error}`, `step-start`/`step-finish`, `file`, etc.). better-async's fork silently produced empty transcripts when part names drifted (`.references/better-opencode-async-agents/src/fork/index.ts:168,264`) — our builder must THROW on a transcript that yields zero content from a non-empty input (loud, not silent). Core already has truncation precedent: `readOutput`'s head+tail error preservation (session-runner.ts, Task 1.3.4) — same patterns, but this builder belongs to the plugin (presentation), not core.
 
@@ -392,7 +392,7 @@ interface SessionRunner {
 
 #### Task 2.3.2: Fork wiring in `bg_task` + live e2e smoke for the plugin
 
-- [ ] Done
+- [x] Done — `LaunchRequest.contextParts?: TextPartInput[]` added (TextPartInput moved to types.ts, re-exported from session-runner.ts + core index; gained `synthetic?`); prepended BEFORE the prompt part in launch's `dispatchPrompt`. Fork seam: `createEngine` now returns `fetchSessionMessages(sessionID): Promise<ForkMessage[]>` (built on the adapted client's `session.messages`, widened once through `unknown` since the adapter statically narrows away `info.summary`/`tool`/compaction parts that the builder reads at runtime); `createBgTaskTool(runner, { fetchMessages })`. fork:false → fetchMessages never called; empty transcript → no contextParts; builder throw (drift) → honest error string + no launch. **LIVE BUG FOUND + FIXED (loud):** `bg_output(block:true)` with omitted `timeout_ms` got `NaN` (opencode's raw execute path does NOT apply Zod `.default()` — same artifact as bg_cancel's `all`), `NaN` reached `setTimeout(cb, NaN)` → fired ~1ms → block returned "still running" instantly → model gave up → child session **Aborted**. Fixed by defensive `Number.isFinite` coercion in output.ts + 2 regression tests. e2e smoke (`bun run smoke:agents`) PASS on A/B/C, stable across reruns; fork injection independently verified in the opencode SQLite store (the child session carries the `"Context forked from the parent session…"` synthetic part with the parent's codename). Harness scenario B reframed from "secret word → state it back" (which haiku refused as a jailbreak) to a benign release-codename handoff — the fork mechanism is identical.
 
 **Context:** Injection channel (plan decision + custom-tools.md recipe): `client.session.prompt` with `body: { noReply: true, parts: [{ type: "text", text, synthetic: true }] }` into the CHILD session before the task prompt runs — but core's `launch()` currently sends the task prompt itself in `promptAsync`. Sequencing matters: the context must arrive before (or with) the task prompt. Options: prepend the transcript as an extra part in the launch `promptAsync` parts array (single prompt, ordering guaranteed) vs a separate `noReply` prompt first (two round-trips, race possible). PICK the single-prompt prepend: extend `LaunchRequest` with `contextParts?: TextPartInput[]` in core (small, typed, additive) so launch passes them ahead of the task prompt part. The e2e harness from 1.5.1 (`packages/core/test-harness/`) is the model for the plugin's own smoke: PWD pinning, OPENCODE_BIN, single-turn lifecycle (run-smoke.ts).
 

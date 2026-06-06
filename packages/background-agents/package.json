@@ -1,0 +1,12 @@
+{
+	"name": "opencode-drawer-agents",
+	"type": "module",
+	"private": true,
+	"dependencies": {
+		"@drawers/core": "workspace:*",
+		"@opencode-ai/plugin": "1.16.2"
+	},
+	"devDependencies": {
+		"bun-types": "1.3.14"
+	}
+}

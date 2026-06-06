@@ -26,13 +26,13 @@ import { type Plugin, tool } from "@opencode-ai/plugin";
 // own Bun from the test-harness cwd, where the `@drawers/core` workspace alias
 // is not guaranteed to resolve. The relative path always resolves.
 import {
+	adaptSdkClient,
 	type BgTask,
 	type Clock,
 	ConcurrencyManager,
 	createIdGenerator,
 	createSessionRunner,
 	createTaskStore,
-	type EngineClient,
 } from "../../src/index.ts";
 
 const SERVICE = "smoke-plugin";
@@ -57,24 +57,9 @@ export const SmokePlugin: Plugin = async ({ client }) => {
 		return {};
 	}
 
-	// Adapter: the real SDK client → the engine's structural EngineClient. Each
-	// method forwards the engine's call shape verbatim and narrows the result.
-	const engineClient: EngineClient = {
-		session: {
-			create: async (opts) => {
-				const res = await client.session.create({ body: opts.body });
-				return { data: res.data ? { id: res.data.id } : undefined };
-			},
-			promptAsync: async (opts) =>
-				client.session.promptAsync({ path: opts.path, body: opts.body }),
-			abort: async (opts) => client.session.abort({ path: opts.path }),
-			messages: async (opts) => {
-				const res = await client.session.messages({ path: opts.path });
-				return { data: res.data ?? undefined };
-			},
-			get: async (opts) => client.session.get({ path: opts.path }),
-		},
-	};
+	// Adapter: the real SDK client → the engine's structural EngineClient. Lives
+	// in core (`adaptSdkClient`) and is re-verified live by this smoke run.
+	const engineClient = adaptSdkClient(client);
 
 	const store = createTaskStore({ baseDir });
 	const recoveredTasks = await store.load();

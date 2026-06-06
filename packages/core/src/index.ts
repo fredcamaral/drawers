@@ -22,6 +22,8 @@ export type {
 	TaskStoreOptions,
 } from "./persistence";
 export { createTaskStore } from "./persistence";
+export type { SdkSessionClient } from "./sdk-adapter";
+export { adaptSdkClient } from "./sdk-adapter";
 export type {
 	EngineClient,
 	PersistFn,
@@ -37,6 +39,7 @@ export type {
 	SessionRunner,
 	TaskOutput,
 	TaskStatus,
+	TextPartInput,
 } from "./types";
 export {
 	isTerminal,
