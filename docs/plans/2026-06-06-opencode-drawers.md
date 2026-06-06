@@ -21,7 +21,7 @@
 | 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
 | 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Complete |
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
-| 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Epic-level |
+| 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Detailed |
 | 5 | Both plugins published to npm and installable in a clean project via `"plugin": [...]` | 5.1 | Epic-level |
 
 ## Design decisions (binding across phases)
@@ -570,6 +570,61 @@ interface SessionRunner {
 **Dependencies:** Phase 3
 **Done when:** fire → continue conversation → notification → read result loop works e2e.
 
+> **Elaboration deviations (recorded 2026-06-06, post-Phase-3):** (a) The opencode loader calls EVERY export of the registered entry as a function — but `packages/workflows/src/index.ts` is the library surface. The plugin entry is therefore a separate module (`src/plugin/index.ts`, single export) and package.json gains `exports: { ".": "./src/plugin/index.ts", "./lib": "./src/index.ts" }`. (b) `createChatMessageHook`/`createToastNotifier` move from background-agents into `@drawers/core` (both plugins must be independently installable; core already depends on `@opencode-ai/plugin`); background-agents re-imports. (c) `WorkflowRunDeps` gains optional `registry?: SchemaRegistry` — one plugin-level registry serves the single global `structured_output` tool across concurrent runs (sessionIDs are globally unique). (d) **Budget deviates from spec §6's shared pool**: `spent()` counts output tokens of workflow-spawned children only — sweeping the parent session per call is API-heavy and the main loop belongs to opencode; the `budget_tokens` tool arg prices the WORKFLOW, not the turn. Labeled, not hidden. (e) The workflows engine's runner is constructed with `defaultConcurrency: 0` (unlimited) per the Phase 3 deviation note — the workflow gate is the authoritative limiter.
+
+#### Task 4.1.1: Hoist notification presentation into core
+
+- [ ] Done
+
+**Context:** `createChatMessageHook` (background-agents `src/hooks/notifications.ts:121-124`) and `createToastNotifier` (`:181-184`) are generic over `NotificationQueue`/`TaskNotice` (both already in core `notify.ts`) — nothing BgTask-specific beyond wording. The workflows plugin needs identical passive delivery (notice → parent's next message + toast) and MUST NOT import from `opencode-drawer-agents`.
+
+**Implementation vision:** Move both factories (and their `ShowToast`/logger types) into `packages/core/src/notify-hooks.ts` essentially verbatim; parametrize the two strings that are agents-specific (the visible-line prefix and the synthetic hint header) as optional `render` options with the current text as defaults, so both plugins read naturally. Re-export from core index. background-agents `src/hooks/notifications.ts` becomes a thin re-import (or its call sites switch to core imports and the file is deleted — prefer deletion; its tests move to core, adjusted import paths only). No behavior change: the moved tests must pass unmodified in assertion content.
+
+**Files:**
+- Create: `packages/core/src/notify-hooks.ts`
+- Modify: `packages/core/src/index.ts`
+- Delete: `packages/background-agents/src/hooks/notifications.ts` (+ its test) after moving
+- Modify: `packages/background-agents/src/index.ts` (imports from `@drawers/core`)
+- Test: `packages/core/src/notify-hooks.test.ts` (moved, import paths adjusted)
+
+**Verification:** `bun test` whole repo green (no assertion changes in the moved suite); `bun run typecheck && bun run lint`.
+
+**Done when:** both plugins can consume passive notification delivery from core; agents plugin behavior is bit-identical.
+
+#### Task 4.1.2: Plugin shell, engine assembly, run store, global structured_output
+
+- [ ] Done
+
+**Context:** Mirror the background-agents plugin shape (`packages/background-agents/src/index.ts` + `engine.ts:86-164`). Core pieces all exist: `adaptSdkClient`, `createSessionRunner`, `createTaskStore` (generic — validates only id/parentSessionID/status, persistence.ts:104-126), `createNotificationQueue`. Library: `createWorkflowRun` (runtime/index.ts:43-85). Deviation (a): plugin entry is `src/plugin/index.ts` with the SINGLE export `WorkflowsPlugin: Plugin`.
+
+**Implementation vision:** (1) Library change: `WorkflowRunDeps.registry?: SchemaRegistry` (default: own instance, current behavior; test both). (2) `src/plugin/engine.ts`: `createWorkflowEngine({ client, directory, dataDir?, onNotify?, logger? })` → `{ runs, runStore, queue, registry, startRun, stopRun, statusOf }`. Internals: `adaptSdkClient`; runner via `createSessionRunner` with `new ConcurrencyManager({ defaultConcurrency: 0 })` (deviation e) and its own task store at `<dataDir>/workflow-tasks` (env `OPENCODE_DRAWERS_DATA_DIR` passthrough like engine.ts:78-84); ONE `createSchemaRegistry()` shared across runs (deviation c); run records in a second `createTaskStore` at `<dataDir>/workflow-runs` — `RunRecord = { id: runId ("wf_"+8char via core createIdGenerator prefix option — check ids.ts; if prefix is fixed "bg_", extend with a prefix option), parentSessionID, status: "running"|"completed"|"error"|"cancelled", description: meta name, createdAt, completedAt?, scriptPath, args, returnValue?, error?, agentCount? }` persisted through the store's minimal-shape validation; script source persisted to `<dataDir>/workflow-scripts/<runId>.js` before execution (the spec's "persisted script path", returned by the tool). `startRun({ source, args, parentSessionID })`: create record → `createWorkflowRun({ runner, parentSessionID, runId, args, registry, onProgress })` → fire `run.run(source)` detached; on settle: update record (status/returnValue/error/agentCount), push `TaskNotice` into the queue (taskId=runId, description=meta name or "workflow", hint names `workflow_status`), toast via onNotify. In-memory `runs: Map<runId, { run: WorkflowRun, record, progress: ProgressEvent[] }>` (progress accumulates from onProgress). Startup recovery: `runStore.load()` — records still "running" from a dead process flip to error "interrupted by restart" (children are NOT auto-relaunched; same philosophy as core's recovered tasks). (3) `src/plugin/index.ts`: single export wiring `event` → runner.handleEvent, `chat.message` → core's createChatMessageHook(queue), `tool:` `{ structured_output: createStructuredOutputTool(engine.registry) }` (tools `workflow*` arrive in 4.1.3 — register the structured tool now so children can call it), toast notifier from core. (4) package.json `exports` map per deviation (a); verify the test-harness-style file:// registration loads the plugin entry, not the lib (no live harness yet — assert via a unit test that imports the entry module and checks exactly one export).
+
+**Files:**
+- Modify: `packages/workflows/src/runtime/index.ts` (+ runtime.test.ts: registry injection), `packages/workflows/package.json` (exports map), `packages/core/src/ids.ts` ONLY IF the prefix is hardcoded (+ test)
+- Create: `packages/workflows/src/plugin/engine.ts`, `packages/workflows/src/plugin/index.ts`
+- Test: `packages/workflows/src/plugin/engine.test.ts`, `packages/workflows/src/plugin/index.test.ts`
+
+**Verification:** `bun test` green; named cases: startRun persists record+script then resolves runId immediately (before run settles); settle updates record + queues notice; restart recovery flips running→error; shared registry routes two concurrent runs; single-export entry.
+
+**Done when:** the engine fires a run detached, persists its lifecycle, and delivers completion passively — all under test with fake runner/client.
+
+#### Task 4.1.3: `workflow` / `workflow_status` / `workflow_stop` tools + saved workflows
+
+- [ ] Done
+
+**Context:** Tool patterns: `packages/background-agents/src/tools/*.ts` (defensive arg coercion per the Phase 2 NaN lesson — opencode does NOT apply Zod defaults). `PluginInput.directory` is the project root — saved workflows live at `<directory>/.opencode/workflows/<name>.js`. Spec §2.2/§2.3.
+
+**Implementation vision:** `src/plugin/tools/workflow.ts`: args `{ script?, script_path?, name?, args?, resume_from_run_id?, budget_tokens? }` — exactly one of script/script_path/name (coerce: treat empty strings as absent); `name` → read `<directory>/.opencode/workflows/<name>.js` (missing → honest error listing available files); `script_path` → read file (relative paths resolve against `directory`); `args` accepted as object OR JSON string (coerce); returns `{ runId, scriptPath, meta.name }` text immediately + guidance "do not poll; you'll be notified — workflow_status <runId> for progress" (no-poll guidance mirroring bg_task). `resume_from_run_id` is accepted but returns "resume lands in Task 4.2.2" until then (honest placeholder). `workflow_status.ts`: args `{ run_id }` → record status + progress tree rendered as text: group agent:start/end by phase (phase title or "(no phase)"), one line per agent `[done|running] label`, narrator `log:` lines interleaved in order, tail with returnValue (JSON, head-truncated at ~2000 chars) when completed / error when failed. `workflow_stop.ts`: args `{ run_id }` → engine.stopRun: run.abort() + record→cancelled + notice. All three: unknown run_id → error string listing known runIds. Register in plugin entry.
+
+**Files:**
+- Create: `packages/workflows/src/plugin/tools/workflow.ts`, `workflow-status.ts`, `workflow-stop.ts`
+- Modify: `packages/workflows/src/plugin/index.ts`, `packages/workflows/src/plugin/engine.ts` (stopRun/statusOf as needed)
+- Test: one test file per tool under `src/plugin/tools/`
+
+**Verification:** `bun test` green; named cases: source-selection xor (0 and 2 sources → error); saved-name resolution + missing-name listing; args-as-JSON-string coercion; immediate return while run in flight; status tree shows phases/agents/logs in order; stop cancels live run and notice fires.
+
+**Done when:** the fire → continue → notified → `workflow_status` read-result loop works under test end-to-end against the fake client. **Epic 4.1 exit.**
+
 ### Epic 4.2: Journal and deterministic resume
 
 **Goal:** Append-only JSONL journal of `(callIndex, hash(prompt+opts), result)`; resume replays the script with longest-unchanged-prefix cache hits; first divergence runs live (spec §7).
@@ -577,12 +632,78 @@ interface SessionRunner {
 **Dependencies:** Epic 4.1
 **Done when:** same-script+args resume reproduces the result with zero new agent launches; an edited mid-script call re-runs only itself and successors.
 
+#### Task 4.2.1: Journal module + replay seam in the runtime
+
+- [ ] Done
+
+**Context:** Spec §7: every run journals its `agent()` calls; resume replays — longest unchanged prefix of `(prompt, opts)` pairs returns cached results instantly; first edited/new call and everything after runs live. Call INDEX is deterministic: `pipeline`/`parallel` invoke their callbacks synchronously in array order and the determinism sandbox bans the only sources of ordering drift, so invocation order is stable across replays of an unchanged script. The structured variant's result (a JSON object) journals identically.
+
+**Implementation vision:** (1) `src/plugin/journal.ts`: `createJournal({ path, fs? })` → `{ record(entry: JournalEntry): Promise<void>, load(): Promise<JournalEntry[]> }`; `JournalEntry = { index: number, key: string, status: "ok", result: unknown }` — only SETTLED non-null results are journaled (a null/failed agent must re-run on resume, not replay its failure); append-only JSONL, one `JSON.stringify` line per entry, writes serialized through a queue (reuse the per-task write-queue idiom from core persistence.ts); `load` tolerates a truncated final line (crash mid-append → drop it, log). Key: `sha256(stableStringify({ prompt, label, phase, schema, model, agentType }))` via `node:crypto`; `stableStringify` = recursive key-sorted JSON (small local helper; no dep). (2) Runtime seam: `WorkflowRunDeps.replay?: { entries: JournalEntry[], onRecord: (e: JournalEntry) => void }`. agent-call integration: maintain a call counter (the journal index — distinct from the lifetime cap counter); per call compute key; if `replay.entries[index]` exists AND `prefixIntact` (a run-level box, starts true) AND `entries[index].key === key` → emit `agent:start`/`agent:end` with status "cached" and resolve the journaled result WITHOUT launching (no gate acquire, no counters.agents increment — cached calls don't count against the lifetime cap... DECISION: they DO count; the cap is a runaway-loop backstop and replay must hit it at the same point the original did; increment but skip gate/launch); on key mismatch or index beyond entries → flip `prefixIntact` false forever (spec: everything after the first divergence runs live, even if a later key coincidentally matches); every LIVE settled non-null result → `replay.onRecord({ index, key, status: "ok", result })`.
+
+**Files:**
+- Create: `packages/workflows/src/plugin/journal.ts`
+- Test: `packages/workflows/src/plugin/journal.test.ts`
+- Modify: `packages/workflows/src/runtime/index.ts`, `packages/workflows/src/runtime/agent-call.ts` (+ both test files)
+- Modify: `packages/workflows/src/index.ts` (export journal types for the plugin layer)
+
+**Verification:** `bun test` green; named cases: journal round-trip incl. truncated-final-line tolerance; stable key (object key order irrelevant; schema present/absent distinguishes); replay full-prefix → zero launches (fake runner asserts no launch calls) with identical returnValue; mid-script divergence → live from that index even when a LATER key matches; null results never journaled (re-run live on resume); cached calls still increment the lifetime counter.
+
+**Done when:** the runtime can replay a journal with the spec's longest-unchanged-prefix semantics, fully under unit/conformance test.
+
+#### Task 4.2.2: Resume wiring in the plugin
+
+- [ ] Done
+
+**Context:** Spec §2.2/§7: `Workflow({ scriptPath, resumeFromRunId })`; same script + same args → 100% cache hit; prior run must be stopped first; resume is same-session... relaxed here: same plugin instance OR post-restart (journal + script + record are all on disk — restart resume is a strict improvement over the spec and falls out of the persistence design; take it). The 4.1.3 `workflow` tool already accepts `resume_from_run_id` as a placeholder.
+
+**Implementation vision:** engine `startRun` gains `resumeFromRunId?`: (1) guard — referenced record must exist (error listing known runs) and must NOT be currently running in this instance (error "stop it first: workflow_stop <id>"); (2) script source: explicit `script`/`script_path`/`name` wins; absent → load the PRIOR run's persisted `scriptPath` (the edit-and-reinvoke loop: user edits the persisted file, passes resume id only); (3) args: explicit args win; absent → prior record's args (spec: same args → full hit); (4) load journal of the prior run → `replay.entries`; new run gets its OWN runId + journal file seeded by `onRecord` (cached entries are re-recorded as they replay so the new journal is complete standalone — decision: re-record cached hits; keeps every run's journal self-contained); (5) record carries `resumedFrom: priorRunId` for the status tree header. workflow tool: replace the 4.1.3 placeholder; `workflow_status` shows "resumed from wf_xxx, N/M calls cached" (count cached vs live from progress events' "cached" status).
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/engine.ts`, `src/plugin/tools/workflow.ts`, `workflow-status.ts` (+ tests)
+
+**Verification:** `bun test` green; named cases: same script+args resume → zero fake-runner launches, identical returnValue, status shows M/M cached; edited script (one prompt changed mid-way) → calls before the edit cached, the edited one and ALL after run live; resume of a still-running run → refused; resume after simulated restart (new engine instance over the same dataDir) works; explicit new args defeat the cache exactly when they reach a prompt.
+
+**Done when:** the edit → re-invoke → prefix-cached loop works against persisted state, incl. across an engine restart. **Epic 4.2 exit.**
+
 ### Epic 4.3: Budget and sub-workflows
 
 **Goal:** `budget.total/spent()/remaining()` from SDK token usage (spike first: verify usage metadata on assistant messages per the 1.1.2 audit; fallback = labeled char-based estimation); hard-ceiling throw on exhaustion; `workflow()` sub-workflow sharing caps/budget/abort, nesting depth 1 (spec §6/§8).
 **Scope:** `packages/workflows/src/`
 **Dependencies:** Epic 4.2
 **Done when:** loop-until-budget conformance test halts at the ceiling; nested sub-workflow inside a child throws.
+
+#### Task 4.3.1: Token budget provider
+
+- [ ] Done
+
+**Context:** Audit row m confirms `AssistantMessage.tokens = { input, output, reasoning, cache: { read, write } }` + `cost`, carried by `session.messages()` (the adapter does not strip them at runtime — engine.ts widening precedent from fork). The spike the epic asked for is therefore already answered: token metadata is typed and reachable; no char-based fallback needed. Per elaboration deviation (d): `spent()` counts workflow children only.
+
+**Implementation vision:** `src/plugin/budget.ts`: `createTokenBudget({ total, fetchMessages })` → `BudgetView & { recordTask(sessionID): Promise<void> }`: an accumulator; `recordTask` fetches the child session's messages once, sums assistant `tokens.output + tokens.reasoning` (reasoning is output-priced; document), adds to the counter — fenced: a fetch failure logs and adds 0 (budget must never crash a run). agent-call integration: after `awaitCompletion` settles (any terminal status), if deps.budget exposes `recordTask` AND the task has a sessionID, await it BEFORE resolving — so the budget check of the NEXT agent() call sees this call's spend (sequential loops, the spec's §6 idiom, stay accurate; concurrent calls are best-effort by nature — document). Type it as an optional structural extension: `BudgetView & Partial<{ recordTask }>` checked at runtime (the library keeps no plugin dependency). Engine wiring: `budget_tokens` arg (4.1.3 already accepts it) → `createTokenBudget({ total: budget_tokens, fetchMessages: adapted client })`; absent → null-budget default as today. `workflow_status` shows `spent/total` when a total exists. Cached replay calls record nothing (no session) — resumed runs re-spend only live calls, which is exactly right.
+
+**Files:**
+- Create: `packages/workflows/src/plugin/budget.ts` (+ test)
+- Modify: `packages/workflows/src/runtime/agent-call.ts` (+ test), `src/plugin/engine.ts`, `src/plugin/tools/workflow-status.ts` (+ tests)
+
+**Verification:** `bun test` green; named cases: loop-until-budget conformance script (`while (budget.total && budget.remaining() > N) { await agent(...) }` with scripted per-child token counts) halts at the ceiling via BudgetExhaustedError → run status error mentioning budget; sequential accuracy (call 2's check sees call 1's spend); fetch-failure adds 0 and warns; no budget → Infinity semantics unchanged.
+
+**Done when:** the §6 dynamic-scaling idiom works against scripted token counts, hard ceiling included.
+
+#### Task 4.3.2: Sub-workflows + live e2e smoke — Phase 4 exit
+
+- [ ] Done
+
+**Context:** Spec §8: `workflow(nameOrRef, args?)` runs a child workflow inline, returns its return value; child shares the parent's concurrency cap, agent counter, abort signal, budget (and here: schema registry); nesting depth 1 — `workflow()` inside a child throws; unknown name / unreadable path / child syntax error throw synchronously (catchable in the script). The runtime's `workflow` global is currently the NotYetSupported stub (runtime/index.ts). Live-harness model: `packages/background-agents/test-harness/` (PWD pinning, OPENCODE_BIN, file:// plugin registration, OPENCODE_DRAWERS_DATA_DIR).
+
+**Implementation vision:** (1) Library: `WorkflowRunDeps.resolveSubWorkflow?: (nameOrRef: string | { scriptPath: string }) => Promise<string>` (returns script SOURCE; plugin provides fs/saved-name resolution — library stays fs-free). Runtime builds the child run internally: same gate, same counters object, same budget, same registry, same liveTasks/abort latch; child's OWN progress events forwarded to the parent's journal wrapped under a `workflow:<name>` phase prefix (decision: prefix the child's agent labels with `<meta.name>/` rather than a new event type — Phase 4 status tree gets nesting for free); child deps get `resolveSubWorkflow: undefined` → child's `workflow` global throws NestingError (depth 1 enforced structurally, not by flag-counting). Child meta/script errors → synchronous throw out of `workflow()` (catchable); child run executing with `status: "error"` → `workflow()` THROWS that error too (spec: errors throw, unlike agent's null — §8 lists them as throwing). Replay: the child's agent calls flow through the SAME journal/replay seam as the parent's (shared call counter) — a resumed parent replays straight through child calls; document that editing the child's saved file voids the prefix from the first child call (key includes prompt, and child prompts derive from the child source… they don't — keys are per agent() call. DECISION: include a synthetic journal entry for the workflow() call itself: key = hash of (resolved child SOURCE + args), so a child-script edit breaks the prefix exactly at the workflow() boundary; entry result = child returnValue; on replay-hit, the child is not re-run at all). (2) Plugin: engine provides the resolver (saved names from `.opencode/workflows/`, `{scriptPath}` against `directory`). (3) e2e: `packages/workflows/test-harness/` mirroring the agents harness — opencode.json registers the plugin entry file://; scenario A: inline canonical two-stage review workflow (pipeline of 2 items → agent per item → parallel verify) over trivial prompts, assert completed + returnValue shape + notification part in a follow-up parent turn; scenario B: `workflow_stop` mid-run → cancelled; scenario C: resume — run A's runId resumed with same script → status shows all-cached, zero new child sessions in the opencode store. Root script `smoke:workflows`. (4) README documenting the harness env knobs (copy the agents README structure).
+
+**Files:**
+- Modify: `packages/workflows/src/runtime/index.ts`, `agent-call.ts` or a new `src/runtime/sub-workflow.ts` (+ tests), `src/plugin/engine.ts` (+ test)
+- Create: `packages/workflows/test-harness/opencode.json`, `run-smoke.ts`, `README.md`
+- Modify: root `package.json` (`smoke:workflows`)
+
+**Verification:** `bun test` green (sub-workflow conformance: shared caps/budget/registry, nesting throw, error-throw semantics, child-edit breaks prefix at the boundary); `bun run smoke:workflows` PASS A/B/C against live opencode.
+
+**Done when:** the canonical review workflow runs e2e on a real opencode with passive completion, stop, and all-cached resume proven live. **Phase 4 exit.**
 
 ---
 
