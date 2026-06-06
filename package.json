@@ -1,0 +1,18 @@
+{
+	"name": "opencode-drawers",
+	"private": true,
+	"type": "module",
+	"workspaces": [
+		"packages/*"
+	],
+	"scripts": {
+		"test": "bun test",
+		"typecheck": "bunx tsc --noEmit -p packages/core",
+		"lint": "biome check .",
+		"smoke": "bun packages/core/test-harness/run-smoke.ts"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.4.16",
+		"typescript": "6.0.3"
+	}
+}

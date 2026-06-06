@@ -18,8 +18,8 @@
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Detailed |
-| 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Epic-level |
+| 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
+| 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Detailed |
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Epic-level |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Epic-level |
 | 5 | Both plugins published to npm and installable in a clean project via `"plugin": [...]` | 5.1 | Epic-level |
@@ -48,7 +48,7 @@
 
 #### Task 1.1.1: Scaffold the Bun workspaces monorepo
 
-- [ ] Done
+- [x] Done
 
 **Context:** Repo is empty except `docs/`, `.claude/`, `WORKFLOWS_HL_SPEC.md`, `.gitignore` (already ignores `.references/`, `node_modules/`, `dist/`). Layout decided in the architecture: `packages/core`, later `packages/background-agents`, `packages/workflows`.
 
@@ -69,7 +69,7 @@
 
 #### Task 1.1.2: Regenerate API refs and audit the typed SDK surface
 
-- [ ] Done
+- [x] Done — all 13 surfaces typed ✅ (see `docs/sdk-surface-audit.md`). Notables: `session.status` IS typed but only reports `idle|retry|busy` (not a completion oracle — pair with output validation per decision 2); `AssistantMessage.tokens` exposes input/output/reasoning/cache + cost (Epic 4.3 budget spike unblocked); per-prompt `tools: {[name]: boolean}` recursion guard fully typed.
 
 **Context:** The local skill mandates a gate: regenerate `references/hooks.md` and `references/events.md` from the installed SDK before any hook code (`.claude/skills/opencode-plugin-dev/SKILL.md:61-72`, script at `.claude/skills/opencode-plugin-dev/scripts/extract-plugin-api.ts`). The engine design assumes specific SDK capabilities; each must be confirmed typed or the design adjusts NOW, not in Phase 2.
 
@@ -93,7 +93,7 @@
 
 #### Task 1.2.1: Implement ConcurrencyManager (clean-room)
 
-- [ ] Done
+- [x] Done — deviation: `acquire()` returns `AcquireResult` (= `Promise<{id}>` with a synchronous readonly `id` property) so callers can cancel a still-queued waiter; superset of the planned contract. `limitFor()` surfaces `0` as the unlimited sentinel.
 
 **Context:** Design source: `.references/oh-my-opencode/src/features/background-agent/concurrency.ts` (175 lines; SUL-1.0 — reimplement the design, do not copy text). Key behaviors verified in analysis: limit resolution `modelConcurrency[model]` > `providerConcurrency[provider]` > `defaultConcurrency` > 5, with `0` meaning unlimited (`:25-40`); concurrency *key* follows where the config knob lives — full model string if a model limit is set, else provider, else model (`:42-53`); provider = `model.split('/')[0]`.
 
@@ -116,7 +116,7 @@
 
 #### Task 1.3.1: Core types, IDs, and the engine's public contract
 
-- [ ] Done
+- [x] Done — `handleEvent` typed against the SDK's `Event` discriminated union (32 members) instead of `unknown`; `notified?: boolean` added to `BgTask` for Epic 1.4; `TERMINAL_STATUSES`/`isTerminal` helpers exported.
 
 **Context:** Greenfield. The contract below is load-bearing: Epics 1.4/1.5 and both Phase 2/3 consumers program against it (snippet justified as a cross-epic contract).
 
@@ -163,7 +163,7 @@ interface SessionRunner {
 
 #### Task 1.3.2: Launch path
 
-- [ ] Done
+- [x] Done — decisions recorded: concurrency-key fallback when `model` absent is the literal `"default"` (never the agent name — keyspace collision risk); depth/`session.create` failures REJECT launch, cancellations RESOLVE with the `cancelled` task; `LaunchRequest.model` string is split into the SDK's `{providerID, modelID}`; temporary `markCancelled` seam to be absorbed by 1.3.3's `tryComplete`. ⚠️ for 1.3.3: happy-path slot release is owned by the completion gate (doesn't exist yet).
 
 **Context:** Spine validated in prior art: `client.session.create({ body: { parentID, title } })` then `client.session.promptAsync({ path: { id }, body: { agent, tools, parts } })` fire-and-forget (`.references/better-opencode-async-agents/src/manager/task-lifecycle.ts:72-180`). OMO re-checks cancellation around the session-create await because the user can cancel mid-window (`.references/oh-my-opencode/src/features/background-agent/manager.ts:773,785,797`).
 
@@ -179,7 +179,7 @@ interface SessionRunner {
 
 #### Task 1.3.3: Completion gate, mutex, and safety net
 
-- [ ] Done
+- [x] Done — `completion.ts` (`createCompletionGate`) owns tryComplete/idle-gating/poll/stale; runner wires it via injected collaborators. Key finding: `session.idle` must NOT count as last-activity (it perpetually resets the grace window — caught by tests). Deviation: teardown is DETACHED from the synchronous flip; callers needing post-teardown state must join via `awaitCompletion` (sharp edge for 1.3.4's cancel). Orphan-abort on cancel-before-create stays in the launch path (gate can't abort a session that didn't exist at flip time). 640× rerun race-clean.
 
 **Context:** The race-correctness core. Verified design from OMO: `session.idle` handler requires status `running` + min-idle elapsed, defers-and-re-checks if too early (`.references/oh-my-opencode/src/features/background-agent/session-idle-event-handler.ts:35-52`); validates session has ≥1 non-empty assistant/tool message before completing (`manager.ts:2159-2217`); `tryCompleteTask` does a synchronous `status !== "running" → return false` check-and-flip **before any await** — JS single-threadedness is the mutex (`manager.ts:2443-2501`); slot released before async teardown to prevent leaks (`:2466-2469`).
 
@@ -196,7 +196,7 @@ interface SessionRunner {
 
 #### Task 1.3.4: Cancel, resume, and output reading
 
-- [ ] Done
+- [x] Done — contract additions: `BgTask.model?` (resume re-acquires the right slot), `TaskOutput.messages` refined to `TaskOutputMessage[]`, gate gained `resetForResume(task)` (invalidates output-validation cache + restarts activity clock so a stale idle can't complete the new turn). `markCancelled` seam deleted; `cancel()` joins detached teardown via `awaitCompletion` so callers observe released slot + persisted state.
 
 **Context:** Cancel = `client.session.abort` + terminal flip (better-async `task-lifecycle.ts:216-224` — but it bypasses its own status helper; we route everything through `tryComplete`). Resume re-prompts the existing session and re-acquires concurrency (OMO `manager.ts:1240+`). Output reading walks `session.messages` with filtering (better-async `src/tools/output.ts`).
 
@@ -219,7 +219,7 @@ interface SessionRunner {
 
 #### Task 1.4.1: Atomic per-task persistence with restart recovery
 
-- [ ] Done
+- [x] Done — recovery wired as `SessionRunnerDeps.recoveredTasks?: BgTask[]` (construction-time DI, not an interface method). Slot policy: recovered running tasks occupy NO concurrency slot (re-acquiring could deadlock startup if recovered > limit; original process's slots died with it). `save()` snapshots the task before enqueueing — the gate mutates BgTask in place, so a queued write must capture call-time state.
 
 **Context:** better-async persists one whole-file JSON with read-modify-write, no locking, silent `{}` on corruption, and drops fields needed for resume (`.references/better-opencode-async-agents/src/storage.ts:77-121`, `src/manager/index.ts:325-339`) — all three defects to avoid. OMO persists nothing.
 
@@ -236,7 +236,7 @@ interface SessionRunner {
 
 #### Task 1.4.2: Notification queue with passive-flush contract
 
-- [ ] Done
+- [x] Done — dedup key is `taskId + ":" + completedAt`, not taskId alone (a resumed task legitimately re-completes with a fresh completedAt; taskId-only would swallow the second notice). `seed()` never fires onNotify (no toast storm on restart). `TaskNotice` lives in notify.ts, not types.ts — presentation shapes stay out of the engine contract.
 
 **Context:** Decision 1: no active parent-wake. The passive channel is OMO's "Channel B": pending notices injected when the parent's next user message flows through the `chat.message` hook (`.references/oh-my-opencode/src/features/background-agent/manager.ts:2144-2153`). Toasts via the typed TUI surface confirmed in Task 1.1.2. better-async's dedup-with-priority exists because it has three competing notifiers (`.references/better-opencode-async-agents/src/manager/notifications.ts:15-230`) — our single-winner `tryComplete` means at most one notice per task, so dedup is a simple seen-set.
 
@@ -260,7 +260,7 @@ interface SessionRunner {
 
 #### Task 1.5.1: Smoke harness plugin + scripted headless run
 
-- [ ] Done
+- [x] Done — PASS against real opencode 1.16.2 (verified independently). EngineClient structural subset matched the live SDK exactly — zero core changes. Environmental gotchas recorded for Phase 2: (1) opencode resolves config from `PWD` env var, not spawn cwd — pin `PWD` when spawning; (2) `OPENCODE_PURE=1` disables ALL external plugins including ours; (3) `opencode run` is single-turn — parent turn end shuts the server down and aborts running children (the engine finalized the abort correctly); (4) global agent configs can silently override the configured model — force via `run --model`.
 
 **Context:** Plugin loading rules: auto-scan glob is `{plugin,plugins}/*.{ts,js}`, one level deep, or explicit `opencode.json` `plugin` array with local paths (`.claude/skills/opencode-plugin-dev/SKILL.md:157-180`). The plugin loader calls all exports as functions — never export classes from the entry (better-async hit this: `.references/better-opencode-async-agents/src/index.ts:16-17`). Hooks fire inside headless `opencode run` (`SKILL.md:85-86`). Testing guidance: `.claude/skills/opencode-plugin-dev/references/testing.md`.
 
@@ -284,10 +284,64 @@ interface SessionRunner {
 
 ### Epic 2.1: Plugin shell and tool surface
 
-**Goal:** `packages/background-agents` plugin wires the core engine into OpenCode with tools `bg_task` (launch + resume via `task_id`), `bg_output` (incl. `block`, incremental fetch), `bg_cancel` (single/all), `bg_list` (children of current session).
-**Scope:** `packages/background-agents/`
+**Goal:** `packages/background-agents` plugin wires the core engine into OpenCode with tools `bg_task` (launch + resume via `task_id`), `bg_output` (incl. `block`), `bg_cancel` (single/all), `bg_list` (children of current session).
+**Scope:** `packages/background-agents/`, small extraction into `packages/core/`
 **Dependencies:** Phase 1
 **Done when:** all four tools callable from a live session; recursion guard verified (child cannot see `bg_*` tools); single tool family, single resume path (no better-async/OMO dual-family drift).
+
+#### Task 2.1.1: SDK client adapter in core + plugin package scaffold with engine wiring
+
+- [ ] Done
+
+**Context:** The smoke plugin (`packages/core/test-harness/plugin/smoke-plugin.ts:60-77`) hand-rolls the real-SDK→`EngineClient` adapter; both Phase 2 and Phase 4 plugins need the identical adapter — it belongs in core, written once. The full wiring recipe (store→recover→runner→event hook) is proven at `smoke-plugin.ts:79-116`. Core's public surface is exported from `packages/core/src/index.ts`.
+
+**Implementation vision:** (1) Create `packages/core/src/sdk-adapter.ts`: `adaptSdkClient(client): EngineClient` — lift the adapter verbatim-in-spirit from the smoke plugin; type the input structurally (the five `session.*` methods with their Options-shaped signatures) rather than importing `ReturnType<createOpencodeClient>` if that's cleaner under `verbatimModuleSyntax`; unit test with a scripted fake asserting call-shape forwarding and `{data}` narrowing. Re-export from index. Update the smoke plugin to consume it (deletes its local copy — the smoke run re-verifies the adapter live in 2.3.2). (2) Scaffold `packages/background-agents`: package.json named `opencode-drawer-agents` (decision 6), `"type": "module"`, workspace dep `@drawers/core`, exact-pinned `@opencode-ai/plugin` 1.16.2; tsconfig extending base; extend root `typecheck` script to cover it. (3) `src/engine.ts`: `createEngine({ client, dataDir? })` — one factory assembling store (`createTaskStore`, default base dir; `OPENCODE_DRAWERS_DATA_DIR` env override), `store.load()` → `recoveredTasks`, `ConcurrencyManager` (config-driven later, defaults now), `createIdGenerator()`, Date clock, `client.app.log`-backed logger, returns `{ runner, store, queue }` with `createNotificationQueue` wired to `runner`'s `onTaskComplete` (toast cb left injectable — Epic 2.2 fills it). Check how `onTaskComplete` is passed (gate dep via runner config — read `session-runner.ts` for the exact seam). (4) `src/index.ts`: the plugin entry — single async function export `BackgroundAgentsPlugin: Plugin` wiring `event` → `runner.handleEvent` and an empty `tool: {}` placeholder (2.1.2/2.1.3 fill it). No classes from the entry; `client.app.log` only, never console.
+
+**Files:**
+- Create: `packages/core/src/sdk-adapter.ts`
+- Test: `packages/core/src/sdk-adapter.test.ts`
+- Modify: `packages/core/src/index.ts`, `packages/core/test-harness/plugin/smoke-plugin.ts`
+- Create: `packages/background-agents/package.json`, `packages/background-agents/tsconfig.json`, `packages/background-agents/src/index.ts`, `packages/background-agents/src/engine.ts`
+- Test: `packages/background-agents/src/engine.test.ts`
+- Modify: `package.json` (typecheck script)
+
+**Verification:** `bun install && bun test && bun run typecheck && bun run lint` — green; engine test proves recovery wiring (fake fs store seeded with a terminal + a running task).
+
+**Done when:** adapter lives in core with tests, smoke plugin consumes it, plugin package builds with the engine factory under test.
+
+#### Task 2.1.2: `bg_task` tool — launch and resume
+
+- [ ] Done
+
+**Context:** Tool registration shape: `.claude/skills/opencode-plugin-dev/references/custom-tools.md` (`tool()` helper, `tool.schema.*` = Zod, `ToolContext.sessionID`/`abort`/`metadata`). Core surface: `SessionRunner.launch(LaunchRequest)` (`packages/core/src/types.ts`) and `resume(taskId, prompt)` — resume only on terminal tasks, rejects `taskStillRunning`/`sessionExpired` (session-runner.ts, Task 1.3.4). Recursion guard is core-side (launch's tools override) — but depth must be INFERRED here: the runner's `list()` exposes tasks with `sessionID`; if the calling `context.sessionID` matches a tracked task's child session, this call is from a child.
+
+**Implementation vision:** `src/tools/task.ts` exporting a factory `createBgTaskTool(runner)` (DI for tests). Args: `description` (string, short — UI title), `prompt` (string), `agent` (string, default "build"), `model` (optional, "provider/model"), `task_id` (optional — when present this is a RESUME: `prompt` required, all other args ignored). Launch path: depth = `(runner.list().find(t => t.sessionID === context.sessionID)?.depth ?? -1) + 1` — core's maxDepth guard does the rejecting; tool just reports the error string honestly. Returns (string result): task id + status + explicit guidance "running in background — you will be notified on completion; do NOT poll; use bg_output(task_id) when notified" (sets model expectations against poll-storms). Resume path: call `runner.resume`; map `taskStillRunning` and `sessionExpired` errors to honest error-string returns (expected outcomes the model reasons over — custom-tools.md error strategy 2), unexpected errors throw. Use `context.metadata({ title: description })`. Tests with a fake `SessionRunner` (typed interface — no SDK needed): launch arg mapping incl. depth inference (parent call → 0, call from child session → 1), resume mapping, both error translations.
+
+**Files:**
+- Create: `packages/background-agents/src/tools/task.ts`
+- Modify: `packages/background-agents/src/index.ts` (register under key `bg_task`)
+- Test: `packages/background-agents/src/tools/task.test.ts`
+
+**Verification:** `bun test packages/background-agents` — green.
+
+**Done when:** launch + resume work against the fake runner, depth inference is proven, and the result text contains the no-poll guidance.
+
+#### Task 2.1.3: `bg_output`, `bg_cancel`, `bg_list` tools
+
+- [ ] Done
+
+**Context:** Core surface: `readOutput(taskId, { full? })` → `{ status, summaryText, messages? }`; `awaitCompletion(taskId, timeoutMs)` resolves on terminal/rejects on timeout; `cancel(taskId)` resolves post-teardown, no-ops terminal tasks; `list(parentSessionID?)`. (`packages/core/src/types.ts`, tasks 1.3.3/1.3.4.)
+
+**Implementation vision:** `src/tools/output.ts`, `cancel.ts`, `list.ts`, factories like 2.1.2. `bg_output` args: `task_id`, `full` (bool default false), `block` (bool default false), `timeout_ms` (number default 60000, max-clamped 300000) — `block: true` → `awaitCompletion` first (timeout → honest "still running after Xms" string, NOT a throw — the model should not retry-storm), then `readOutput`; format: status line + summary, `full` appends the filtered transcript as fenced text. Respect `context.abort`: bail from block awaiting when aborted (race `awaitCompletion` vs an abort promise; on abort return "wait cancelled"). `bg_cancel` args: `task_id` optional, `all` (bool default false) — exactly one required, both/neither → error string; `all` cancels every non-terminal task of `list(context.sessionID)`; reports per-task outcomes. `bg_list` args: `{}` — renders `list(context.sessionID)` as a compact table (id, status, description, age via injected clock-less Date; durations from task timestamps), empty → "no background tasks for this session". Unit tests per tool with the fake runner: block-timeout path, abort path, cancel all-vs-one matrix, list rendering incl. empty.
+
+**Files:**
+- Create: `packages/background-agents/src/tools/output.ts`, `packages/background-agents/src/tools/cancel.ts`, `packages/background-agents/src/tools/list.ts`
+- Modify: `packages/background-agents/src/index.ts` (register `bg_output`/`bg_cancel`/`bg_list`)
+- Test: `packages/background-agents/src/tools/output.test.ts`, `packages/background-agents/src/tools/cancel.test.ts`, `packages/background-agents/src/tools/list.test.ts`
+
+**Verification:** `bun test packages/background-agents` — green incl. block/abort/all-cancel edges.
+
+**Done when:** all four `bg_*` tools registered from the entry, every named edge tested, no tool ever throws on an expected outcome.
 
 ### Epic 2.2: Notification delivery wiring
 
@@ -296,12 +350,63 @@ interface SessionRunner {
 **Dependencies:** Epic 2.1
 **Done when:** completing task surfaces a toast immediately and a notice on the parent's next message; no notice duplication across restarts.
 
+#### Task 2.2.1: `chat.message` flush hook + TUI toasts
+
+- [ ] Done
+
+**Context:** Hook signature (`.claude/skills/opencode-plugin-dev/references/hooks.md:66-75`): `"chat.message"(input: { sessionID, ... }, output: { message: UserMessage; parts: Part[] })` — mutation is by in-place reference: PUSH onto `output.parts`, never reassign. Core queue: `flushFor(parentSessionID)` drains oldest-first and fire-and-forgets `markNotified` (`packages/core/src/notify.ts`); `seed(tasks)` was already wired at engine construction if 2.1.1 did its job — verify, don't duplicate. Toast surface: `client.tui.showToast` typed per `docs/sdk-surface-audit.md` row h (check exact params there). Notice dedup across restarts is core's job (`notified` flag persisted) — the hook layer stays dumb.
+
+**Implementation vision:** `src/hooks/notifications.ts`: factory `createChatMessageHook(queue)` returning the hook fn: `queue.flushFor(input.sessionID)`; empty → return without touching output; else push ONE visible text part summarizing all notices (compact: "✅ bg_abc12345 'description' completed in 32s" lines) plus ONE `synthetic: true` text part with the retrieval hints (model-only instruction; verify the `Part` type allows `synthetic` on text parts — sdk-surface audit/types.gen, it does per Task 1.3.4's GatePart work). Toast wiring: in `engine.ts`, fill the `onNotify` callback left injectable by 2.1.1: `client.tui.showToast({ body: { title, message, variant } })` per the audited shape — wrap in try/catch+log (toast failure must never break completion teardown); status→variant mapping: completed→success, error→error, cancelled→info. `markNotified` callback → `store.save`-backed (verify 2.1.1 wired it; the queue calls it per flushed notice). Tests: fake queue + scripted output object — parts pushed in order (visible first, synthetic second), empty-flush no-op, part shapes structurally valid (`type: "text"`, `text`, `synthetic`); toast callback mapping per terminal status; toast throw swallowed+logged.
+
+**Files:**
+- Create: `packages/background-agents/src/hooks/notifications.ts`
+- Modify: `packages/background-agents/src/engine.ts` (toast + markNotified wiring), `packages/background-agents/src/index.ts` (register hook)
+- Test: `packages/background-agents/src/hooks/notifications.test.ts`
+
+**Verification:** `bun test packages/background-agents` — green.
+
+**Done when:** flush hook pushes visible+synthetic parts only when notices exist; toasts fire on live completion with correct variant; a queue/toast failure can never crash the hook (chat.message is prompt-pipeline — a throw here kills the user's message per the gotchas doc).
+
 ### Epic 2.3: Context forking
 
 **Goal:** `bg_task(fork: true)` injects truncated parent history into the child via a `noReply` prompt.
 **Scope:** `packages/background-agents/src/fork/`
 **Dependencies:** Epic 2.1
 **Done when:** forked child demonstrably answers from parent context; truncation validated against the REAL current message part schema (better-async's pipeline silently no-ops on schema drift — `tool_result` vs `tool` part types, `.references/better-opencode-async-agents/src/fork/index.ts:168,264`); compaction-boundary slicing, recency-tiered truncation, head+tail error preservation, linear-time budget trimming.
+
+#### Task 2.3.1: Fork transcript builder (pure)
+
+- [ ] Done
+
+**Context:** Input is the REAL `session.messages` shape: `{ info: Message, parts: Part[] }[]` — verify part type names against the installed SDK's `types.gen.d.ts` (audit row c/j; known kinds: `text` w/ optional `synthetic`, `tool` w/ `state.{status,output,error}`, `step-start`/`step-finish`, `file`, etc.). better-async's fork silently produced empty transcripts when part names drifted (`.references/better-opencode-async-agents/src/fork/index.ts:168,264`) — our builder must THROW on a transcript that yields zero content from a non-empty input (loud, not silent). Core already has truncation precedent: `readOutput`'s head+tail error preservation (session-runner.ts, Task 1.3.4) — same patterns, but this builder belongs to the plugin (presentation), not core.
+
+**Implementation vision:** `src/fork/transcript.ts`: pure function `buildForkTranscript(messages, opts: { budgetChars?: number }): string` (default budget ~24k chars). Pipeline, all linear-time: (1) compaction-boundary slice — if a compaction/summary marker message exists (check the real schema for how compaction surfaces: `system` role summary or a part flag; inspect types.gen + one real transcript from the smoke harness data if needed), keep only messages after the LAST one; (2) map messages to blocks: user/assistant text parts verbatim (skip `synthetic`), tool parts as `[tool: name] <output>` with per-block caps; (3) recency-tiered truncation: newest N messages get generous per-block caps, older get tight caps (e.g. last 5 → 4000 chars/block, rest → 600); (4) error-pattern tool outputs (reuse the regex family from readOutput) get head+tail preservation instead of flat truncation; (5) final budget pass: drop OLDEST whole blocks until under budget (never mid-block cuts beyond the per-block caps); (6) wrap with header "Context forked from the parent session — for reference only; follow the task prompt below." Tests: pure-function table tests with REAL-shaped fixtures (steal shapes from a captured smoke transcript or hand-build against types.gen); named cases: schema-drift guard (non-empty input + zero extractable content → throws), compaction slice, tier boundaries, error head+tail, budget drop order, empty-input → empty string (NOT a throw — genuinely empty parent is valid).
+
+**Files:**
+- Create: `packages/background-agents/src/fork/transcript.ts`
+- Test: `packages/background-agents/src/fork/transcript.test.ts`
+
+**Verification:** `bun test packages/background-agents/src/fork` — all named cases green.
+
+**Done when:** builder is pure, linear-time, throws on schema drift, and every truncation tier is under test.
+
+#### Task 2.3.2: Fork wiring in `bg_task` + live e2e smoke for the plugin
+
+- [ ] Done
+
+**Context:** Injection channel (plan decision + custom-tools.md recipe): `client.session.prompt` with `body: { noReply: true, parts: [{ type: "text", text, synthetic: true }] }` into the CHILD session before the task prompt runs — but core's `launch()` currently sends the task prompt itself in `promptAsync`. Sequencing matters: the context must arrive before (or with) the task prompt. Options: prepend the transcript as an extra part in the launch `promptAsync` parts array (single prompt, ordering guaranteed) vs a separate `noReply` prompt first (two round-trips, race possible). PICK the single-prompt prepend: extend `LaunchRequest` with `contextParts?: TextPartInput[]` in core (small, typed, additive) so launch passes them ahead of the task prompt part. The e2e harness from 1.5.1 (`packages/core/test-harness/`) is the model for the plugin's own smoke: PWD pinning, OPENCODE_BIN, single-turn lifecycle (run-smoke.ts).
+
+**Implementation vision:** (1) Core: add `contextParts?` to `LaunchRequest`, prepend in launch's parts array; unit test the ordering. (2) Plugin: `bg_task` gains `fork` (bool default false): fetch parent messages via the adapter (`session.messages` — expose on the engine or pass client into the tool factory; smallest clean seam), build transcript (2.3.1), pass as `contextParts: [{ type: "text", text: transcript, synthetic: true }]`. Empty transcript → launch WITHOUT context parts (don't send an empty header). (3) e2e: `packages/background-agents/test-harness/` mirroring 1.5.1's (opencode.json registering the REAL plugin entry via file:// path, run-script): scenario A — bg_task launches, completes, bg_output reads result; scenario B — fork: parent told a fact ("the secret word is X") in turn 1, forked bg_task asked to state the secret word, assert child's output contains it; scenario C — restart: second process, bg_list/bg_output show the recovered terminal task. Root script `"smoke:agents"`. Excluded from `bun test` (no *.test.ts names).
+
+**Files:**
+- Modify: `packages/core/src/types.ts`, `packages/core/src/session-runner.ts` (contextParts prepend), `packages/core/src/session-runner.test.ts`
+- Modify: `packages/background-agents/src/tools/task.ts` (+ its test)
+- Create: `packages/background-agents/test-harness/opencode.json`, `packages/background-agents/test-harness/run-smoke.ts`, `packages/background-agents/test-harness/README.md`
+- Modify: `package.json` (smoke:agents script)
+
+**Verification:** `bun test` green; `bun run smoke:agents` PASS on scenarios A/B/C against a live opencode.
+
+**Done when:** forked child demonstrably answers from parent context in the live run, and the whole `bg_*` family is proven e2e with restart survival. **Phase 2 exit.**
 
 ---
 
