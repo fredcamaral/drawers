@@ -163,7 +163,7 @@ interface SessionRunner {
 
 #### Task 1.3.2: Launch path
 
-- [ ] Done
+- [x] Done — decisions recorded: concurrency-key fallback when `model` absent is the literal `"default"` (never the agent name — keyspace collision risk); depth/`session.create` failures REJECT launch, cancellations RESOLVE with the `cancelled` task; `LaunchRequest.model` string is split into the SDK's `{providerID, modelID}`; temporary `markCancelled` seam to be absorbed by 1.3.3's `tryComplete`. ⚠️ for 1.3.3: happy-path slot release is owned by the completion gate (doesn't exist yet).
 
 **Context:** Spine validated in prior art: `client.session.create({ body: { parentID, title } })` then `client.session.promptAsync({ path: { id }, body: { agent, tools, parts } })` fire-and-forget (`.references/better-opencode-async-agents/src/manager/task-lifecycle.ts:72-180`). OMO re-checks cancellation around the session-create await because the user can cancel mid-window (`.references/oh-my-opencode/src/features/background-agent/manager.ts:773,785,797`).
 
