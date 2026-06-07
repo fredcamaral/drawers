@@ -83,6 +83,9 @@ const tui: TuiPlugin = async (api) => {
 	]);
 
 	api.keymap.registerLayer({
+		// `ctrl+o` (mnemonic: Open) is free in opencode's default keymap — a global
+		// shortcut to the viewer alongside the `/workflows` palette command.
+		bindings: [{ key: "ctrl+o", cmd: "workflows.open" }],
 		commands: [
 			{
 				name: "workflows.open",
