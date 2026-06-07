@@ -68,6 +68,27 @@ describe("createStructuredOutputTool", () => {
 		expect(registry.resultFor("ses_3").present).toBe(false);
 	});
 
+	test("validation failure records the failure reason for diagnostics (Task 7.2.1)", async () => {
+		const registry = createSchemaRegistry();
+		registry.register("ses_diag", compileSchema(SCHEMA));
+		const t = createStructuredOutputTool(registry);
+		await t.execute({ result: '{"n":"oops"}' }, ctx("ses_diag"));
+		// The validation errors are recorded so agent-call can render schema_invalid.
+		expect(registry.lastFailure("ses_diag")).toBeDefined();
+		expect(registry.lastFailure("ses_diag")).not.toBe("");
+	});
+
+	test("a JSON parse failure also records a failure (the tool WAS called, Task 7.2.1)", async () => {
+		// Parse failure and schema-validation failure both mean "the tool was called
+		// but produced no stored value" — both feed schema_invalid, distinguishing
+		// them from schema_no_call (the tool was never called at all).
+		const registry = createSchemaRegistry();
+		registry.register("ses_pf", compileSchema(SCHEMA));
+		const t = createStructuredOutputTool(registry);
+		await t.execute({ result: "not json {" }, ctx("ses_pf"));
+		expect(registry.lastFailure("ses_pf")).toBeDefined();
+	});
+
 	test("valid string result is stored and returns 'accepted'", async () => {
 		const registry = createSchemaRegistry();
 		registry.register("ses_4", compileSchema(SCHEMA));

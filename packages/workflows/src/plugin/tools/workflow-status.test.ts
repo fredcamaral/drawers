@@ -294,6 +294,189 @@ describe("createWorkflowStatusTool — tail", () => {
 	});
 });
 
+describe("createWorkflowStatusTool — agent:end note + empty warning (Task 7.2.1)", () => {
+	test("a diagnostic note renders after the agent's marker line", async () => {
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "reviewer" },
+				{
+					type: "agent:end",
+					label: "reviewer",
+					status: "error",
+					note: "null — schema_invalid: missing 'verdict'; raw 6.3k chars preserved",
+				},
+			],
+			[1_000, 1_500],
+		);
+		const engine = fakeEngine([
+			{
+				record: makeRecord({ id: "wf_note00001", status: "completed" }),
+				progress,
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_note00001" }, ctx());
+		expect(out).toContain("schema_invalid");
+		expect(out).toContain("raw 6.3k chars preserved");
+		// The note follows the agent marker line, not a phase header.
+		const lines = out.split("\n");
+		const markerIdx = lines.findIndex((l) => l.includes("reviewer"));
+		expect(lines[markerIdx + 1]).toContain("schema_invalid");
+	});
+
+	test("an empty_output note renders the ⚠ empty output warning", async () => {
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "summarizer" },
+				{
+					type: "agent:end",
+					label: "summarizer",
+					status: "completed",
+					note: "empty output",
+				},
+			],
+			[1_000, 1_500],
+		);
+		const engine = fakeEngine([
+			{
+				record: makeRecord({ id: "wf_empty0001", status: "completed" }),
+				progress,
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_empty0001" }, ctx());
+		expect(out).toContain("⚠ empty output");
+	});
+
+	test("an agent:end with no note renders no extra line", async () => {
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "clean" },
+				{ type: "agent:end", label: "clean", status: "completed" },
+			],
+			[1_000, 1_500],
+		);
+		const engine = fakeEngine([
+			{
+				record: makeRecord({ id: "wf_clean0001", status: "completed" }),
+				progress,
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_clean0001" }, ctx());
+		expect(out).not.toContain("⚠");
+		expect(out).not.toContain("null —");
+	});
+});
+
+describe("createWorkflowStatusTool — untruncated full result (Task 7.2.2)", () => {
+	test("full:true renders the COMPLETE returnValue JSON (no 2000-char cut)", async () => {
+		const big = { blob: "x".repeat(5000) };
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_full00001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: big,
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_full00001", full: true }, ctx());
+		expect(out).toContain(JSON.stringify(big));
+		expect(out).not.toContain("(truncated)");
+	});
+
+	test("default view still previews at 2000 with the truncation marker", async () => {
+		const big = { blob: "x".repeat(5000) };
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_prev00001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: big,
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_prev00001" }, ctx());
+		expect(out).toContain("(truncated)");
+		expect(out).not.toContain(JSON.stringify(big));
+	});
+
+	test("full:true renders persisted per-agent diagnostics", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_fdiag0001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+					diagnostics: [
+						{
+							label: "reviewer",
+							index: 0,
+							reason: "schema_invalid",
+							rawText: "the raw prose the model produced",
+							childSessionID: "ses_x",
+						},
+					],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_fdiag0001", full: true }, ctx());
+		expect(out).toContain("diagnostics:");
+		expect(out).toContain("reviewer");
+		expect(out).toContain("schema_invalid");
+		expect(out).toContain("the raw prose the model produced");
+	});
+
+	test("a result over 200k chars renders a path trailer, never a silent cut", async () => {
+		const huge = { blob: "y".repeat(210_000) };
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_huge00001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: huge,
+					scriptPath: "/wf-data/workflow-scripts/wf_huge00001.js",
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_huge00001", full: true }, ctx());
+		expect(out).toContain("exceeds 200k chars");
+		expect(out).toContain("wf_huge00001.json");
+	});
+
+	test("full:true works for a terminal persisted record (no live handle fields)", async () => {
+		const big = { blob: "z".repeat(4000) };
+		const engine = fakeEngine([
+			{
+				// A recovered/terminal record: no `now`, no `settled`, no `budget`.
+				record: makeRecord({
+					id: "wf_term00001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: big,
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_term00001", full: true }, ctx());
+		expect(out).toContain(JSON.stringify(big));
+	});
+});
+
 describe("createWorkflowStatusTool — resume (Task 4.2.2)", () => {
 	test("header shows 'resumed from <id>' when the record was resumed", async () => {
 		const engine = fakeEngine([

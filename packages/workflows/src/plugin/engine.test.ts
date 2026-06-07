@@ -819,6 +819,47 @@ function makeCompletingClient(reply = "AGENT_RESULT") {
 	};
 }
 
+/**
+ * A completing client whose child assistant message carries a completed TOOL part
+ * but NO text (Task 7.2.1 test seam). The gate's hasValidOutput accepts the tool
+ * part so the turn completes, yet lastAssistantText is "" → the agent primitive
+ * resolves "" and reports an `empty_output` diagnostic.
+ */
+function makeToolOnlyCompletingClient() {
+	const sessions: string[] = [];
+	let seq = 0;
+	return {
+		sessions,
+		client: {
+			session: {
+				create: async () => {
+					seq += 1;
+					const id = `ses_child_${seq}`;
+					sessions.push(id);
+					return { data: { id } };
+				},
+				promptAsync: async () => undefined,
+				abort: async () => undefined,
+				messages: async () => ({
+					data: [
+						{
+							info: {
+								role: "assistant" as const,
+								time: { created: NOW, completed: NOW },
+							},
+							parts: [
+								{ type: "tool", state: { status: "completed", output: "ran" } },
+							],
+						},
+					],
+				}),
+				get: async () => ({ data: { id: "ses_child" } }),
+				status: async () => ({ data: {} }),
+			},
+		},
+	};
+}
+
 /** A clock whose `now` is a mutable box; bump past 5000ms to clear idle grace. */
 function bumpClock(start: number) {
 	const box = { t: start };
@@ -913,6 +954,85 @@ describe("createWorkflowEngine — fresh run journals to disk", () => {
 			status: "ok",
 			result: "HELLO",
 		});
+
+		await engine.dispose();
+	});
+});
+
+describe("createWorkflowEngine — agent diagnostics persist on the record (Task 7.2.1)", () => {
+	test("an empty-output agent settles with an empty_output diagnostic on the run record", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		// A child whose assistant message carries a TOOL part but NO text: the gate's
+		// hasValidOutput accepts the tool part (turn completes), yet lastAssistantText
+		// is "" — the realistic empty_output path (an empty-text message never
+		// completes on idle alone, by Phase 7.1's valid-output requirement).
+		const { client, sessions } = makeToolOnlyCompletingClient();
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_diag001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("do work", { label: "worker" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const record = engine.statusOf(handle.runId)?.record;
+		expect(record?.status).toBe("completed");
+		// The empty "" result is still returned to the script (byte-identical).
+		expect(record?.returnValue).toBe("");
+		// And the diagnostic is persisted for post-mortem.
+		expect(record?.diagnostics).toBeDefined();
+		expect(record?.diagnostics).toHaveLength(1);
+		expect(record?.diagnostics?.[0]).toMatchObject({
+			label: "worker",
+			index: 0,
+			reason: "empty_output",
+		});
+
+		// It round-trips through the persisted JSON on disk too.
+		const persisted = JSON.parse(
+			files.get(`${BASE}/workflow-runs/wf_diag001.json`) ?? "{}",
+		);
+		expect(persisted.diagnostics?.[0]?.reason).toBe("empty_output");
+
+		await engine.dispose();
+	});
+
+	test("a clean run persists NO diagnostics field", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("HELLO");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_clean001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const record = engine.statusOf(handle.runId)?.record;
+		expect(record?.status).toBe("completed");
+		expect(record?.diagnostics).toBeUndefined();
 
 		await engine.dispose();
 	});
