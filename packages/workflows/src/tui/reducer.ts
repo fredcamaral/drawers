@@ -139,6 +139,54 @@ export interface RunStateReducer {
 }
 
 /**
+ * The one-line glance the `sidebar_content` slot renders per active run (Task
+ * 8.3.4). `activeAgents`/`totalAgents` aggregate the phase done/total off a
+ * {@link RunViewState}; `status` is the run's top-level status; `elapsedMs` is the
+ * run's wall-clock age.
+ */
+export interface RunSummary {
+	runId?: string;
+	/** Occurrences still running (no `agent:end` yet) across all phases. */
+	activeAgents: number;
+	/** Total agent occurrences across all phases. */
+	totalAgents: number;
+	/** Run age in ms: settled → `endedAt - startedAt`; live → `now - startedAt`. */
+	elapsedMs: number;
+	status: RunViewState["status"];
+}
+
+/**
+ * Collapse a {@link RunViewState} into the sidebar's one-line {@link RunSummary}
+ * (Task 8.3.4). Sums each phase's `done`/`total` into `activeAgents` (running) and
+ * `totalAgents`, and derives `elapsedMs` from the run stamps: a settled run uses
+ * its feed-stamped `endedAt - startedAt` (clock-free, stable after a restart); a
+ * live run uses the caller-supplied `now - startedAt` (the reducer holds NO clock,
+ * so the sidebar passes `Date.now()`). A run with no `startedAt` stamp (an empty or
+ * not-yet-started feed) has `elapsedMs: 0`; negatives clamp to 0 so a glance never
+ * shows a backwards duration.
+ */
+export function summarize(state: RunViewState, now: number): RunSummary {
+	let activeAgents = 0;
+	let totalAgents = 0;
+	for (const phase of state.phases) {
+		totalAgents += phase.total;
+		activeAgents += phase.total - phase.done;
+	}
+	let elapsedMs = 0;
+	if (state.startedAt !== undefined) {
+		const end = state.endedAt ?? now;
+		elapsedMs = Math.max(0, end - state.startedAt);
+	}
+	return {
+		...(state.runId !== undefined ? { runId: state.runId } : {}),
+		activeAgents,
+		totalAgents,
+		elapsedMs,
+		status: state.status,
+	};
+}
+
+/**
  * Build a reducer that folds `FeedEvent`s in file order into a {@link RunViewState}.
  * Holds NO clock and NO io — a test feeds a hand-built `FeedEvent[]` and asserts
  * the model. Phase markers/counts are derived on `state()` from the live agents.

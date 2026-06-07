@@ -34,17 +34,26 @@ import { resolveDataBaseDir } from "@drawers/core";
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
 import { createComponent, lazy } from "solid-js";
 
-// The JSX route is loaded LAZILY: `import("./route")` only fires when the route first
-// renders (inside the host, where opencode's `@opentui/solid` transform is active), so
-// this `.ts` entry never pulls the untransformable `.tsx` into its static module graph
-// (the smoke test imports this module without an opentui runtime).
+// The JSX route + sidebar are loaded LAZILY: `import("./route")`/`import("./sidebar")`
+// only fire when the host first renders them (where opencode's `@opentui/solid`
+// transform is active), so this `.ts` entry never pulls the untransformable `.tsx`
+// files into its static module graph (the smoke test imports this module without an
+// opentui runtime).
 const WorkflowsRoute = lazy(() => import("./route"));
+const SidebarRuns = lazy(() => import("./sidebar"));
 
 /** Plugin id — shared with the server module so both surfaces read as one drawer. */
 export const TUI_PLUGIN_ID = "opencode-drawer-workflows";
 
 /** The route name the open command navigates to and the route registers under. */
 export const ROUTE_WORKFLOWS = "workflows";
+
+/**
+ * Host slot order for the workflows sidebar summary (Task 8.3.4). The host renders
+ * registered slots ascending by `order`; this sits just after the internal todo
+ * slot (`order: 400`) so an active-runs glance lands below the session's todos.
+ */
+export const SIDEBAR_SLOT_ORDER = 410;
 
 /** Feed dir leaf — MUST match the engine's `SUBDIR_FEED` (the viewer reads it). */
 export const SUBDIR_FEED = "workflow-feed";
@@ -131,6 +140,20 @@ const tui: TuiPlugin = async (api) => {
 				},
 			},
 		],
+	});
+
+	// The `sidebar_content` slot (Task 8.3.4): a passive one-line glance per ACTIVE
+	// run, discovered from the feed dir alone (the feed is the bus — no protocol with
+	// the server plugin). The slot collapses to nothing when no run is live and
+	// navigates into the route on selection. The JSX body is lazily imported so this
+	// `.ts` entry stays JSX-free (same reason as the route).
+	api.slots.register({
+		order: SIDEBAR_SLOT_ORDER,
+		slots: {
+			sidebar_content(_ctx, _props) {
+				return createComponent(SidebarRuns, { api, feedDir });
+			},
+		},
 	});
 };
 

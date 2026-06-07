@@ -1327,7 +1327,7 @@ interface SessionRunner {
 
 #### Task 8.3.4: `sidebar_content` slot summarizing active runs + open keybind, and the Epic-level live walkthrough
 
-- [ ] Done
+- [x] Done
 
 **Context:** the host exposes a `sidebar_content` slot keyed by `session_id` (`.references/opencode/packages/plugin/src/tui.ts:480-482`), registered via `api.slots.register({ order, slots: { sidebar_content(ctx, props) { return <View .../> } } })` — the canonical shape is the internal `sidebar/todo.tsx` plugin (`.references/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/sidebar/todo.tsx:33-42`): a `<Show when={...}>` over a `createMemo` of live state, collapsing to nothing when there is no active data. The viewer needs a passive summary of active runs (`34/35 agents · 1h34m`-style) plus a way to jump into the route (Epic Done-when). Active runs are discoverable from the feed dir alone: each `<runId>.jsonl` whose tail has a `run:start`/`agent:*` but no terminal `run:end` is in-flight; the reducer (8.3.1) already computes `status`/phase counts, so a sidebar entry is a thin reducer-per-file summary. The route + open command land in 8.3.3; this task adds the slot that LISTS active runs and navigates into the route with the chosen `runId`.
 

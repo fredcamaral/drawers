@@ -4,6 +4,7 @@ import {
 	createRunStateReducer,
 	parseFeedLine,
 	type RunViewState,
+	summarize,
 } from "./reducer";
 
 /**
@@ -319,6 +320,119 @@ describe("createRunStateReducer — cancel-requested then terminal", () => {
 		reducer.apply({ type: "run:end", status: "cancelled", at: 4 });
 		expect(reducer.state().status).toBe("cancelled");
 		expect(reducer.state().endedAt).toBe(4);
+	});
+});
+
+describe("summarize — sidebar one-line run summary (Task 8.3.4)", () => {
+	const tokens = (input: number) => ({
+		input,
+		output: 0,
+		reasoning: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+	});
+
+	// Two phases, three agents total: build has one ended + one running, review
+	// has one running. So done/total = 1/3 and one agent is still running.
+	const inflightFeed: FeedEvent[] = [
+		{ type: "run:start", runId: "wf_summ", parentSessionID: "ses_p", at: 1000 },
+		{ type: "agent:start", label: "impl", phase: "build", at: 1010 },
+		{
+			type: "agent:launched",
+			label: "impl",
+			phase: "build",
+			sessionID: "ses_impl",
+			model: "anthropic/claude-opus-4-8",
+			at: 1020,
+		},
+		{
+			type: "agent:end",
+			label: "impl",
+			status: "completed",
+			sessionID: "ses_impl",
+			durationMs: 80,
+			tokens: tokens(60),
+			toolCalls: 3,
+			at: 1100,
+		} as FeedEvent,
+		{ type: "agent:start", label: "fix", phase: "build", at: 1110 },
+		{
+			type: "agent:launched",
+			label: "fix",
+			phase: "build",
+			sessionID: "ses_fix",
+			model: "anthropic/claude-opus-4-8",
+			at: 1120,
+		},
+		{ type: "agent:start", label: "review", phase: "review", at: 1130 },
+		{
+			type: "agent:launched",
+			label: "review",
+			phase: "review",
+			sessionID: "ses_rev",
+			model: "anthropic/claude-sonnet-4-5",
+			at: 1140,
+		},
+	];
+
+	test("aggregates active/total agents and running status for an in-flight run", () => {
+		const state = reduce(inflightFeed);
+		// `now` is supplied by the caller (the reducer is clock-free): 5000 - 1000.
+		const summary = summarize(state, 5000);
+		expect(summary.runId).toBe("wf_summ");
+		expect(summary.status).toBe("running");
+		expect(summary.totalAgents).toBe(3);
+		// One of three agents has settled (`impl`); two are still running.
+		expect(summary.activeAgents).toBe(2);
+		expect(summary.elapsedMs).toBe(4000);
+	});
+
+	test("interposes cancelling and still counts active agents", () => {
+		const state = reduce([
+			...inflightFeed,
+			{ type: "run:cancel-requested", runId: "wf_summ", at: 2000 },
+		]);
+		const summary = summarize(state, 5000);
+		expect(summary.status).toBe("cancelling");
+		expect(summary.activeAgents).toBe(2);
+	});
+
+	test("summarizes a settled run with terminal status and feed-derived elapsed", () => {
+		const settledFeed: FeedEvent[] = [
+			...inflightFeed,
+			{
+				type: "agent:end",
+				label: "fix",
+				status: "completed",
+				sessionID: "ses_fix",
+				durationMs: 40,
+				at: 1200,
+			} as FeedEvent,
+			{
+				type: "agent:end",
+				label: "review",
+				status: "completed",
+				sessionID: "ses_rev",
+				durationMs: 30,
+				at: 1300,
+			} as FeedEvent,
+			{ type: "run:end", status: "completed", at: 1500 },
+		];
+		const state = reduce(settledFeed);
+		// A settled run ignores `now` and uses endedAt - startedAt (1500 - 1000).
+		const summary = summarize(state, 999_999);
+		expect(summary.status).toBe("completed");
+		expect(summary.activeAgents).toBe(0);
+		expect(summary.totalAgents).toBe(3);
+		expect(summary.elapsedMs).toBe(500);
+	});
+
+	test("elapsedMs is 0 before any run:start stamp is seen", () => {
+		const summary = summarize(reduce([]), 5000);
+		expect(summary.runId).toBeUndefined();
+		expect(summary.totalAgents).toBe(0);
+		expect(summary.activeAgents).toBe(0);
+		expect(summary.elapsedMs).toBe(0);
 	});
 });
 

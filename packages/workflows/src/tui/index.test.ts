@@ -25,12 +25,19 @@ interface CapturedCommand {
 	run: (ctx: unknown) => unknown;
 }
 
-/** A hand-rolled `TuiPluginApi` double recording route + keymap registrations. */
+/** A registered slot plugin, captured by the fake `api.slots.register`. */
+interface CapturedSlotPlugin {
+	order?: unknown;
+	slots?: Record<string, unknown>;
+}
+
+/** A hand-rolled `TuiPluginApi` double recording route + keymap + slot registrations. */
 function fakeApi() {
 	const routes: CapturedRoute[] = [];
 	const commands: CapturedCommand[] = [];
 	const layers: unknown[] = [];
 	const navigations: { name: string; params?: Record<string, unknown> }[] = [];
+	const slotPlugins: CapturedSlotPlugin[] = [];
 	const api = {
 		route: {
 			register(defs: CapturedRoute[]) {
@@ -52,7 +59,8 @@ function fakeApi() {
 			},
 		},
 		slots: {
-			register() {
+			register(plugin: CapturedSlotPlugin) {
+				slotPlugins.push(plugin);
 				return "";
 			},
 		},
@@ -62,7 +70,7 @@ function fakeApi() {
 			},
 		},
 	};
-	return { api, routes, commands, layers, navigations };
+	return { api, routes, commands, layers, navigations, slotPlugins };
 }
 
 describe("tui module shape", () => {
@@ -102,6 +110,18 @@ describe("tui(api) registration", () => {
 		open?.run({});
 		expect(navigations).toHaveLength(1);
 		expect(navigations[0]?.name).toBe("workflows");
+	});
+
+	test("registers a sidebar_content slot (Task 8.3.4)", async () => {
+		const { api, slotPlugins } = fakeApi();
+		// biome-ignore lint/suspicious/noExplicitAny: the fake api is a structural double, not the full TuiPluginApi.
+		await tuiModule.tui(api as any, undefined, {} as any);
+		const withSidebar = slotPlugins.filter(
+			(p) => p.slots !== undefined && "sidebar_content" in p.slots,
+		);
+		expect(withSidebar).toHaveLength(1);
+		expect(typeof withSidebar[0]?.slots?.sidebar_content).toBe("function");
+		expect(typeof withSidebar[0]?.order).toBe("number");
 	});
 });
 
