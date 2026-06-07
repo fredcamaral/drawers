@@ -934,6 +934,55 @@ interface SessionRunner {
 **Dependencies:** Epic 6.1; constraint from reversed design decision 1 — wake ONLY on idle parent, passive fallback otherwise, no oh-my-opencode-style crash-mitigation sprawl
 **Done when:** with the TUI parent idle, a completing workflow triggers a parent turn that reads the result without user input; with the parent busy, notices arrive via the existing flush exactly once.
 
+#### Task 6.3.1: Core wake notifier
+
+- [ ] Done
+
+**Context:** Terminal notices flow through core's notification queue (toast via `onNotify`; passive drain via `createChatMessageHook` — now wrapped by the workflows digest hook). Typed SDK surface for wake: `client.session.status()` is the GLOBAL `/session/status` map `{ [sessionID]: SessionStatus }`, `SessionStatus = idle | retry | busy` (`docs/sdk-surface-audit.md` row f — no per-session path); `client.session.promptAsync` is already used for child dispatch (`session-runner.ts:343`).
+
+**Implementation vision:** New core module `createWakeNotifier({ client, queue, logger, clock })` exposing a `notify(notice)`-shaped hook the plugins call on terminal transitions. Behavior: (1) check the parent's status — wake when the entry is `idle` OR ABSENT (absent ≠ busy; the missed-wake failure mode is the silence we're fixing, and promptAsync failures are fenced anyway — document this call); `busy`/`retry` → leave queued for the passive flush. (2) Coalesce: drain ALL pending notices for that parent into ONE wake prompt; consume-on-success only — `promptAsync` resolving marks them consumed; any throw leaves them queued (passive fallback intact, exactly-once preserved against the flush). (3) Per-parent in-flight guard: never two concurrent wakes for the same parent. (4) Wake text demarcated CC-style: `[task-notification] <notice lines> — automated notice, not the user; read results with the matching status tool.` (5) No retry timers, no polling loops — a wake attempt happens only when a notice arrives; lean by constraint. Verify `promptAsync` body's `agent` field is optional and omit it (the parent keeps its own agent); if the typed surface requires it, STOP and report.
+
+**Files:**
+- Create: `packages/core/src/wake-notifier.ts` (+ export via `packages/core/src/index.ts`)
+- Test: `packages/core/src/wake-notifier.test.ts`
+
+**Verification:** `cd packages/core && bun test wake-notifier` — RED first: idle parent → one coalesced promptAsync carrying all pending notices, consumed; busy parent → no prompt, notices remain; promptAsync throw → notices remain; concurrent notices → single in-flight wake.
+
+**Done when:** the four behaviors above are test-pinned and the full core suite passes.
+
+#### Task 6.3.2: Wire wake into both plugins
+
+- [ ] Done
+
+**Context:** Workflows: terminal transitions invoke the engine's `onNotify` seam (`packages/workflows/src/plugin/engine.ts` — currently toast-only via `plugin/index.ts:68-70`). Background-agents: `packages/background-agents/src/index.ts` wires its queue + toast similarly. Both already share core's queue semantics.
+
+**Implementation vision:** Each plugin constructs the wake notifier with its engine's queue and calls it alongside the toast on terminal transitions — toast stays (visual), wake added (CC parity), passive flush remains as fallback for busy/failed wakes. The status tool named in the wake text differs per plugin (`workflow_status` vs `bg_output`). No behavior change for headless single-turn contexts beyond a fenced failed prompt. Keep wiring thin — composition in `index.ts`, no engine surgery beyond exposing what the notifier needs.
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/index.ts`
+- Modify: `packages/background-agents/src/index.ts`
+- Test: `packages/workflows/src/plugin/index.test.ts`, `packages/background-agents/src/index.test.ts`
+
+**Verification:** plugin index tests — RED: terminal notice with idle parent triggers a parent promptAsync carrying the demarcated notice; busy parent leaves the flush path intact.
+
+**Done when:** both plugins wake an idle parent on completion in unit tests; full repo gates green.
+
+#### Task 6.3.3: Documentation truth update
+
+- [ ] Done
+
+**Context:** `packages/background-agents/README.md` documents the passive model ("why no active wake") — now false. `packages/workflows/README.md` describes completion notification passively.
+
+**Implementation vision:** Update both notification sections: active wake on idle parent (CC task-notification parity), passive flush + toast as fallback layers, the busy-parent rule, and the headless caveat (`opencode run` dies with its turn — `wait_ms` remains the answer there). Keep the established README voice; no marketing.
+
+**Files:**
+- Modify: `packages/background-agents/README.md`
+- Modify: `packages/workflows/README.md`
+
+**Verification:** reread sections against the shipped behavior; no stale "no active wake" claims remain (`grep -ri "active wake" packages/*/README.md`).
+
+**Done when:** READMEs match the implementation.
+
 ---
 
 ## Risks (carried from analysis)
