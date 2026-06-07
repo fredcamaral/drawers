@@ -858,9 +858,74 @@ interface SessionRunner {
 ### Epic 6.2: In-session workflow observability
 
 **Goal:** The main session can see what a running workflow is doing — CC-style: architecture echo at submit, per-agent elapsed, live progress while blocked.
-**Scope:** `packages/workflows/src/runtime/types.ts` (ProgressEvent timestamps), `plugin/tools/workflow.ts` (submit-time architecture echo: meta phases + detected primitives), `plugin/tools/workflow-status.ts` (elapsed per agent + live totals + richer header; live `ctx.metadata({title})` streaming during `wait_ms`), `plugin/index.ts` (live-run digest prepended by the `chat.message` flush while a run is in flight)
+**Scope:** `packages/workflows/src/plugin/engine.ts` (event stamping), `plugin/tools/workflow.ts`, `plugin/tools/workflow-status.ts`, `plugin/index.ts`
 **Dependencies:** Epic 6.1 (status must report trustworthy results)
 **Done when:** during a live run, `workflow_status` shows per-agent elapsed and the TUI tool line updates while `wait_ms` blocks; the `workflow` return echoes the flow architecture; sending any message mid-run surfaces a one-line digest.
+
+#### Task 6.2.1: Timestamped progress + elapsed rendering
+
+- [ ] Done
+
+**Context:** `ProgressEvent` (`packages/workflows/src/runtime/types.ts:53-57`) carries no timestamps, so `workflow_status` can render elapsed only for terminal runs (`completedAt - createdAt`). The runtime is deliberately clock-free; the engine has the injected `Clock` and pushes events at `engine.ts:588-591` (`onProgress`).
+
+**Implementation vision:** Stamp at the ENGINE boundary, not in the runtime: engine wraps each event as `StampedProgressEvent = ProgressEvent & { at: number }` (`clock.now()`) before pushing to `handle.progress` — runtime types stay clock-free, fake clocks keep tests deterministic. `workflow-status` render gains: header `running <elapsed>` for LIVE runs (`clock.now() - createdAt` — the engine exposes its clock or the handle carries a `now()` view); per-agent elapsed on done/failed/cached markers (`end.at - start.at`, pairing first-unmatched-start per label — labels may repeat, chronological pairing is the documented approximation); a counts line `N running / N done / N failed / N cached` while live. Recovered runs (no in-memory progress) render as today.
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/engine.ts`
+- Modify: `packages/workflows/src/plugin/tools/workflow-status.ts`
+- Test: `packages/workflows/src/plugin/tools/workflow-status.test.ts`, `packages/workflows/src/plugin/engine.test.ts`
+
+**Verification:** `cd packages/workflows && bun test` — RED first on the new render expectations.
+
+**Done when:** a live status render shows total elapsed + per-agent elapsed + counts, all driven by fake-clock-stamped events.
+
+#### Task 6.2.2: Architecture echo at submit
+
+- [ ] Done
+
+**Context:** The `workflow` tool's immediate return (`plugin/tools/workflow.ts`, execute path) hands back only run id + script path + "running in background" prose. The parsed meta (name/description/phases) is already in hand at submit; the script source is too.
+
+**Implementation vision:** Extend the immediate return with a compact architecture block: meta name + phases (from the validated meta), plus a "detected primitives" line from cheap regex counts over the source (`agent(`, `pipeline(`, `parallel(`, `workflow(`, `schema` presence) labeled as detected-call-sites — an honest approximation, NOT a DAG (static analysis of arbitrary JS cannot promise more; the journal records the real shape after execution). Keep the existing run-id-first line intact (the model parses it for workflow_status).
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/tools/workflow.ts`
+- Test: `packages/workflows/src/plugin/tools/workflow.test.ts`
+
+**Verification:** `bun test workflow.test` — RED on the new return-shape expectations.
+
+**Done when:** submitting the canonical review script echoes name, phases, and detected primitive counts alongside the run id.
+
+#### Task 6.2.3: Live TUI progress during wait_ms
+
+- [ ] Done
+
+**Context:** `workflow_status` `wait_ms` blocks silently (`workflow-status.ts:247-254` races `handle.settled` vs timeout). opencode's `ToolContext.metadata({ title })` updates the in-progress tool line live (`.claude/skills/opencode-plugin-dev/references/custom-tools.md:91-120`) — the ONLY live-display channel a plugin gets.
+
+**Implementation vision:** While blocked, re-render a compact title on a ~1s interval driven by the handle's stamped progress: `<name> · <current phase> · <done>/<seen> agents · <elapsed>` — counts from the same tally logic as 6.2.1. Wrap every `context.metadata` call in try/catch (defensive: hosts may not implement it); always clear the interval on settle/timeout (finally). No interval when `wait_ms` is 0/absent. Final render unchanged.
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/tools/workflow-status.ts`
+- Test: `packages/workflows/src/plugin/tools/workflow-status.test.ts` (fake context capturing metadata calls; fake timers per existing patterns)
+
+**Verification:** `bun test workflow-status` — RED first: a blocked wait with progress events must emit metadata title updates.
+
+**Done when:** a blocked `workflow_status` call streams title updates reflecting live progress, and never leaks a timer.
+
+#### Task 6.2.4: Live-run digest on the next user turn
+
+- [ ] Done
+
+**Context:** `plugin/index.ts:87` wires `createChatMessageHook(engine.queue, logger)` — it drains TERMINAL notices into the parent's next message. While a run is LIVE there is no passive surface at all.
+
+**Implementation vision:** Extend the hook wiring so that, per user message, live runs owned by that parent session prepend one line each: `[workflow wf_x '<name>' running <elapsed> — <done>/<seen> agents done]`, formatted consistently with the existing notice style. The engine exposes a small read surface (live runs + tallies — reuse 6.2.1's tally). No persistence, no dedup needed (a digest is repeatable by design; only terminal notices are once-only).
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/index.ts` (and the hook factory it delegates to)
+- Test: `packages/workflows/src/plugin/index.test.ts`
+
+**Verification:** `bun test index.test` — RED: a chat.message during a live run must carry the digest line; after settle it must not.
+
+**Done when:** any user message sent mid-run surfaces the digest; terminal notices keep their exactly-once behavior.
 
 ### Epic 6.3: Active parent wake
 
