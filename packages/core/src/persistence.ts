@@ -17,6 +17,7 @@
  */
 
 import {
+	appendFile,
 	mkdir,
 	readdir,
 	readFile,
@@ -41,6 +42,14 @@ export interface FsFacade {
 	writeFile(path: string, data: string, enc: "utf-8"): Promise<void>;
 	rename(from: string, to: string): Promise<void>;
 	rm(path: string, opts: { force: true }): Promise<void>;
+	/**
+	 * Optional native append. `node:fs/promises` exposes an O(1) `appendFile`, so a
+	 * facade backed by it gets append-only writers (the workflow feed) for free; an
+	 * in-memory test facade may omit it and have callers synthesize a read-modify-
+	 * write fallback. Optional so existing facades that never append still satisfy
+	 * the type.
+	 */
+	appendFile?(path: string, data: string, enc: "utf-8"): Promise<void>;
 }
 
 const defaultFs: FsFacade = {
@@ -50,6 +59,7 @@ const defaultFs: FsFacade = {
 	writeFile: (path, data, enc) => writeFile(path, data, enc),
 	rename: (from, to) => rename(from, to),
 	rm: (path, opts) => rm(path, opts),
+	appendFile: (path, data, enc) => appendFile(path, data, enc),
 };
 
 export interface TaskStoreLogger {

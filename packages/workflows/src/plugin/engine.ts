@@ -54,11 +54,23 @@ import type {
 	AgentDiagnostic,
 	BudgetView,
 	JournalEntry,
-	StampedProgressEvent,
 } from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
+import { type ControlWatcher, createControlWatcher } from "./control";
+import {
+	createFeedWriter,
+	type EnrichedProgressEvent,
+	type FeedFs,
+	type FeedWriter,
+} from "./feed";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
+import {
+	createSessionStatsCollector,
+	type SessionStatsCollector,
+	type SessionStatsSnapshot,
+	type SessionTokenSnapshot,
+} from "./session-stats";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
 export interface EngineLogger {
@@ -70,6 +82,48 @@ export interface EngineLogger {
 
 /** Terminal-or-live status of a workflow run. */
 export type RunStatus = "running" | "completed" | "error" | "cancelled";
+
+/**
+ * The per-agent rollup persisted on a {@link RunRecord} (Task 8.1.4). One entry
+ * per `agent:end` the engine sees, accumulated at the choke point so a finished
+ * run reconstructs CC's per-agent table (`model · tokens · tools · duration`)
+ * from the record ALONE — no feed re-parsing. Cached entries (no session) carry
+ * only `label`/`phase`/`status`; launched-and-ended entries carry the full stats.
+ */
+export interface AgentSummary {
+	label: string;
+	phase?: string;
+	/** The child sessionID, present only for launched (non-cached) agents. */
+	sessionID?: string;
+	/** Resolved model, when one was known at launch. */
+	model?: string;
+	/** Resolved subagent type, when one was known at launch. */
+	agentType?: string;
+	/** The `agent:end` status word (`completed`/`error`/`cancelled`/`cached`/…). */
+	status: string;
+	/** The collector's final token snapshot — absent on cached entries. */
+	tokens?: SessionTokenSnapshot;
+	/** Terminal tool-call count — absent on cached entries. */
+	toolCalls?: number;
+	/** `agent:end.at − agent:launched.at` — absent on cached entries. */
+	durationMs?: number;
+	/** The degrade note (Task 7.2.1), when the call collapsed to null/empty. */
+	note?: string;
+}
+
+/**
+ * The launch metadata the choke point holds per live session (Task 8.1.4),
+ * captured from `agent:launched` and consumed at the matching `agent:end` to
+ * compute the duration and stamp model/agentType. Dropped at the agent's end.
+ */
+interface LaunchMeta {
+	label: string;
+	phase?: string;
+	model?: string;
+	agentType?: string;
+	/** The engine-stamped `at` of the `agent:launched` event. */
+	launchedAt: number;
+}
 
 /**
  * The persisted record of one workflow run. Stored through {@link createTaskStore},
@@ -102,6 +156,13 @@ export interface RunRecord {
 	 * Absent when the run had no degraded calls.
 	 */
 	diagnostics?: AgentDiagnostic[];
+	/**
+	 * Per-agent rollup (Task 8.1.4): one {@link AgentSummary} per `agent:end` the
+	 * run produced, accumulated at the engine choke point and persisted at every
+	 * settle site (success, error, cancel) so the record alone reconstructs CC's
+	 * per-agent table post-hoc. Absent when the run launched no agents.
+	 */
+	agents?: AgentSummary[];
 }
 
 /** In-memory handle for a run: live run (absent for recovered records), record, progress. */
@@ -111,9 +172,11 @@ export interface RunHandle {
 	/**
 	 * Engine-stamped progress (Task 6.2.1): the runtime emits clock-free
 	 * {@link ProgressEvent}s, the engine stamps each with `at = clock.now()` at its
-	 * onProgress boundary. `workflow_status` reads `at` for per-agent elapsed.
+	 * onProgress boundary. `workflow_status` reads `at` for per-agent elapsed. Live
+	 * `agent:end` events are widened to {@link EnrichedProgressEvent} at the choke
+	 * point (Task 8.1.4) — the same enrichment the feed file carries.
 	 */
-	progress: StampedProgressEvent[];
+	progress: EnrichedProgressEvent[];
 	/**
 	 * A live wall-clock view for elapsed rendering (Task 6.2.1). The engine sets it
 	 * to its injected `clock.now` for LIVE runs only — recovered runs (flipped to a
@@ -195,6 +258,19 @@ export interface CreateWorkflowEngineOptions {
 	clock?: Clock;
 	/** Injectable runId generator; defaults to a `wf_`-prefixed core generator. */
 	ids?: IdGenerator;
+	/**
+	 * Poll cadence for the external control-channel watcher (Task 8.2.2), in ms.
+	 * Defaults to 1000. The watcher scans `<dataDir>/workflow-control/` for
+	 * `<runId>.cancel` sentinels and cancels the matching live run.
+	 */
+	controlPollMs?: number;
+	/**
+	 * Injectable interval arming for the control watcher; defaults to
+	 * `globalThis.setInterval`. Tests pin the cadence and drive `tick()` directly.
+	 */
+	setIntervalFn?: (cb: () => void, ms: number) => unknown;
+	/** Injectable interval clearing; defaults to `globalThis.clearInterval`. */
+	clearIntervalFn?: (handle: unknown) => void;
 }
 
 export interface WorkflowEngine {
@@ -214,6 +290,14 @@ export interface WorkflowEngine {
 	stopRun(runId: string): void;
 	/** Snapshot of a run handle (record + progress), or undefined when unknown. */
 	statusOf(runId: string): RunHandle | undefined;
+	/**
+	 * Live per-session stats for a tracked CHILD session (Task 8.1.5). The
+	 * collector tracks a session only between its `agent:launched` and `agent:end`,
+	 * so this returns numbers ONLY for in-flight agents and `undefined` otherwise.
+	 * `workflow_status` reads it to fill the running rows of the CC-style tree (a
+	 * settled agent's final stats live on `RunRecord.agents` / the enriched end).
+	 */
+	statsSnapshot(sessionID: string): SessionStatsSnapshot | undefined;
 	/**
 	 * Live (status `running`) run handles owned by a parent session (Task 6.2.4).
 	 * The chat.message digest hook reads this to prepend a one-line digest per live
@@ -246,29 +330,76 @@ const SUBDIR_TASKS = "workflow-tasks";
 const SUBDIR_RUNS = "workflow-runs";
 const SUBDIR_SCRIPTS = "workflow-scripts";
 const SUBDIR_JOURNALS = "workflow-journals";
+const SUBDIR_FEED = "workflow-feed";
+// External control-channel sentinel dir (Task 8.2.1). Declared beside its sibling
+// subdirs so the on-disk layout stays in one place; the control watcher (Task
+// 8.2.2) resolves it via `subdir()` and polls it for `<runId>.cancel` sentinels.
+const SUBDIR_CONTROL = "workflow-control";
+
+/**
+ * Minimum gap between throttled `agent:stats` feed lines for one session (Task
+ * 8.1.3). `message.updated` fires per streamed token, so an unthrottled emit
+ * would flood the feed; one line per session per window is plenty for a tailing
+ * TUI viewer. The status tool reads collector snapshots directly, so it is never
+ * throttle-bound.
+ */
+const STATS_THROTTLE_MS = 2000;
+
+/**
+ * Synthesize an append as read-modify-write over `readFile`/`writeFile` (ENOENT →
+ * start empty), for an {@link FsFacade} that has no native `appendFile` — only the
+ * in-memory test fs. This is O(n) per append (it rewrites the whole file), so it is
+ * the FALLBACK only: a production facade backed by `node:fs/promises` exposes the
+ * native O(1) `appendFile` and never lands here. Callers' own single-serial write
+ * chain guarantees no two appends interleave for one file.
+ */
+function synthesizeAppend(
+	fs: FsFacade,
+): (path: string, data: string, enc: "utf-8") => Promise<void> {
+	return async (path, data, enc) => {
+		let prior = "";
+		try {
+			prior = await fs.readFile(path, enc);
+		} catch (err) {
+			if ((err as { code?: string }).code !== "ENOENT") {
+				throw err;
+			}
+		}
+		await fs.writeFile(path, prior + data, enc);
+	};
+}
 
 /**
  * Adapt the engine's {@link FsFacade} to the {@link JournalFs} the journal needs.
- * `FsFacade` has no `appendFile`, so it is synthesized as read-modify-write over
- * `readFile`/`writeFile` (ENOENT → start empty). This keeps the in-memory test
- * fs unchanged — it already exposes `readFile`/`writeFile`. The journal's own
- * single-serial write chain guarantees no two appends interleave for one file.
+ * Prefers the facade's native `appendFile` (the production `node:fs/promises` path,
+ * O(1) per line); falls back to the read-modify-write {@link synthesizeAppend} only
+ * for an in-memory test fs that lacks it. The journal's single-serial write chain
+ * guarantees no two appends interleave for one file.
  */
 function journalFsFromFacade(fs: FsFacade): JournalFs {
+	const append = fs.appendFile?.bind(fs) ?? synthesizeAppend(fs);
 	return {
 		mkdir: (path, opts) => fs.mkdir(path, opts),
 		readFile: (path, enc) => fs.readFile(path, enc),
-		appendFile: async (path, data, enc) => {
-			let prior = "";
-			try {
-				prior = await fs.readFile(path, enc);
-			} catch (err) {
-				if ((err as { code?: string }).code !== "ENOENT") {
-					throw err;
-				}
-			}
-			await fs.writeFile(path, prior + data, enc);
-		},
+		appendFile: append,
+	};
+}
+
+/**
+ * Adapt the engine's {@link FsFacade} to the {@link FeedFs} the live feed writer
+ * needs (Task 8.1.2). The feed is the high-frequency observability bus (every
+ * lifecycle event plus throttled stats lines), so it MUST use the native O(1)
+ * `appendFile` the production facade exposes — read-modify-write would make the
+ * feed-write path O(n²) in line count, quadratic IO precisely on the long runs the
+ * feed exists to observe. The synthesized fallback is used only by the in-memory
+ * test fs (tiny files). The writer's own dead-state fence absorbs any error this
+ * raises — a broken disk drops feed lines but never breaks the run.
+ */
+function feedFsFromFacade(fs: FsFacade): FeedFs {
+	const append = fs.appendFile?.bind(fs) ?? synthesizeAppend(fs);
+	return {
+		mkdir: (path, opts) => fs.mkdir(path, opts),
+		appendFile: append,
 	};
 }
 
@@ -354,6 +485,8 @@ export function createWorkflowEngine(
 	const subdir = (name: string) => join(base, name);
 	const scriptsDir = subdir(SUBDIR_SCRIPTS);
 	const journalsDir = subdir(SUBDIR_JOURNALS);
+	const feedDir = subdir(SUBDIR_FEED);
+	const controlDir = subdir(SUBDIR_CONTROL);
 
 	// Sub-workflow source resolver (spec §8): maps a name/{scriptPath} to source
 	// against the project directory. Threaded into every TOP-LEVEL run's
@@ -368,6 +501,15 @@ export function createWorkflowEngine(
 	const journalPath = (id: string) => join(journalsDir, `${id}.jsonl`);
 
 	const journalFs = fs ? journalFsFromFacade(fs) : undefined;
+	// The live feed writer's fs (Task 8.1.2): same read-modify-write synthesis as the
+	// journal so the in-memory test fs works unchanged. ALWAYS present (fs always is).
+	const feedFs = feedFsFromFacade(fs);
+	const feedLogger = logger
+		? {
+				error: (msg: string, meta?: Record<string, unknown>) =>
+					logger.error(msg, meta),
+			}
+		: undefined;
 	const journalLogger = logger
 		? {
 				error: (msg: string, meta?: Record<string, unknown>) =>
@@ -412,6 +554,55 @@ export function createWorkflowEngine(
 
 	// (3) In-memory run handles, keyed by runId.
 	const runs = new Map<string, RunHandle>();
+
+	// Per-run live feed writers (Task 8.1.2), keyed by runId. Created in startRun,
+	// reachable by stopRun for the cancel `run:end` line; dropped when the run
+	// settles (the writer holds only a serialized promise chain, no live handle).
+	const feeds = new Map<string, FeedWriter>();
+
+	// ONE session-stats collector per engine (Task 8.1.3): handleEvent folds every
+	// SDK event into the matching CHILD session's token/tool stats (unregistered
+	// sessions are dropped at the first map lookup, so non-workflow traffic costs
+	// one Map.has). Registered on the choke-point sighting of `agent:launched`,
+	// unregistered on `agent:end`.
+	const stats: SessionStatsCollector = createSessionStatsCollector({ clock });
+	// Per-session binding for the throttled `agent:stats` feed line: which run's
+	// feed to write to, the agent's display label, and the last emission time so a
+	// stats change emits at most once per STATS_THROTTLE_MS window. Cleared on
+	// `agent:end`.
+	const statsBindings = new Map<
+		string,
+		{ runId: string; label: string; lastEmittedAt: number }
+	>();
+
+	// External control channel (Task 8.2.2): a poll loop over `workflow-control/`
+	// for `<runId>.cancel` sentinels. `stopRun` is the single cancel authority and
+	// is safe to call unconditionally (its own `status !== "running"` guard makes
+	// unknown/terminal ids no-ops); the `run:cancel-requested` feed line is appended
+	// ONLY for a live run, BEFORE stopRun, so a viewer tailing the feed sees the
+	// cancelling state ahead of the terminal `run:end`. The watcher reuses the engine
+	// `FsFacade` (readdir/rm), so no new fs surface is introduced. Armed below once
+	// the maps exist; stopped first thing in dispose().
+	const control: ControlWatcher = createControlWatcher({
+		dir: controlDir,
+		fs,
+		intervalMs: opts.controlPollMs ?? 1000,
+		setIntervalFn: opts.setIntervalFn,
+		clearIntervalFn: opts.clearIntervalFn,
+		logger,
+		onCancel: async (runId) => {
+			const handle = runs.get(runId);
+			if (handle?.record.status === "running") {
+				feeds.get(runId)?.append({
+					type: "run:cancel-requested",
+					runId,
+					at: clock.now(),
+				});
+			}
+			stopRun(runId);
+		},
+	});
+	control.start();
 
 	// (4) The terminal-notice queue. markNotified flips + re-persists the record.
 	const queue = createNotificationQueue({
@@ -600,6 +791,25 @@ export function createWorkflowEngine(
 		runs.set(runId, handle);
 		persistRecord(record);
 
+		// The live feed (Task 8.1.2): one writer per run, framed by run:start now and
+		// run:end at settle. Every stamped progress event is appended in the onProgress
+		// choke below, so the feed file and handle.progress carry the same stream. The
+		// writer is fenced — a feed-write failure can never break the run.
+		const feed = createFeedWriter({
+			dir: feedDir,
+			runId,
+			fs: feedFs,
+			logger: feedLogger,
+		});
+		feeds.set(runId, feed);
+		feed.append({
+			type: "run:start",
+			runId,
+			parentSessionID: args.parentSessionID,
+			scriptPath,
+			at: clock.now(),
+		});
+
 		// Every run gets its OWN journal (empty file). onRecord persists each settled
 		// AND each re-recorded cached entry, so the new journal is self-contained.
 		const journal: Journal | undefined = journalFs
@@ -620,6 +830,37 @@ export function createWorkflowEngine(
 		// record at settle so a finished run is debuggable without SQLite.
 		const diagnostics: AgentDiagnostic[] = [];
 
+		// Task 8.1.4 per-run choke-point state (dropped when this closure settles):
+		//   - launchMeta: the launched session's label/phase/model/agentType + the
+		//     stamped launch time, keyed by sessionID, consumed at agent:end to
+		//     compute durationMs and stamp model/agentType;
+		//   - startQueue: a FIFO of pending agent:start phases (label-matched) so a
+		//     CACHED end (no sessionID, no agent:launched) recovers its phase — the
+		//     cached path emits start+end synchronously and back-to-back.
+		// The AgentSummary rollup accumulates directly onto `record.agents` (lazily
+		// created) so it is reachable from BOTH the in-closure settle sites AND
+		// stopRun, and persists for free wherever settleRecord saves the record.
+		const launchMeta = new Map<string, LaunchMeta>();
+		const startQueue: Array<{ label: string; phase?: string }> = [];
+
+		/** Pull (and remove) the first pending start matching a label, for its phase. */
+		const claimStartPhase = (label: string): string | undefined => {
+			const i = startQueue.findIndex((s) => s.label === label);
+			if (i === -1) {
+				return undefined;
+			}
+			const [claimed] = startQueue.splice(i, 1);
+			return claimed?.phase;
+		};
+
+		/** Append a per-agent summary onto the record (Task 8.1.4), lazily creating it. */
+		const rollupAgent = (summary: AgentSummary): void => {
+			if (record.agents === undefined) {
+				record.agents = [];
+			}
+			record.agents.push(summary);
+		};
+
 		const run = createWorkflowRun({
 			runner,
 			parentSessionID: args.parentSessionID,
@@ -631,8 +872,94 @@ export function createWorkflowEngine(
 			...(budget !== undefined ? { budget } : {}),
 			onProgress: (e) => {
 				// Stamp at the ENGINE boundary (Task 6.2.1): the runtime stays clock-free;
-				// the timestamp comes from the engine's injected clock here.
-				handle.progress.push({ ...e, at: clock.now() });
+				// the timestamp comes from the engine's injected clock here. A LIVE
+				// agent:end is then WIDENED into an enriched event (Task 8.1.4) so the
+				// feed file and handle.progress carry one identical truth; every other
+				// event rides through as the plain stamped event.
+				const at = clock.now();
+				let out: EnrichedProgressEvent = { ...e, at };
+				if (e.type === "agent:start") {
+					// Remember the phase so a later cached end can recover it (the cached
+					// path never emits agent:launched and its end carries no sessionID).
+					startQueue.push({ label: e.label, phase: e.phase });
+				} else if (e.type === "agent:launched") {
+					// Bind the session-stats collector at the choke point (Task 8.1.3): a
+					// launched session starts being tracked the instant it exists. The
+					// stats themselves are harvested from the SDK event stream (see
+					// handleEvent), not from these lifecycle events.
+					stats.register(e.sessionID, { runId, label: e.label });
+					statsBindings.set(e.sessionID, {
+						runId,
+						label: e.label,
+						// Seed lastEmittedAt in the past so the first real stats change
+						// emits immediately (no initial throttle penalty).
+						lastEmittedAt: Number.NEGATIVE_INFINITY,
+					});
+					// Capture launch meta for the matching agent:end (Task 8.1.4); the
+					// launched start is now live, so drop it from the cached-start queue.
+					launchMeta.set(e.sessionID, {
+						label: e.label,
+						phase: e.phase,
+						model: e.model,
+						agentType: e.agentType,
+						launchedAt: at,
+					});
+					claimStartPhase(e.label);
+				} else if (e.type === "agent:end" && e.sessionID !== undefined) {
+					// A LIVE agent ended: enrich the stamped end with the collector's
+					// final snapshot + the launch-derived duration/model/agentType BEFORE
+					// it is pushed/appended, then drop the per-session tracking. The
+					// snapshot MUST be read before unregister clears the collector state.
+					const meta = launchMeta.get(e.sessionID);
+					const snap = stats.snapshot(e.sessionID);
+					const durationMs =
+						meta !== undefined ? at - meta.launchedAt : undefined;
+					out = {
+						...e,
+						at,
+						...(durationMs !== undefined ? { durationMs } : {}),
+						...(snap !== undefined
+							? { tokens: snap.tokens, toolCalls: snap.toolCalls }
+							: {}),
+						...(meta?.model !== undefined ? { model: meta.model } : {}),
+						...(meta?.agentType !== undefined
+							? { agentType: meta.agentType }
+							: {}),
+					};
+					rollupAgent({
+						label: e.label,
+						...(meta?.phase !== undefined ? { phase: meta.phase } : {}),
+						sessionID: e.sessionID,
+						...(meta?.model !== undefined ? { model: meta.model } : {}),
+						...(meta?.agentType !== undefined
+							? { agentType: meta.agentType }
+							: {}),
+						status: e.status,
+						...(snap !== undefined
+							? { tokens: snap.tokens, toolCalls: snap.toolCalls }
+							: {}),
+						...(durationMs !== undefined ? { durationMs } : {}),
+						...(e.note !== undefined ? { note: e.note } : {}),
+					});
+					stats.unregister(e.sessionID);
+					statsBindings.delete(e.sessionID);
+					launchMeta.delete(e.sessionID);
+				} else if (e.type === "agent:end") {
+					// A CACHED agent ended (no sessionID): the stamped end rides through
+					// untouched, and a stats-free summary carrying only label/phase/status
+					// rolls up (the phase recovered from the matching pending start).
+					const phase = claimStartPhase(e.label);
+					rollupAgent({
+						label: e.label,
+						...(phase !== undefined ? { phase } : {}),
+						status: e.status,
+						...(e.note !== undefined ? { note: e.note } : {}),
+					});
+				}
+				handle.progress.push(out);
+				// Mirror onto the live feed (Task 8.1.2): one source of truth for the
+				// status tool (handle.progress) and the TUI viewer (the feed file).
+				feed.append(out);
 				logger?.debug("workflow progress", { runId, event: e });
 			},
 			// Task 7.2.1: collect typed diagnostics for null/empty agent calls.
@@ -655,47 +982,99 @@ export function createWorkflowEngine(
 		const drainJournal = (): Promise<void> =>
 			Promise.allSettled(journalWrites).then(() => undefined);
 
-		// Fire DETACHED — never await the run. On settle, DRAIN the journal, then
-		// update the record. The settle promise is exposed on the handle so
-		// workflow_status's wait_ms blocks until the journal is durable (resume-safe).
+		// Fire DETACHED — never await the run. On settle, DRAIN the journal AND the
+		// feed, then update the record. The settle promise is exposed on the handle so
+		// workflow_status's wait_ms blocks until both are durable (resume-safe; the
+		// viewer sees the run:end line).
+		//
+		// The feed's `run:end` is ALWAYS appended here, never in stopRun. The run()
+		// promise resolves only once the workflow body's every `await agent()` has
+		// unblocked — and on cancel, abort() flips the in-flight children terminal,
+		// which is exactly what unblocks those awaits and flushes their `agent:end`
+		// through onProgress FIRST. So writing `run:end` here keeps it the terminal
+		// feed line on EVERY path (success, error, cancel): the framing invariant a
+		// TUI viewer relies on. A cancel pre-flips the record to `cancelled`; the feed
+		// then carries that terminal status, and the record is re-persisted so the
+		// last in-flight agent's rollup (mutated after stopRun's settle) is durable.
 		handle.settled = run
 			.run(resolved.source)
 			.then(async (result) => {
 				await drainJournal();
 				return result;
 			})
-			.then((result) => {
-				// A stopRun() may have already flipped the record to cancelled; do not
-				// clobber a terminal record with the run's own (also-terminal) result.
-				if (handle.record.status !== "running") {
-					return;
+			.then(async (result) => {
+				// A stopRun() may have already flipped the record to cancelled. Do not
+				// clobber it with the run's own (also-terminal) result — but still finalize
+				// the feed and re-persist the record below, since the in-flight agents'
+				// ends arrived (and rolled up) only after stopRun ran.
+				if (handle.record.status === "running") {
+					settleRecord(handle, {
+						status: result.status,
+						returnValue: result.returnValue,
+						error: result.error,
+						agentCount: result.agentCount,
+						// Snapshot the budget spend at settle for status display (Task 4.3.1).
+						...(budget !== undefined ? { budgetSpent: budget.spent() } : {}),
+						// Persist diagnostics for any degraded calls (Task 7.2.1); omit the
+						// field entirely on a clean run.
+						...(diagnostics.length > 0 ? { diagnostics } : {}),
+					});
+				} else {
+					// Cancelled by stopRun: re-persist so the final in-flight rollup lands on
+					// disk (stopRun's settle ran before those ends arrived).
+					persistRecord(handle.record);
 				}
-				settleRecord(handle, {
-					status: result.status,
-					returnValue: result.returnValue,
-					error: result.error,
-					agentCount: result.agentCount,
-					// Snapshot the budget spend at settle for status display (Task 4.3.1).
+				await finalizeFeed(handle, {
+					...(result.agentCount !== undefined
+						? { agentCount: result.agentCount }
+						: {}),
 					...(budget !== undefined ? { budgetSpent: budget.spent() } : {}),
-					// Persist diagnostics for any degraded calls (Task 7.2.1); omit the
-					// field entirely on a clean run.
-					...(diagnostics.length > 0 ? { diagnostics } : {}),
 				});
 			})
-			.catch((err: unknown) => {
+			.catch(async (err: unknown) => {
 				// createWorkflowRun.run() never rejects, but fence defensively.
-				if (handle.record.status !== "running") {
-					return;
+				if (handle.record.status === "running") {
+					settleRecord(handle, {
+						status: "error",
+						error: err instanceof Error ? err.message : String(err),
+						// Carry any diagnostics collected before the throw (Task 7.2.1).
+						...(diagnostics.length > 0 ? { diagnostics } : {}),
+					});
+				} else {
+					persistRecord(handle.record);
 				}
-				settleRecord(handle, {
-					status: "error",
-					error: err instanceof Error ? err.message : String(err),
-					// Carry any diagnostics collected before the throw (Task 7.2.1).
-					...(diagnostics.length > 0 ? { diagnostics } : {}),
-				});
+				await finalizeFeed(handle, {});
 			});
 
 		return { runId, scriptPath, name };
+	}
+
+	/**
+	 * Write the feed's terminal `run:end` line, drain the writer, and drop it from
+	 * the per-run map (Task 8.1.2). Always driven from the run's own settle branch,
+	 * which resolves only after every in-flight `agent:end` has flushed — so `run:end`
+	 * is the terminal feed line on success, error, AND cancel. The line carries the
+	 * record's terminal status (a stopRun pre-flips it to `cancelled`). Idempotent by
+	 * map presence; fenced — `settled()` never rejects, so a flush failure can't fail
+	 * a run.
+	 */
+	async function finalizeFeed(
+		handle: RunHandle,
+		end: { agentCount?: number; budgetSpent?: number },
+	): Promise<void> {
+		const runId = handle.record.id;
+		const feed = feeds.get(runId);
+		if (feed === undefined) {
+			return;
+		}
+		feeds.delete(runId);
+		feed.append({
+			type: "run:end",
+			status: handle.record.status,
+			...end,
+			at: clock.now(),
+		});
+		await feed.settled();
 	}
 
 	function stopRun(runId: string): void {
@@ -703,12 +1082,63 @@ export function createWorkflowEngine(
 		if (handle?.record.status !== "running") {
 			return;
 		}
+		// Abort flips the in-flight children terminal (fire-and-forget) and flips the
+		// record to cancelled. The feed's `run:end` is NOT written here: the detached
+		// settle branch above writes it after the aborted children's `agent:end`
+		// events drain, so `run:end` stays the terminal feed line on cancel too.
 		handle.run?.abort();
 		settleRecord(handle, { status: "cancelled" });
 	}
 
+	/**
+	 * Fold one SDK event into per-agent stats (Task 8.1.3), maybe-emit a throttled
+	 * `agent:stats` feed line, THEN forward to the runner's completion gate. The
+	 * stats fold is fenced — a telemetry hiccup never blocks the gate forward, the
+	 * sole load-bearing path. `agent:stats` is feed-only; it is NOT pushed to
+	 * `handle.progress` (the status tool reads collector snapshots directly).
+	 */
+	async function handleEvent(
+		event: Parameters<SessionRunner["handleEvent"]>[0],
+	): Promise<void> {
+		try {
+			const sessionID = stats.handleEvent(event);
+			if (sessionID !== undefined) {
+				const binding = statsBindings.get(sessionID);
+				const now = clock.now();
+				if (
+					binding !== undefined &&
+					now - binding.lastEmittedAt >= STATS_THROTTLE_MS
+				) {
+					const snap = stats.snapshot(sessionID);
+					const feed = feeds.get(binding.runId);
+					if (snap !== undefined && feed !== undefined) {
+						binding.lastEmittedAt = now;
+						feed.append({
+							type: "agent:stats",
+							label: binding.label,
+							sessionID,
+							tokens: snap.tokens,
+							toolCalls: snap.toolCalls,
+							lastTools: snap.lastTools,
+							at: now,
+						});
+					}
+				}
+			}
+		} catch (err) {
+			logger?.error("session stats fold failed", {
+				err: err instanceof Error ? err.message : String(err),
+			});
+		}
+		await runner.handleEvent(event);
+	}
+
 	function statusOf(runId: string): RunHandle | undefined {
 		return runs.get(runId);
+	}
+
+	function statsSnapshot(sessionID: string): SessionStatsSnapshot | undefined {
+		return stats.snapshot(sessionID);
 	}
 
 	function liveRunsFor(parentSessionID: string): RunHandle[] {
@@ -756,9 +1186,13 @@ export function createWorkflowEngine(
 		},
 		stopRun,
 		statusOf,
+		statsSnapshot,
 		liveRunsFor,
-		handleEvent: (event) => runner.handleEvent(event),
+		handleEvent,
 		dispose: async () => {
+			// Stop the control poll loop before draining stores so no late tick races
+			// a disposed engine.
+			control.stop();
 			await readyPromise;
 			await runner.dispose();
 			await taskStore.dispose();

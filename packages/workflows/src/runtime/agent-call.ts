@@ -336,6 +336,25 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			sessionId = task.sessionID;
 			liveTasks?.add(task.id);
 
+			// Task 8.1.1: announce the launched session the instant it exists, between
+			// start and end. This carries the session↔label binding downstream
+			// consumers attach stats/durations to; model resolves from the launched
+			// task (which mirrors the requested model) falling back to opts.model, and
+			// agentType from opts.agentType ?? defaults.agent. Stays clock-free. Guarded
+			// on a present sessionID — a runner that returns no session has nothing to
+			// bind, so it skips agent:launched just like the cached path.
+			if (sessionId !== undefined) {
+				const launchedModel = task.model ?? opts.model;
+				emit({
+					type: "agent:launched",
+					label,
+					phase,
+					sessionID: sessionId,
+					...(launchedModel !== undefined ? { model: launchedModel } : {}),
+					agentType: opts.agentType ?? defaults.agent,
+				});
+			}
+
 			// 8. Wait for it to reach a terminal status.
 			const done = await runner.awaitCompletion(task.id, awaitTimeoutMs);
 			status = done.status;
@@ -423,11 +442,14 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				registry.clear(sessionId);
 			}
 			// 11. Announce the end with the resolved status (and the diagnostic note,
-			// when this call degraded — Task 7.2.1).
+			// when this call degraded — Task 7.2.1). When a session was launched, carry
+			// its sessionID (Task 8.1.1) so the engine can pair this end with its
+			// agent:launched; the cached and pre-launch-throw paths omit it.
 			emit({
 				type: "agent:end",
 				label,
 				status,
+				...(sessionId !== undefined ? { sessionID: sessionId } : {}),
 				...(endNote !== undefined ? { note: endNote } : {}),
 			});
 		}

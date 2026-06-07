@@ -898,6 +898,23 @@ function readJournal(files: Map<string, string>, id: string): JournalEntry[] {
 		.map((l) => JSON.parse(l) as JournalEntry);
 }
 
+const FEED = (id: string) => `${BASE}/workflow-feed/${id}.jsonl`;
+
+/** Read a feed file's parsed lines from the fake fs (missing → []) (Task 8.1.2). */
+function readFeed(
+	files: Map<string, string>,
+	id: string,
+): Array<Record<string, unknown>> {
+	const raw = files.get(FEED(id));
+	if (raw === undefined) {
+		return [];
+	}
+	return raw
+		.split("\n")
+		.filter((l) => l.length > 0)
+		.map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
 /**
  * Drive a single-agent child to completion: launch dispatched the prompt async,
  * so bump the clock past the grace and emit the child's idle event. Returns once
@@ -1614,5 +1631,776 @@ describe("createWorkflowEngine — resume across restart", () => {
 		expect(creates2).toBe(0);
 
 		await engine2.dispose();
+	});
+});
+
+describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
+	// A completed run must leave a parseable JSONL feed bracketed by run:start /
+	// run:end, with every engine-stamped progress event in between mirroring
+	// handle.progress (same enriched stream, one source of truth). Driven via the
+	// all-cache resume path: a seeded journal replays as cached against the inert
+	// client, so the run completes deterministically with agent:start/agent:end
+	// progress events and no live child needed.
+	test("a completed run leaves run:start … events … run:end matching handle.progress", async () => {
+		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
+		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_prior001",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_prior001.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_prior001.js`]: SCRIPT,
+			[JOURNALS("wf_prior001")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_prior001.json`]: JSON.stringify(priorRecord),
+		});
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_feed0001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_prior001",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		const lines = readFeed(files, "wf_feed0001");
+		// First line frames the run; last line settles it.
+		expect(lines[0]?.type).toBe("run:start");
+		expect(lines[0]?.runId).toBe("wf_feed0001");
+		expect(lines[0]?.parentSessionID).toBe("ses_parent");
+		expect(lines[0]?.scriptPath).toBe(handle.scriptPath);
+		expect(lines.at(-1)?.type).toBe("run:end");
+		expect(lines.at(-1)?.status).toBe("completed");
+
+		// The interior lines are exactly the stamped progress events the handle
+		// carries, in order — feed and handle.progress are the same stream.
+		const interior = lines.slice(1, -1);
+		const progress = engine.statusOf(handle.runId)?.progress ?? [];
+		expect(interior).toEqual(progress as unknown as typeof interior);
+		// The cached call emitted agent:start + agent:end (no agent:launched).
+		expect(interior.some((l) => l.type === "agent:start")).toBe(true);
+		expect(interior.some((l) => l.type === "agent:end")).toBe(true);
+
+		await engine.dispose();
+	});
+
+	test("a feed-write failure cannot fail the run (fenced): run still completes", async () => {
+		// An fs whose writeFile/append synthesis throws for the feed file only would
+		// be brittle to target; instead inject a feed fs via a facade whose appendFile
+		// path always errors. The simplest deterministic seam: a facade whose
+		// readFile/writeFile work for scripts/journals/records but whose feed writes
+		// blow up. We model that by making writeFile throw for any feed path.
+		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
+		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_prior002",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_prior002.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_prior002.js`]: SCRIPT,
+			[JOURNALS("wf_prior002")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_prior002.json`]: JSON.stringify(priorRecord),
+		});
+		// Wrap writeFile so any feed-path write throws — the run must survive.
+		const baseWrite = facade.writeFile.bind(facade);
+		facade.writeFile = async (path: string, data: string, enc: "utf-8") => {
+			if (path.includes("/workflow-feed/")) {
+				throw new Error("EIO: feed disk on fire");
+			}
+			return baseWrite(path, data, enc);
+		};
+		const errors: string[] = [];
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: { ...noopLogger, error: (msg) => errors.push(msg) },
+			ids: fixedIds("wf_feed0002"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_prior002",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+
+		// The run completes despite the feed disk being on fire.
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+		expect(engine.statusOf(handle.runId)?.record.returnValue).toBe("CACHED");
+		// Nothing was written; the writer logged its single failure line.
+		expect(readFeed(files, "wf_feed0002")).toEqual([]);
+		expect(errors.some((e) => e.includes("feed"))).toBe(true);
+
+		await engine.dispose();
+	});
+
+	test("a facade with a native appendFile drives feed writes O(1) — no read-modify-write per line", async () => {
+		// The production facade (node:fs/promises) exposes a native appendFile. The
+		// feed is the high-frequency observability bus, so each line MUST go through
+		// that O(1) append — NOT the read-modify-write synthesis (which re-reads the
+		// whole growing file per line, O(n²) overall). We assert it by injecting a
+		// facade whose appendFile is real but whose readFile would throw if the feed
+		// path were ever read back — proving the synthesis path is not taken.
+		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
+		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_prior003",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_prior003.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_prior003.js`]: SCRIPT,
+			[JOURNALS("wf_prior003")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_prior003.json`]: JSON.stringify(priorRecord),
+		});
+		// Native append: concatenate onto the in-memory file, exactly like
+		// node:fs/promises.appendFile. Count the calls per feed path.
+		const appendCalls = new Map<string, number>();
+		facade.appendFile = async (path: string, data: string) => {
+			appendCalls.set(path, (appendCalls.get(path) ?? 0) + 1);
+			files.set(path, (files.get(path) ?? "") + data);
+		};
+		// Trap any read-back of the feed file — the O(1) path must never read it.
+		const baseRead = facade.readFile.bind(facade);
+		const feedReads: string[] = [];
+		facade.readFile = async (path: string, enc: "utf-8") => {
+			if (path.includes("/workflow-feed/")) {
+				feedReads.push(path);
+			}
+			return baseRead(path, enc);
+		};
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_feed0003"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_prior003",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// The feed was written via native appendFile, once per line, and NEVER read
+		// back (no read-modify-write).
+		expect(appendCalls.get(FEED("wf_feed0003")) ?? 0).toBeGreaterThan(0);
+		expect(feedReads).toEqual([]);
+		const lines = readFeed(files, "wf_feed0003");
+		expect(lines.at(0)?.type).toBe("run:start");
+		expect(lines.at(-1)?.type).toBe("run:end");
+
+		await engine.dispose();
+	});
+});
+
+// ---- Task 8.1.3: session stats collector → throttled agent:stats feed lines ---
+
+/** A synthetic `message.updated` for an assistant message with explicit tokens. */
+function msgUpdated(
+	sessionID: string,
+	messageID: string,
+	tokens: {
+		input: number;
+		output: number;
+		reasoning: number;
+		cache: { read: number; write: number };
+	},
+	// biome-ignore lint/suspicious/noExplicitAny: the collector reads a structural slice only.
+): any {
+	return {
+		type: "message.updated",
+		properties: {
+			info: { id: messageID, sessionID, role: "assistant", tokens },
+		},
+	};
+}
+
+/** A synthetic completed `message.part.updated` tool part. */
+function toolPart(
+	sessionID: string,
+	partID: string,
+	tool: string,
+	// biome-ignore lint/suspicious/noExplicitAny: structural slice only.
+): any {
+	return {
+		type: "message.part.updated",
+		properties: {
+			part: {
+				id: partID,
+				sessionID,
+				messageID: "msg_x",
+				type: "tool",
+				callID: `call_${partID}`,
+				tool,
+				state: { status: "completed", input: {} },
+			},
+		},
+	};
+}
+
+describe("createWorkflowEngine — session stats → agent:stats feed (Task 8.1.3)", () => {
+	test("a launched child's token/tool stats emit throttled agent:stats lines, and stop after settle", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_stats001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("do work", { label: "worker" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		// After flush the agent has launched: agent:launched fired through the choke
+		// point, so the child session is REGISTERED with the collector.
+		await flush();
+		const child = sessions[0] as string;
+
+		// First stats change → emits one agent:stats (no prior emission this window).
+		engine.handleEvent(
+			msgUpdated(child, "msg_1", {
+				input: 100,
+				output: 10,
+				reasoning: 0,
+				cache: { read: 0, write: 0 },
+			}),
+		);
+		// A second change WITHIN the 2000ms window must be throttled (no new line).
+		bump(500);
+		engine.handleEvent(toolPart(child, "prt_1", "bash"));
+		// A third change PAST the window emits again.
+		bump(2000);
+		engine.handleEvent(toolPart(child, "prt_2", "read"));
+		await flush();
+
+		const stats = readFeed(files, "wf_stats001").filter(
+			(l) => l.type === "agent:stats",
+		);
+		// Exactly two emissions: window 1 (the token update) and window 2 (past 2s).
+		expect(stats).toHaveLength(2);
+		// Each carries the session↔label binding and the rolled-up snapshot.
+		expect(stats[0]?.sessionID).toBe(child);
+		expect(stats[0]?.label).toBe("worker");
+		expect(stats[0]?.tokens).toEqual({
+			input: 100,
+			output: 10,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+		// The second line reflects the accumulated tool calls (the throttled bash +
+		// the windowed read both counted in the collector by emit time).
+		expect(stats[1]?.toolCalls).toBe(2);
+		expect(stats[1]?.lastTools).toEqual(["bash({})", "read({})"]);
+		// agent:stats is feed-only — it never lands in handle.progress.
+		const progress = engine.statusOf(handle.runId)?.progress ?? [];
+		expect(
+			progress.some((e) => (e as { type: string }).type === "agent:stats"),
+		).toBe(false);
+
+		// Complete the run; the child unregisters at agent:end.
+		bump(6000);
+		await driveIdle(engine, child, bump);
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// A post-settle event for the now-unregistered child emits nothing further.
+		const before = readFeed(files, "wf_stats001").filter(
+			(l) => l.type === "agent:stats",
+		).length;
+		engine.handleEvent(toolPart(child, "prt_3", "grep"));
+		await flush();
+		const after = readFeed(files, "wf_stats001").filter(
+			(l) => l.type === "agent:stats",
+		).length;
+		expect(after).toBe(before);
+
+		await engine.dispose();
+	});
+});
+
+// ---- Task 8.1.4: enriched agent:end + per-agent rollup on the RunRecord -----
+
+describe("createWorkflowEngine — enriched agent:end + RunRecord.agents (Task 8.1.4)", () => {
+	test("a live agent:end is enriched with durationMs/tokens/toolCalls/model/agentType in BOTH the feed and handle.progress, and rolled up onto RunRecord.agents", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_enr0001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("do work", { label: "worker", phase: "Impl", model: "anthropic/claude-opus-4-8", agentType: "reviewer" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		// agent:launched fires through the choke at this clock instant.
+		await flush();
+		const child = sessions[0] as string;
+		const launchedAt = mclock.now();
+
+		// Feed token + tool stats for the child before it ends, so the collector's
+		// final snapshot is non-empty at agent:end time.
+		engine.handleEvent(
+			msgUpdated(child, "msg_1", {
+				input: 200,
+				output: 50,
+				reasoning: 5,
+				cache: { read: 1, write: 2 },
+			}),
+		);
+		engine.handleEvent(toolPart(child, "prt_1", "bash"));
+		engine.handleEvent(toolPart(child, "prt_2", "read"));
+		await flush();
+
+		// Advance the clock so durationMs = end - launchedAt is a known delta, then
+		// drive the child to completion (driveIdle bumps another 6000ms first).
+		bump(1234);
+		await driveIdle(engine, child, bump);
+		const endAt = mclock.now();
+		const expectedDuration = endAt - launchedAt;
+
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// (1) The agent:end line in the feed carries the enrichment.
+		const feed = readFeed(files, "wf_enr0001");
+		const feedEnd = feed.find((l) => l.type === "agent:end");
+		expect(feedEnd).toBeDefined();
+		expect(feedEnd?.sessionID).toBe(child);
+		expect(feedEnd?.durationMs).toBe(expectedDuration);
+		expect(feedEnd?.model).toBe("anthropic/claude-opus-4-8");
+		expect(feedEnd?.agentType).toBe("reviewer");
+		expect(feedEnd?.toolCalls).toBe(2);
+		expect(feedEnd?.tokens).toEqual({
+			input: 200,
+			output: 50,
+			reasoning: 5,
+			cacheRead: 1,
+			cacheWrite: 2,
+		});
+
+		// (2) handle.progress carries the SAME enriched values — one source of truth.
+		const progress = engine.statusOf(handle.runId)?.progress ?? [];
+		const progEnd = progress.find(
+			(e) => (e as { type: string }).type === "agent:end",
+		) as Record<string, unknown> | undefined;
+		expect(progEnd).toBeDefined();
+		expect(progEnd?.durationMs).toBe(expectedDuration);
+		expect(progEnd?.model).toBe("anthropic/claude-opus-4-8");
+		expect(progEnd?.agentType).toBe("reviewer");
+		expect(progEnd?.toolCalls).toBe(2);
+		expect(progEnd?.tokens).toEqual({
+			input: 200,
+			output: 50,
+			reasoning: 5,
+			cacheRead: 1,
+			cacheWrite: 2,
+		});
+
+		// (3) The settled record's agents array matches the enriched end.
+		const agents = engine.statusOf(handle.runId)?.record.agents ?? [];
+		expect(agents).toHaveLength(1);
+		expect(agents[0]).toMatchObject({
+			label: "worker",
+			phase: "Impl",
+			sessionID: child,
+			model: "anthropic/claude-opus-4-8",
+			agentType: "reviewer",
+			status: "completed",
+			toolCalls: 2,
+			durationMs: expectedDuration,
+		});
+		expect(agents[0]?.tokens).toEqual({
+			input: 200,
+			output: 50,
+			reasoning: 5,
+			cacheRead: 1,
+			cacheWrite: 2,
+		});
+
+		await engine.dispose();
+	});
+
+	test("a cached agent:end passes through unenriched and rolls up a stats-free cached entry carrying label/phase/status", async () => {
+		// Resume with a seeded journal: the call replays as cached → agent:start +
+		// agent:end{status:"cached"} with NO sessionID, so the choke leaves it
+		// untouched and the summary carries only label/phase/status.
+		const SCRIPT = `${META}const r = await agent("do work", { label: "cachee", phase: "Review" });\nreturn r;\n`;
+		const key = computeCallKey({
+			prompt: "do work",
+			label: "cachee",
+			phase: "Review",
+		});
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_enrprior",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_enrprior.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_enrprior.js`]: SCRIPT,
+			[JOURNALS("wf_enrprior")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_enrprior.json`]: JSON.stringify(priorRecord),
+		});
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_enr0002"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_enrprior",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// The cached agent:end carries no enrichment fields.
+		const feed = readFeed(files, "wf_enr0002");
+		const feedEnd = feed.find((l) => l.type === "agent:end");
+		expect(feedEnd).toBeDefined();
+		expect(feedEnd?.status).toBe("cached");
+		expect(feedEnd?.sessionID).toBeUndefined();
+		expect(feedEnd?.durationMs).toBeUndefined();
+		expect(feedEnd?.tokens).toBeUndefined();
+		expect(feedEnd?.toolCalls).toBeUndefined();
+
+		// The rolled-up summary carries only label/phase/status (no stats).
+		const agents = engine.statusOf(handle.runId)?.record.agents ?? [];
+		expect(agents).toHaveLength(1);
+		expect(agents[0]).toEqual({
+			label: "cachee",
+			phase: "Review",
+			status: "cached",
+		});
+
+		await engine.dispose();
+	});
+
+	test("a cancelled run persists the partial agents accumulated through the stop", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_enr0003"),
+		});
+		await engine.ready();
+
+		// Two sequential agents: the first completes (enriched end → accumulated),
+		// the second is in flight when the run is stopped. Aborting the run settles
+		// the in-flight agent on a non-completed terminal status, so its end fires
+		// too — the rollup captures BOTH, proving partial agents survive a cancel.
+		const handle = await engine.startRun({
+			source: `${META}const a = await agent("first", { label: "one", phase: "P" });\nconst b = await agent("second", { label: "two", phase: "P" });\nreturn [a, b];\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		const first = sessions[0] as string;
+		const launchedAt = mclock.now();
+		bump(500);
+		await driveIdle(engine, first, bump);
+		const firstEndAt = mclock.now();
+
+		// The second agent has launched but never idles; stop it mid-flight.
+		await flush();
+		expect(sessions.length).toBe(2);
+		const second = sessions[1] as string;
+		engine.stopRun(handle.runId);
+		await flush();
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("cancelled");
+
+		const agents = status?.record.agents ?? [];
+		expect(agents).toHaveLength(2);
+		// The first agent completed cleanly before the stop — full enriched summary.
+		expect(agents[0]).toMatchObject({
+			label: "one",
+			phase: "P",
+			sessionID: first,
+			status: "completed",
+			toolCalls: 0,
+			durationMs: firstEndAt - launchedAt,
+		});
+		// The second agent's end fired on the abort with a non-completed status; it is
+		// still rolled up (partial truth), keyed to its own session.
+		expect(agents[1]).toMatchObject({
+			label: "two",
+			phase: "P",
+			sessionID: second,
+			status: "cancelled",
+		});
+
+		await engine.dispose();
+	});
+
+	test("a cancel with an in-flight child still leaves run:end as the LAST feed line", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_cxl0001"),
+		});
+		await engine.ready();
+
+		// Two sequential agents: the first completes, the second is in flight at stop.
+		// Aborting flips the second child terminal, so its `agent:end` flushes through
+		// onProgress AFTER stopRun returns — the feed must still close with run:end.
+		const handle = await engine.startRun({
+			source: `${META}const a = await agent("first", { label: "one", phase: "P" });\nconst b = await agent("second", { label: "two", phase: "P" });\nreturn [a, b];\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		const first = sessions[0] as string;
+		bump(500);
+		await driveIdle(engine, first, bump);
+
+		await flush();
+		expect(sessions.length).toBe(2);
+		engine.stopRun(handle.runId);
+		// Let the abort round-trip resolve the in-flight child + drain the settle chain.
+		await engine.statusOf(handle.runId)?.settled;
+		await flush();
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("cancelled");
+
+		const lines = readFeed(files, "wf_cxl0001");
+		// The framing invariant: first line run:start, LAST line run:end — even though
+		// the in-flight child's agent:end fired after stopRun.
+		expect(lines.at(0)?.type).toBe("run:start");
+		expect(lines.at(-1)?.type).toBe("run:end");
+		expect(lines.at(-1)?.status).toBe("cancelled");
+		// The in-flight (second) agent's end is present and lands BEFORE run:end.
+		const ends = lines.filter((l) => l.type === "agent:end");
+		expect(ends.length).toBe(2);
+		const lastEndIdx = lines.map((l) => l.type).lastIndexOf("agent:end");
+		const runEndIdx = lines.map((l) => l.type).lastIndexOf("run:end");
+		expect(lastEndIdx).toBeLessThan(runEndIdx);
+
+		await engine.dispose();
+	});
+});
+
+// ---- Task 8.2.2: external control channel (sentinel cancel) ---------------
+
+const CONTROL = `${BASE}/workflow-control`;
+
+/**
+ * Capture the control watcher's interval callback through the injected seam so a
+ * test can fire a poll deterministically (no real timers). Returns the captured
+ * callback box and the inject-able fns the engine wires straight into the watcher.
+ */
+function captureControlTick() {
+	const box: { cb?: () => void } = {};
+	return {
+		box,
+		setIntervalFn: (cb: () => void) => {
+			box.cb = cb;
+			return 1;
+		},
+		clearIntervalFn: () => {},
+	};
+}
+
+describe("createWorkflowEngine — external control channel (Task 8.2.2)", () => {
+	test("a `<runId>.cancel` sentinel cancels the live run, brackets the feed with cancel-requested before run:end, and consumes the sentinel", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const tick = captureControlTick();
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctl0001"),
+			setIntervalFn: tick.setIntervalFn,
+			clearIntervalFn: tick.clearIntervalFn,
+		});
+		await engine.ready();
+
+		// Two sequential agents: drive the first to completion, then cancel via the
+		// sentinel while the second is in flight — mirroring the live-cancel path so
+		// the detached settle branch writes the terminal run:end after the aborted
+		// child's agent:end drains.
+		const handle = await engine.startRun({
+			source: `${META}const a = await agent("first", { label: "one", phase: "P" });\nconst b = await agent("second", { label: "two", phase: "P" });\nreturn [a, b];\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		const first = sessions[0] as string;
+		bump(500);
+		await driveIdle(engine, first, bump);
+		await flush();
+		expect(sessions.length).toBe(2);
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("running");
+
+		// The external actor drops the sentinel into the control dir, then the
+		// engine's poll fires.
+		files.set(`${CONTROL}/${handle.runId}.cancel`, "");
+		tick.box.cb?.();
+		await engine.statusOf(handle.runId)?.settled;
+		await flush();
+
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("cancelled");
+
+		// The sentinel was consumed.
+		expect(files.has(`${CONTROL}/${handle.runId}.cancel`)).toBe(false);
+
+		// The feed carries run:cancel-requested BEFORE the terminal run:end.
+		const lines = readFeed(files, handle.runId);
+		const types = lines.map((l) => l.type);
+		expect(types).toContain("run:cancel-requested");
+		const cancelIdx = types.indexOf("run:cancel-requested");
+		const runEndIdx = types.lastIndexOf("run:end");
+		expect(cancelIdx).toBeGreaterThanOrEqual(0);
+		expect(cancelIdx).toBeLessThan(runEndIdx);
+		expect(lines.at(-1)?.type).toBe("run:end");
+		expect(lines.at(-1)?.status).toBe("cancelled");
+
+		await engine.dispose();
+	});
+
+	test("a sentinel for an unknown runId is consumed with no record change and no feed", async () => {
+		const { facade, files } = makeFs();
+		const tick = captureControlTick();
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctl0002"),
+			setIntervalFn: tick.setIntervalFn,
+			clearIntervalFn: tick.clearIntervalFn,
+		});
+		await engine.ready();
+
+		files.set(`${CONTROL}/wf_ghost.cancel`, "");
+		tick.box.cb?.();
+		await flush();
+
+		// No run exists for the ghost id; nothing settles, but the stale sentinel is
+		// consumed so it cannot accumulate or re-fire.
+		expect(engine.statusOf("wf_ghost")).toBeUndefined();
+		expect(files.has(`${CONTROL}/wf_ghost.cancel`)).toBe(false);
+		expect(readFeed(files, "wf_ghost")).toEqual([]);
+
+		await engine.dispose();
+	});
+
+	test("dispose() clears the control poll interval (no tick races a disposed engine)", async () => {
+		const { facade } = makeFs();
+		// Real handle id so clearIntervalFn receives exactly what setIntervalFn returned.
+		const armed: number[] = [];
+		const cleared: number[] = [];
+		let seq = 0;
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctl0003"),
+			setIntervalFn: (_cb: () => void) => {
+				seq += 1;
+				armed.push(seq);
+				return seq;
+			},
+			clearIntervalFn: (handle: unknown) => {
+				cleared.push(handle as number);
+			},
+		});
+		await engine.ready();
+
+		// The watcher arms exactly one interval at construction.
+		expect(armed).toEqual([1]);
+		expect(cleared).toEqual([]);
+
+		await engine.dispose();
+
+		// dispose() must stop the watcher, clearing the same handle setInterval returned.
+		expect(cleared).toEqual([1]);
 	});
 });

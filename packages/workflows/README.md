@@ -24,7 +24,8 @@ This README is both the package landing page and the complete authoring manual. 
    - [Sub-workflows](#sub-workflows)
 4. [Worked examples](#worked-examples)
 5. [Environment variables](#environment-variables)
-6. [Honest limitations](#honest-limitations)
+6. [The native TUI viewer](#the-native-tui-viewer)
+7. [Honest limitations](#honest-limitations)
 
 ---
 
@@ -497,6 +498,42 @@ return { marker: reply, x: args && args.x };
 | `OPENCODE_DRAWERS_DATA_DIR` | Base directory for the plugin's persistence (run records, child-task records, persisted scripts, journals). When unset, the XDG default base `$XDG_DATA_HOME/opencode-drawers` (or `~/.local/share/opencode-drawers`) is used — so persistence and restart-resume work out of the box on a default install. |
 
 Under the base dir the plugin maintains its `workflow-*` subdirectories: `workflow-runs/` (run records), `workflow-tasks/` (child-task records, one per launched agent), `workflow-scripts/` (the persisted source per run id), and `workflow-journals/` (one `<runId>.jsonl` per run, powering resume).
+
+---
+
+## The native TUI viewer
+
+Beyond the textual `workflow_status` tool, the package ships a second plugin surface — a **native TUI viewer** loaded through OpenCode's `"./tui"` package export. It gives you CC's `/workflows`-style live observability: a phases tree, per-agent `model · tokens · tool calls · duration` rows, drill-down detail, and an in-TUI cancel — all driven from the run's feed file. The viewer is a **lens, not a dependency**: it only ever *reads* `<dataDir>/workflow-feed/<runId>.jsonl`, so headless runs still produce the feed and the viewer adds zero coupling to the server plugin (Phase 8 binding decision: the feed file is the bus).
+
+It contributes two things to the TUI:
+
+- A **`sidebar_content` slot** — a passive one-line glance per active run (`… <run-id>  <done>/<total> agents · <elapsed>`, the CC-style `done/total` where the leading number is how many agents finished), invisible when no run is live. Click a run (or open the viewer from the palette) to jump into the full-screen route for that run.
+- A **full-screen `workflows` route** — three panes (Phases | Agents | Detail). Open it from the command palette (`/workflows`). In-route keys: `j/k` move the selection within the focused pane, `enter` drills Phases → Agents → Detail, `esc` backs out one pane then closes the route, and `x` writes the cancel sentinel for the open run (the exact external touch the engine's control watcher consumes — the run settles `cancelled`).
+
+### Installing the viewer surface
+
+The viewer rides the **same package** as the server plugin — no separate install. The published `opencode-drawer-workflows` entry in your `opencode.json` `plugin` array exposes both `"."` (the server plugin) and `"./tui"` (the viewer); OpenCode loads the TUI surface automatically in its TUI process. For a local checkout, register the dev `file://` form (see [Install](#install)); the `"./tui"` export resolves from the same package.
+
+### Pinned-version note (TUI surface risk)
+
+The `"./tui"` plugin API is newer and less settled than the server plugin API, and its published types lag the runtime (`PluginModule.tui?: never` pins `tui` *out* on the server module even though the runtime accepts it). This surface is built and tested against:
+
+- **opencode `1.16.2`** (`@opencode-ai/plugin@1.16.2`, which provides the `/tui` type entry).
+- **opentui `0.3.2`** for all three peers — `@opentui/core`, `@opentui/keymap`, `@opentui/solid` — pinned to the exact versions the pinned opencode ships.
+
+The viewer module types its default export as `TuiPluginModule` (from `@opencode-ai/plugin/tui`), which sidesteps the type lag. Treat breakage on an opencode/opentui bump as expected maintenance: re-pin the versions, re-run `bun run typecheck` (it includes `tsconfig.tui.json`), and re-walk the manual steps below.
+
+### Live walkthrough (manual validation)
+
+The pure reduction/summary logic is unit-tested under `bun test`, but live rendering against a real opentui runtime is out of automated CI scope. Validate it manually:
+
+1. **Install both surfaces.** Point your `opencode.json` at `opencode-drawer-workflows` (or the dev `file://` form) and launch OpenCode's TUI against the pinned opencode `1.16.2`.
+2. **Launch a multi-phase workflow.** Run a script with at least two phases and a handful of agents (the canonical review workflow in [Example 3](#example-3--the-canonical-review-workflow-pipeline--adversarial-verify-with-a-sub-workflow) works well). The `workflow` tool returns a `run_id` immediately.
+3. **Watch the sidebar summarize it.** Within ~1s the `sidebar_content` slot shows a line like `… <run-id>  3/5 agents · 1m 12s` (3 of 5 agents finished), the count climbing as agents settle.
+4. **Open the route.** Run `/workflows` from the command palette (or click the sidebar line). The full-screen Phases | Agents | Detail view opens on that run.
+5. **See it update live.** As the engine appends to the feed, the Phases counters, the per-agent CC-style rows (`✓ impl  opus-4-8  112.7k tok · 51 tools · 7m 8s`), and the Detail pane (last tools, note, token breakdown, sessionID) update in real time. Navigate with `j/k/enter/esc`.
+6. **Cancel through the sentinel.** Press `x`. The view flips to `cancelling` (the feed's `run:cancel-requested` line), the engine's control watcher consumes the sentinel, the children stop, and the run settles `cancelled`.
+7. **Restart and re-render.** Quit and relaunch the TUI, then open `/workflows` again. The now-settled run re-renders from its feed file alone — the viewer holds no state of its own.
 
 ---
 

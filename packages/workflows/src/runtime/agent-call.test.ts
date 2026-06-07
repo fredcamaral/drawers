@@ -565,6 +565,9 @@ describe("createAgentPrimitive — progress events", () => {
 			type: "agent:end",
 			label: "my-label",
 			status: "completed",
+			// sessionID is now carried on the live path (Task 8.1.1); the default fake
+			// runner assigns "ses_1" to the first launch.
+			sessionID: "ses_1",
 		});
 	});
 
@@ -585,6 +588,121 @@ describe("createAgentPrimitive — progress events", () => {
 		await agent("p", { phase: "Local" });
 		const start = events.find((e) => e.type === "agent:start");
 		expect(start).toMatchObject({ type: "agent:start", phase: "Local" });
+	});
+});
+
+describe("createAgentPrimitive — agent:launched + sessionID (Task 8.1.1)", () => {
+	test("a live call emits start → launched → end in order with a session binding", async () => {
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_live",
+		});
+		const { agent, events } = harness({
+			runner,
+			currentPhase: () => "Analyze",
+		});
+		await agent("prompt text", { label: "my-label" });
+		expect(events.map((e) => e.type)).toEqual([
+			"agent:start",
+			"agent:launched",
+			"agent:end",
+		]);
+		const launched = events.find((e) => e.type === "agent:launched");
+		expect(launched).toEqual({
+			type: "agent:launched",
+			label: "my-label",
+			phase: "Analyze",
+			sessionID: "ses_live",
+			// agentType always resolves (opts.agentType ?? defaults.agent); no model
+			// requested and the fake task carries none, so model is omitted.
+			agentType: "build",
+		});
+	});
+
+	test("agent:launched carries the resolved model and agentType", async () => {
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_m",
+		});
+		const { agent, events } = harness({ runner });
+		await agent("p", {
+			label: "L",
+			model: "anthropic/claude",
+			agentType: "reviewer",
+		});
+		const launched = events.find((e) => e.type === "agent:launched");
+		expect(launched).toEqual({
+			type: "agent:launched",
+			label: "L",
+			phase: undefined,
+			sessionID: "ses_m",
+			model: "anthropic/claude",
+			agentType: "reviewer",
+		});
+	});
+
+	test("model falls back to the launched task's model, agentType to defaults.agent", async () => {
+		// No opts.model/opts.agentType: model resolves from the BgTask the runner
+		// returns (which mirrors req.model — here undefined), agentType from defaults.
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_d",
+		});
+		const { agent, events } = harness({
+			runner,
+			defaults: { agent: "general" },
+		});
+		await agent("p");
+		const launched = events.find((e) => e.type === "agent:launched");
+		expect(launched).toMatchObject({
+			type: "agent:launched",
+			sessionID: "ses_d",
+			agentType: "general",
+		});
+	});
+
+	test("agent:end carries the same sessionID as agent:launched on a live call", async () => {
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_end",
+		});
+		const { agent, events } = harness({ runner });
+		await agent("p", { label: "L" });
+		const launched = events.find((e) => e.type === "agent:launched");
+		const end = events.find((e) => e.type === "agent:end");
+		expect(launched?.type === "agent:launched" && launched.sessionID).toBe(
+			"ses_end",
+		);
+		expect(end?.type === "agent:end" && end.sessionID).toBe("ses_end");
+	});
+
+	test("a cached call emits only start/end with no sessionID and no agent:launched", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+		];
+		const { agent, events } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(events.map((e) => e.type)).toEqual(["agent:start", "agent:end"]);
+		const end = events.find((e) => e.type === "agent:end");
+		expect(end?.type === "agent:end" && end.sessionID).toBeUndefined();
+	});
+
+	test("a launch-throw path emits agent:end without a sessionID and no agent:launched", async () => {
+		const runner = new FakeRunner({ launchThrows: new Error("spawn failed") });
+		const { agent, events } = harness({ runner });
+		expect(await agent("p")).toBeNull();
+		expect(events.some((e) => e.type === "agent:launched")).toBe(false);
+		const end = events.find((e) => e.type === "agent:end");
+		expect(end?.type === "agent:end" && end.sessionID).toBeUndefined();
 	});
 });
 

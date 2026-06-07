@@ -7,17 +7,51 @@
  * (result/error). Built as a `tool()` factory closing over the engine so tests
  * inject a minimal fake.
  *
- * Render is a pure function of the run handle (record + progress). The progress
- * section is a FLAT chronological list faithful to event order: a phase header
- * is emitted whenever the phase changes (decision in Task 4.1.3 — simpler and
- * truer to emission order than a re-sorted tree). Per agent one marker line; the
- * status comes from the matching `agent:end` (a start with no end → running).
+ * Render is a pure function of the run handle (record + progress) plus the
+ * engine's live stats snapshots. The progress section is a CC-style PHASE TREE
+ * (Task 8.1.5): agents are grouped by `phase` (a single `(no phase)` group for
+ * the rest), each phase header carrying a `<done>/<total>` counter and a status
+ * marker, and each agent rendered as one row `<marker> <label>  <model>
+ * <tokens> tok · <tools> tools · <duration>`. A LIVE run builds its rows by
+ * pairing `agent:start`/`agent:launched`/`agent:end` from `handle.progress`
+ * (running rows pull live numbers from {@link WorkflowEngine.statsSnapshot}); a
+ * SETTLED/recovered run renders purely from {@link RunRecord.agents}, so the same
+ * view works after a restart. Narrator `log`/`warn` lines follow the tree.
  */
 
 import { type ToolContext, tool } from "@opencode-ai/plugin";
-import type { StampedProgressEvent } from "../../runtime/types";
-import type { RunHandle, RunRecord, WorkflowEngine } from "../engine";
+import {
+	formatDuration,
+	formatTokens,
+	phaseMarker,
+	shortModel,
+	statusMarker,
+	totalTokens,
+} from "../../tui/format";
+import type {
+	AgentSummary,
+	RunHandle,
+	RunRecord,
+	WorkflowEngine,
+} from "../engine";
+import type { EnrichedProgressEvent } from "../feed";
 import { humanizeDuration } from "../format";
+import type {
+	SessionStatsSnapshot,
+	SessionTokenSnapshot,
+} from "../session-stats";
+
+// Re-export the CC-tree formatting helpers from their shared home (Task 8.3.1).
+// They moved to `src/tui/format.ts` so the textual tool and the native TUI reducer
+// format identically; the names stay importable from here for existing consumers.
+export { formatDuration, formatTokens } from "../../tui/format";
+
+/**
+ * The engine's live per-session stats lookup, narrowed to the tool's needs (Task
+ * 8.1.5). Returns the current token/tool snapshot for a tracked CHILD session, or
+ * `undefined` once the agent has settled (the collector drops it at `agent:end`).
+ */
+type StatsSnapshotFn = (sessionID: string) => SessionStatsSnapshot | undefined;
 
 /** Head-truncation ceiling for the rendered result JSON (default, no-`full` view). */
 const RESULT_MAX = 2000;
@@ -91,17 +125,46 @@ function timeout(ms: number): Promise<void> {
 	});
 }
 
-/** Map an `agent:end` status onto the rendered marker word. */
-function endMarker(status: string): string {
-	switch (status) {
-		case "completed":
-			return "done";
-		case "cached":
-			return "cached";
-		default:
-			// error / cancelled / anything unexpected.
-			return "failed";
-	}
+/**
+ * The enriched `agent:end` view (Task 8.1.4): a stamped end carrying the engine-
+ * computed per-agent stats. `EnrichedProgressEvent`'s end member is a UNION of a
+ * plain stamped end and this enriched one, so a `type === "agent:end"` narrow
+ * keeps both arms; reading the enriched fields requires this widened view. Every
+ * extra field is optional — a cached end (no session) carries none.
+ */
+type EnrichedAgentEnd = Extract<
+	EnrichedProgressEvent,
+	{ type: "agent:end" }
+> & {
+	model?: string;
+	tokens?: SessionTokenSnapshot;
+	toolCalls?: number;
+	durationMs?: number;
+};
+
+/**
+ * One agent occurrence as the CC tree renders it (Task 8.1.5). Built from a LIVE
+ * run's paired progress events (running rows fill `tokens`/`toolCalls` from the
+ * collector snapshot) or directly from a settled run's {@link AgentSummary}.
+ * `status` is `undefined` only for a still-running agent (no `agent:end` yet).
+ */
+interface AgentRow {
+	label: string;
+	phase?: string;
+	status?: string;
+	model?: string;
+	/**
+	 * The child sessionID bound at `agent:launched` (Task 8.1.5). Carried on the row
+	 * so a still-running occurrence pulls ITS OWN live snapshot — critical for
+	 * concurrent same-label agents, where one shared head row would otherwise show
+	 * the last-launched session's stats for every sibling.
+	 */
+	sessionID?: string;
+	/** Total tokens (already summed); absent on cached / un-tracked agents. */
+	tokens?: number;
+	toolCalls?: number;
+	durationMs?: number;
+	note?: string;
 }
 
 /** The error string listing every known runId. */
@@ -185,7 +248,7 @@ function renderDiagnostics(record: RunRecord): string[] {
  * the elapsed `end.at − start.at` (undefined when unmatched).
  */
 function pairStartsToEnds(
-	progress: StampedProgressEvent[],
+	progress: EnrichedProgressEvent[],
 ): Map<number, { status?: string; elapsedMs?: number; note?: string }> {
 	const result = new Map<
 		number,
@@ -217,57 +280,238 @@ function pairStartsToEnds(
 	return result;
 }
 
-/** A single chronological pass: phase headers on change + agent/log/warn lines. */
-function renderProgress(progress: StampedProgressEvent[]): string[] {
-	const paired = pairStartsToEnds(progress);
+/**
+ * Build the CC-style agent rows for a LIVE run by walking its enriched progress
+ * (Task 8.1.5). Each `agent:start` opens an occurrence; the matching
+ * `agent:launched` (FIFO by label) binds its sessionID/model, and the matching
+ * `agent:end` (also FIFO by label) carries the final status + enriched
+ * tokens/toolCalls/durationMs/model. A start with no end is still running: its
+ * tokens/toolCalls are pulled LIVE from the engine's collector snapshot via the
+ * bound sessionID. Cached ends (no sessionID) yield a `cached` row with no stats.
+ * Rows preserve start order so the phase grouping reads chronologically.
+ */
+function liveAgentRows(
+	progress: EnrichedProgressEvent[],
+	statsSnapshot: StatsSnapshotFn,
+): AgentRow[] {
+	const rows: AgentRow[] = [];
+	// Per label: a FIFO of open row indices awaiting launch/end binding.
+	const open = new Map<string, number[]>();
+	const enqueue = (label: string, idx: number): void => {
+		const queue = open.get(label) ?? [];
+		queue.push(idx);
+		open.set(label, queue);
+	};
+	const dequeue = (label: string): number | undefined =>
+		open.get(label)?.shift();
+	/** Remove a specific open index for a label (the sessionID-matched end path). */
+	const dropOpen = (label: string, idx: number): void => {
+		const queue = open.get(label);
+		if (queue === undefined) {
+			return;
+		}
+		const at = queue.indexOf(idx);
+		if (at !== -1) {
+			queue.splice(at, 1);
+		}
+	};
+
+	for (const e of progress) {
+		if (e.type === "agent:start") {
+			const row: AgentRow = {
+				label: e.label,
+				...(e.phase !== undefined ? { phase: e.phase } : {}),
+			};
+			rows.push(row);
+			enqueue(e.label, rows.length - 1);
+		} else if (e.type === "agent:launched") {
+			// Bind launch metadata onto the first still-open occurrence for this label
+			// whose session is not yet bound — NOT the FIFO head. With N concurrent
+			// same-label agents, every `agent:launched` would otherwise stamp the same
+			// head row (last-writer-wins), leaving the siblings model-less and stat-less
+			// until their end. Claiming the first UNBOUND open row gives each launch its
+			// own occurrence, mirroring the engine's per-sessionID disambiguation.
+			const queue = open.get(e.label);
+			const idx = queue?.find((i) => rows[i]?.sessionID === undefined);
+			const row = idx !== undefined ? rows[idx] : undefined;
+			if (row !== undefined) {
+				row.sessionID = e.sessionID;
+				if (e.model !== undefined) {
+					row.model = e.model;
+				}
+				// Pull THIS row's own live snapshot (by its bound session) so a still-
+				// running occurrence shows its own current stats, not a sibling's.
+				const snap = statsSnapshot(e.sessionID);
+				if (snap !== undefined) {
+					row.tokens = totalTokens(snap.tokens);
+					row.toolCalls = snap.toolCalls;
+				}
+			}
+		} else if (e.type === "agent:end") {
+			// A launched end carries its own sessionID — pair it to the row that bound
+			// that exact session (correct under concurrent same-label agents, whose ends
+			// arrive in completion, not launch, order). A cached/sessionless end falls
+			// back to the FIFO head (the documented chronological approximation).
+			let idx: number | undefined;
+			if (e.sessionID !== undefined) {
+				idx = rows.findIndex((r) => r.sessionID === e.sessionID);
+				if (idx === -1) {
+					idx = undefined;
+				} else {
+					dropOpen(e.label, idx);
+				}
+			}
+			if (idx === undefined) {
+				idx = dequeue(e.label);
+			}
+			const row = idx !== undefined ? rows[idx] : undefined;
+			if (row !== undefined) {
+				// The enriched fields (model/tokens/toolCalls/durationMs) are optional on
+				// the union; read them through the enriched view (an engine-side LIVE end
+				// always carries them, a cached end carries none).
+				const end = e as EnrichedAgentEnd;
+				row.status = end.status;
+				if (end.note !== undefined) {
+					row.note = end.note;
+				}
+				if (end.model !== undefined) {
+					row.model = end.model;
+				}
+				if (end.tokens !== undefined) {
+					row.tokens = totalTokens(end.tokens);
+				}
+				if (end.toolCalls !== undefined) {
+					row.toolCalls = end.toolCalls;
+				}
+				if (end.durationMs !== undefined) {
+					row.durationMs = end.durationMs;
+				}
+			}
+		}
+	}
+	return rows;
+}
+
+/** Map the settled {@link RunRecord.agents} rollup onto CC-style rows (Task 8.1.5). */
+function settledAgentRows(agents: AgentSummary[]): AgentRow[] {
+	return agents.map((a) => ({
+		label: a.label,
+		...(a.phase !== undefined ? { phase: a.phase } : {}),
+		status: a.status,
+		...(a.model !== undefined ? { model: a.model } : {}),
+		...(a.tokens !== undefined ? { tokens: totalTokens(a.tokens) } : {}),
+		...(a.toolCalls !== undefined ? { toolCalls: a.toolCalls } : {}),
+		...(a.durationMs !== undefined ? { durationMs: a.durationMs } : {}),
+		...(a.note !== undefined ? { note: a.note } : {}),
+	}));
+}
+
+/** The narrator `log`/`warn` lines, in emission order (Task 8.1.5 keeps them below the tree). */
+function narratorLines(progress: EnrichedProgressEvent[]): string[] {
+	const lines: string[] = [];
+	for (const e of progress) {
+		if (e.type === "log") {
+			lines.push(`  log: ${e.message}`);
+		} else if (e.type === "warn") {
+			lines.push(`  warn: ${e.message}`);
+		}
+	}
+	return lines;
+}
+
+/** The trailing `<tokens> tok · <tools> tools · <duration>` stats segment for a row. */
+function statsSegment(row: AgentRow): string {
+	// Cached (or otherwise un-tracked) agents carry no stats — CC prints `cached`.
+	if (row.status === "cached") {
+		return "cached";
+	}
+	const segments: string[] = [];
+	if (row.tokens !== undefined) {
+		segments.push(`${formatTokens(row.tokens)} tok`);
+	}
+	if (row.toolCalls !== undefined) {
+		segments.push(`${row.toolCalls} tools`);
+	}
+	if (row.durationMs !== undefined) {
+		segments.push(formatDuration(row.durationMs));
+	}
+	return segments.join(" · ");
+}
+
+/** Render one agent row: `<marker> <label>  <model>  <stats>` + an optional note line. */
+function renderAgentRow(row: AgentRow): string[] {
+	const parts = [`  ${statusMarker(row.status)} ${row.label}`];
+	if (row.model !== undefined) {
+		parts.push(shortModel(row.model));
+	}
+	const stats = statsSegment(row);
+	if (stats.length > 0) {
+		parts.push(stats);
+	}
+	const lines = [parts.join("  ")];
+	// Task 7.2.1 note carries through under the row — empty-output gets the ⚠ form.
+	if (row.note !== undefined) {
+		lines.push(
+			row.note === "empty output" ? "    ⚠ empty output" : `    ${row.note}`,
+		);
+	}
+	return lines;
+}
+
+/**
+ * Render the CC-style phase tree (Task 8.1.5): agents grouped by `phase` (a single
+ * `(no phase)` group for the rest) in first-appearance order, each header carrying
+ * a marker and a `<done>/<total>` counter, each agent as one stat row. `done`
+ * counts terminal occurrences (status defined); a running occurrence is not done.
+ */
+function renderAgentTree(rows: AgentRow[]): string[] {
+	if (rows.length === 0) {
+		return [];
+	}
+	// Preserve first-appearance phase order.
+	const order: string[] = [];
+	const groups = new Map<string, AgentRow[]>();
+	for (const row of rows) {
+		const phase = row.phase ?? NO_PHASE;
+		let group = groups.get(phase);
+		if (group === undefined) {
+			group = [];
+			groups.set(phase, group);
+			order.push(phase);
+		}
+		group.push(row);
+	}
 
 	const lines: string[] = [];
-	let currentPhase: string | undefined;
-	let phaseEmitted = false;
-
-	progress.forEach((e, i) => {
-		switch (e.type) {
-			case "agent:start": {
-				const phase = e.phase ?? NO_PHASE;
-				if (!phaseEmitted || phase !== currentPhase) {
-					lines.push(`# ${phase}`);
-					currentPhase = phase;
-					phaseEmitted = true;
-				}
-				const match = paired.get(i);
-				const marker =
-					match?.status !== undefined ? endMarker(match.status) : "running";
-				// Per-agent elapsed (Task 6.2.1): only on a settled marker that carries a
-				// paired duration. A still-running agent has no end to pair, so no suffix.
-				const suffix =
-					match?.elapsedMs !== undefined
-						? ` (${humanizeDuration(match.elapsedMs)})`
-						: "";
-				lines.push(`  [${marker}] ${e.label}${suffix}`);
-				// Task 7.2.1: the diagnostic note renders on its own line right after the
-				// duration — `⚠ empty output` for an empty result, the typed reason note
-				// (e.g. `null — schema_invalid: …; raw 6.3k chars preserved`) otherwise.
-				if (match?.note !== undefined) {
-					const noteLine =
-						match.note === "empty output"
-							? "    ⚠ empty output"
-							: `    ${match.note}`;
-					lines.push(noteLine);
-				}
-				break;
-			}
-			case "agent:end":
-				// Rendered in place at its start; ignored here to avoid duplicate lines.
-				break;
-			case "log":
-				lines.push(`  log: ${e.message}`);
-				break;
-			case "warn":
-				lines.push(`  warn: ${e.message}`);
-				break;
+	for (const phase of order) {
+		const group = groups.get(phase) ?? [];
+		const done = group.filter((r) => r.status !== undefined).length;
+		lines.push(`${phaseMarker(group)} ${phase} ${done}/${group.length}`);
+		for (const row of group) {
+			lines.push(...renderAgentRow(row));
 		}
-	});
+	}
 	return lines;
+}
+
+/**
+ * Render the progress section (Task 8.1.5): the CC-style phase tree followed by
+ * any narrator `log`/`warn` lines. A SETTLED/recovered run renders from
+ * {@link RunRecord.agents} (so the view survives a restart with no live events);
+ * a LIVE run pairs its enriched progress and pulls running rows' stats from the
+ * engine's collector snapshot.
+ */
+function renderProgress(
+	handle: RunHandle,
+	statsSnapshot: StatsSnapshotFn,
+): string[] {
+	const record = handle.record;
+	const terminal = record.status !== "running";
+	const rows =
+		terminal && record.agents !== undefined
+			? settledAgentRows(record.agents)
+			: liveAgentRows(handle.progress, statsSnapshot);
+	return [...renderAgentTree(rows), ...narratorLines(handle.progress)];
 }
 
 /**
@@ -283,7 +527,7 @@ export interface LiveCounts {
 }
 
 /** Tally live per-state counts from stamped progress (Task 6.2.1 / reused by 6.2.3/6.2.4). */
-export function liveCounts(progress: StampedProgressEvent[]): LiveCounts {
+export function liveCounts(progress: EnrichedProgressEvent[]): LiveCounts {
 	const paired = pairStartsToEnds(progress);
 	const counts: LiveCounts = { running: 0, done: 0, failed: 0, cached: 0 };
 	// Walk starts by index to read each one's paired result.
@@ -310,7 +554,7 @@ export function liveCounts(progress: StampedProgressEvent[]): LiveCounts {
  * `cached` was replayed; every other terminal end was a live launch. Counted off
  * the same events the progress tree renders.
  */
-function agentCallTally(progress: StampedProgressEvent[]): {
+function agentCallTally(progress: EnrichedProgressEvent[]): {
 	cached: number;
 	live: number;
 } {
@@ -349,7 +593,7 @@ function budgetLine(handle: RunHandle): string | undefined {
 }
 
 /** The phase of the most recent `agent:start` (the run's current focus), or undefined. */
-function currentPhase(progress: StampedProgressEvent[]): string | undefined {
+function currentPhase(progress: EnrichedProgressEvent[]): string | undefined {
 	for (let i = progress.length - 1; i >= 0; i -= 1) {
 		const e = progress[i];
 		if (e !== undefined && e.type === "agent:start") {
@@ -380,8 +624,13 @@ function liveTitle(handle: RunHandle, nowMs: number): string {
 }
 
 /** Render the full status text for one run handle. `full` (Task 7.2.2) → the
- * complete untruncated result + per-agent diagnostics. */
-function render(handle: RunHandle, full: boolean): string {
+ * complete untruncated result + per-agent diagnostics. `statsSnapshot` (Task
+ * 8.1.5) supplies live token/tool numbers for the running rows of the CC tree. */
+function render(
+	handle: RunHandle,
+	full: boolean,
+	statsSnapshot: StatsSnapshotFn,
+): string {
 	const record: RunRecord = handle.record;
 	const terminal = record.status !== "running";
 
@@ -402,7 +651,7 @@ function render(handle: RunHandle, full: boolean): string {
 
 	const parts: string[] = [header];
 
-	const progressLines = renderProgress(handle.progress);
+	const progressLines = renderProgress(handle, statsSnapshot);
 	if (progressLines.length > 0) {
 		parts.push("", ...progressLines);
 	}
@@ -529,7 +778,9 @@ export function createWorkflowStatusTool(
 					clearIntervalFn(ticker);
 				}
 			}
-			return render(handle, coerceFull(args.full));
+			return render(handle, coerceFull(args.full), (sessionID) =>
+				engine.statsSnapshot(sessionID),
+			);
 		},
 	});
 }

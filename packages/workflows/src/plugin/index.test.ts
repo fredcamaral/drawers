@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	adaptWakeClient,
 	createNotificationQueue,
@@ -12,6 +15,7 @@ import type { Hooks } from "@opencode-ai/plugin";
 import { createWorkflowChatMessageHook } from "./digest-hook";
 import type { RunHandle, WorkflowEngine } from "./engine";
 import * as entry from "./index";
+import { WorkflowsPlugin } from "./index";
 
 /**
  * The opencode loader calls EVERY export of the registered entry module as a
@@ -318,5 +322,70 @@ describe("workflows plugin wake wiring (Task 6.3.2)", () => {
 		expect(toasted).toHaveLength(1);
 		expect(raw.prompts).toHaveLength(0);
 		expect(queue.pending("ses_parent")).toHaveLength(1); // passive flush intact
+	});
+});
+
+// ---- Epic 8.2 review fix: the entry must wire a dispose hook ----------------
+//
+// The engine arms an always-on control-watcher interval at construction (Task
+// 8.2.2) that is only cleared by engine.dispose() → control.stop(). The SDK's
+// Hooks surface exposes `dispose?()` (a loader finalizer), so the entry MUST
+// return it wired to engine.dispose() — otherwise the watcher's referenced timer
+// leaks for the process lifetime. This proves the wiring exists and tears down
+// cleanly; the unit-level proof that engine.dispose() clears the interval lives
+// in engine.test.ts.
+
+describe("workflows plugin entry — dispose wiring (Epic 8.2)", () => {
+	let dataDir: string;
+	const prevDataDir = process.env.OPENCODE_DRAWERS_DATA_DIR;
+
+	beforeAll(async () => {
+		dataDir = await mkdtemp(join(tmpdir(), "wf-entry-dispose-"));
+		process.env.OPENCODE_DRAWERS_DATA_DIR = dataDir;
+	});
+
+	afterAll(async () => {
+		if (prevDataDir === undefined) {
+			delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+		} else {
+			process.env.OPENCODE_DRAWERS_DATA_DIR = prevDataDir;
+		}
+		await rm(dataDir, { recursive: true, force: true }).catch(() => {});
+	});
+
+	/**
+	 * A minimal fake SDK client covering only what the factory touches at
+	 * construction/ready/dispose: structured `app.log`, a `tui.showToast` the toast
+	 * notifier closes over (never called here), and a `session` surface the adapters
+	 * wrap lazily (never invoked on this path).
+	 */
+	function fakeClient() {
+		return {
+			app: { log: async () => undefined },
+			tui: { showToast: async () => undefined },
+			session: {
+				create: async () => ({ data: { id: "ses_child" } }),
+				promptAsync: async () => undefined,
+				abort: async () => undefined,
+				messages: async () => ({ data: [] }),
+				get: async () => undefined,
+				status: async () => ({ data: {} }),
+			},
+			// biome-ignore lint/suspicious/noExplicitAny: minimal structural fake of the SDK client.
+		} as any;
+	}
+
+	test("the factory returns a dispose hook that tears the engine down cleanly", async () => {
+		const hooks = await WorkflowsPlugin({
+			client: fakeClient(),
+			directory: "/proj",
+			// biome-ignore lint/suspicious/noExplicitAny: PluginInput carries more than the factory reads.
+		} as any);
+
+		expect(typeof hooks.dispose).toBe("function");
+		// Invoking it must resolve (engine.dispose drains stores + stops the watcher);
+		// a second call must remain safe (dispose is idempotent on a torn-down engine).
+		await hooks.dispose?.();
+		await hooks.dispose?.();
 	});
 });

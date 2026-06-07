@@ -7,7 +7,7 @@
 	],
 	"scripts": {
 		"test": "bun test",
-		"typecheck": "bunx tsc --noEmit -p packages/core && bunx tsc --noEmit -p packages/background-agents && bunx tsc --noEmit -p packages/workflows",
+		"typecheck": "bunx tsc --noEmit -p packages/core && bunx tsc --noEmit -p packages/background-agents && bunx tsc --noEmit -p packages/workflows && bunx tsc --noEmit -p packages/workflows/tsconfig.tui.json",
 		"lint": "biome check .",
 		"smoke": "bun packages/core/test-harness/run-smoke.ts",
 		"smoke:agents": "bun packages/background-agents/test-harness/run-smoke.ts",
