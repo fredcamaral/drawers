@@ -864,7 +864,7 @@ interface SessionRunner {
 
 #### Task 6.2.1: Timestamped progress + elapsed rendering
 
-- [ ] Done
+- [x] Done — `f3d119a`
 
 **Context:** `ProgressEvent` (`packages/workflows/src/runtime/types.ts:53-57`) carries no timestamps, so `workflow_status` can render elapsed only for terminal runs (`completedAt - createdAt`). The runtime is deliberately clock-free; the engine has the injected `Clock` and pushes events at `engine.ts:588-591` (`onProgress`).
 
@@ -881,7 +881,7 @@ interface SessionRunner {
 
 #### Task 6.2.2: Architecture echo at submit
 
-- [ ] Done
+- [x] Done — `f3d119a`
 
 **Context:** The `workflow` tool's immediate return (`plugin/tools/workflow.ts`, execute path) hands back only run id + script path + "running in background" prose. The parsed meta (name/description/phases) is already in hand at submit; the script source is too.
 
@@ -897,7 +897,7 @@ interface SessionRunner {
 
 #### Task 6.2.3: Live TUI progress during wait_ms
 
-- [ ] Done
+- [x] Done — `f3d119a`
 
 **Context:** `workflow_status` `wait_ms` blocks silently (`workflow-status.ts:247-254` races `handle.settled` vs timeout). opencode's `ToolContext.metadata({ title })` updates the in-progress tool line live (`.claude/skills/opencode-plugin-dev/references/custom-tools.md:91-120`) — the ONLY live-display channel a plugin gets.
 
@@ -913,7 +913,7 @@ interface SessionRunner {
 
 #### Task 6.2.4: Live-run digest on the next user turn
 
-- [ ] Done
+- [x] Done — `f3d119a`
 
 **Context:** `plugin/index.ts:87` wires `createChatMessageHook(engine.queue, logger)` — it drains TERMINAL notices into the parent's next message. While a run is LIVE there is no passive surface at all.
 
