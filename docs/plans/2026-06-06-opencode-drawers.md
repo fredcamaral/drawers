@@ -999,7 +999,7 @@ interface SessionRunner {
 
 #### Task 7.1.1: Add turn-liveness veto to the completion gate
 
-- [ ] Done
+- [x] Done
 
 **Context:** `packages/core/src/completion.ts` — `maybeCompleteOnOutput` (completion.ts:466) and the poll's quiet branch (completion.ts:573) decide completion on `graceElapsed` + `outputIsValid` alone. `hasValidOutput` (completion.ts:193) returns true for any post-watermark tool part. The SDK already exposes the two liveness signals: the global status map (adapted at `packages/core/src/sdk-adapter.ts:111-120` for the wake notifier, audit row f) and `AssistantMessage.time.completed` (typed in `types.gen.d.ts`; `GateMessage.info.time` currently narrows only `created`, completion.ts:65-68).
 
@@ -1018,7 +1018,7 @@ interface SessionRunner {
 
 #### Task 7.1.2: Live repro proves the fix end-to-end
 
-- [ ] Done
+- [x] Done
 
 **Context:** the Phase 6 smoke (`packages/workflows/test-harness/run-smoke.ts`) asserts persisted state, but its scenarios use fast haiku turns that rarely open a >5s silent mid-turn window — they cannot catch this class. The field failure needed opus + a 384KB-diff prompt to reproduce. A deterministic repro needs an artificially slow turn, not a heavy model.
 
