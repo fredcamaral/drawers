@@ -1123,7 +1123,7 @@ interface SessionRunner {
 
 #### Task 8.1.1: Extend the progress vocabulary — `agent:launched` + `sessionID` on `agent:end`
 
-- [ ] Done
+- [x] Done
 
 **Context:** `ProgressEvent` (`packages/workflows/src/runtime/types.ts:52-72`) has four members: `agent:start {label, phase?}`, `agent:end {label, status, note?}`, `log`, `warn`. `agent:start` is emitted before launch (`agent-call.ts:315`), so it cannot carry the child sessionID; the sessionID exists at `agent-call.ts:336` (`sessionId = task.sessionID`) and is in scope in the `finally` that emits `agent:end` (`agent-call.ts:426-433`). The cached path (`agent-call.ts:262-263`) never launches a session. Downstream consumers (engine choke, `workflow_status`, feed) need a session↔label binding to attach stats and compute durations.
 

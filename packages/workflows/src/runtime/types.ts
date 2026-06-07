@@ -57,9 +57,35 @@ export type ProgressEvent =
 			phase?: string;
 	  }
 	| {
+			/**
+			 * A child session was launched (Task 8.1.1), emitted between `agent:start`
+			 * and `agent:end` the instant `runner.launch` returns a sessionID. Carries
+			 * the session↔label binding downstream consumers (engine choke,
+			 * `workflow_status`, feed) need to attach per-agent stats and compute
+			 * durations. The cached and pre-launch-throw paths never emit it (no
+			 * session). The runtime stays clock-free — durations are an engine-side
+			 * derivation, never carried here.
+			 */
+			type: "agent:launched";
+			label: string;
+			phase?: string;
+			sessionID: string;
+			/** Resolved model (`task.model ?? opts.model`), when one is known. */
+			model?: string;
+			/** Resolved subagent type (`opts.agentType ?? defaults.agent`). */
+			agentType?: string;
+	  }
+	| {
 			type: "agent:end";
 			label: string;
 			status: string;
+			/**
+			 * The child's sessionID (Task 8.1.1), present only when a session was
+			 * launched. Absent on the cached and pre-launch-throw paths, which
+			 * legitimately have no session to bind. Lets the engine pair this end with
+			 * its `agent:launched` to finalize per-agent stats and duration.
+			 */
+			sessionID?: string;
 			/**
 			 * Optional short human diagnostic line (Task 7.2.1), present only when the
 			 * call degraded to `null`/`""`. `workflow_status` renders it after the
