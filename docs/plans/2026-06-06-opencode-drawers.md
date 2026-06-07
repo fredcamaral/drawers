@@ -22,7 +22,7 @@
 | 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Complete |
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
-| 5 | Both plugins published to npm and installable in a clean project via `"plugin": [...]` | 5.1 | Epic-level |
+| 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Detailed / 5.2 Epic-level |
 
 ## Design decisions (binding across phases)
 
@@ -709,12 +709,87 @@ interface SessionRunner {
 
 ## Phase 5 — Ship
 
-### Epic 5.1: Publish and documentation
+> Elaboration note (2026-06-06): the original Epic 5.1 mixed documentation and npm
+> publish. Split: Epic 5.1 (documentation) executes now; Epic 5.2 (npm publish)
+> stays epic-level and runs in a separate session (publish requires interactive
+> npm auth at the keyboard). Docs are written npm-first: each package README is
+> the package's npm landing page.
 
-**Goal:** Both plugins on npm (`opencode-drawer-agents`, `opencode-drawer-workflows`), each self-contained (core bundled or published as `@drawers/core` dependency — decide at publish against OpenCode's npm-install behavior); READMEs with install/config/tool reference; publishing per `.claude/skills/opencode-plugin-dev/references/publishing.md`.
-**Scope:** repo-wide
+### Epic 5.1: Documentation
+
+**Goal:** Each plugin has a self-contained README that serves as its npm page (install, config, tool reference, and — for workflows — the complete script-authoring manual); the repo has a root README presenting the drawer and the development workflow. Every example is verified against the real code.
+**Scope:** `README.md` (new, root), `packages/background-agents/README.md` (new), `packages/workflows/README.md` (new)
 **Dependencies:** Phases 2, 4
+**Done when:** docs-reviewer pass is clean; every tool name, option, env var, path, and script example in the docs matches the source; workflow script examples parse through the real `parseScript`.
+
+#### Task 5.1.1: README for `opencode-drawer-agents`
+
+- [ ] Done
+
+**Context:** The plugin exposes `bg_task`/`bg_output`/`bg_cancel`/`bg_list` (`packages/background-agents/src/index.ts:80-87`). No user-facing docs exist anywhere. Data persists under `$OPENCODE_DRAWERS_DATA_DIR` → `$XDG_DATA_HOME` fallback. Completion notices are passive: TUI toast + flushed into the parent's next message via the `chat.message` hook (design decision 1). Tasks survive opencode restarts (Phase 2 exit criterion).
+
+**Implementation vision:** One README, npm-first structure: what it is (one paragraph — fire-and-forget background agents for OpenCode), install (`opencode.json` `"plugin": ["opencode-drawer-agents"]` once published; `file://` form for local dev, marked as such), tool reference table with every parameter read from the actual tool definitions in `packages/background-agents/src/tools/*.ts` (schema names, defaults, coercions — read the code, not memory), notifications model (passive-only; why there is no active wake), persistence/restart behavior, env vars. No marketing prose. Examples are realistic single-turn agent interactions.
+
+**Files:**
+- Create: `packages/background-agents/README.md`
+
+**Verification:** Every tool name/parameter cross-checked against `src/tools/*.ts` schemas; docs-reviewer pass in Task 5.1.4.
+
+**Done when:** a reader with zero context can install, fire a background task, read its output, and explain where state lives.
+
+#### Task 5.1.2: README + authoring manual for `opencode-drawer-workflows`
+
+- [ ] Done
+
+**Context:** The plugin exposes `workflow`/`workflow_status`/`workflow_stop`/`structured_output` (`packages/workflows/src/plugin/index.ts:88-93`). The script runtime API is `agent`/`pipeline`/`parallel`/`phase`/`log`/`args`/`budget`/`workflow` (`packages/workflows/src/runtime/types.ts:83-93`). Determinism bans live in `packages/workflows/src/runtime/evaluate.ts` (Date.now, Math.random, argless `new Date`, scheduling primitives; `console.*` → narrator log). Meta must be a pure literal (`runtime/meta.ts`). Caps: 1000 agent calls lifetime, 4096 items per composition, concurrency gate `min(16, cores−2)`. Resume: journal-backed longest-unchanged-prefix replay, only settled non-null results journaled, works across restarts (`plugin/journal.ts`, `runtime/keys.ts`). Budget: hard ceiling over child sessions' output+reasoning tokens (`plugin/budget.ts`) — note the declared deviation from CC's shared-pool semantics. Sub-workflows: depth-1, saved names resolve from `.opencode/workflows/<name>.js|.mjs`, child error THROWS (unlike `agent()`'s null). `workflow_status` has `wait_ms` (cap 120000) as the single-turn substitute for CC's task notifications.
+
+**Implementation vision:** One self-contained README — it is simultaneously the npm page and the authoring manual (no split into a separate guide; npm relative links are brittle and the surface fits one well-structured doc). Sections: what it is, install, the three tools (+ `structured_output` explained as an internal child-session tool, not user-invoked), then "Writing workflows": meta block format, the eight globals with signatures, `pipeline` vs `parallel` (no-barrier default, when a barrier is right), determinism rules with the *why* (replay-cache poisoning), caps, structured output via `schema`, budget, resume semantics (what re-runs, what replays, what breaks the prefix), saved workflows, sub-workflows. Close with 2–3 complete worked examples, including the canonical review workflow already proven live in `test-harness/run-smoke.ts`. Every example script must parse via the real `parseScript`.
+
+**Files:**
+- Create: `packages/workflows/README.md`
+
+**Verification:** Extract every fenced workflow script from the README and run each through `parseScript` from `packages/workflows/src/runtime/meta.ts` (a throwaway bun script is fine); all parse. Tool parameters cross-checked against `src/plugin/tools/*.ts` schemas.
+
+**Done when:** a model (or human) can author a correct workflow script from the README alone — meta, API, determinism, resume — without reading the source.
+
+#### Task 5.1.3: Root README
+
+- [ ] Done
+
+**Context:** The repo is a Bun-workspace monorepo: `packages/core` (shared engine, npm-private), `packages/background-agents` (`opencode-drawer-agents`), `packages/workflows` (`opencode-drawer-workflows`). Root `package.json` carries `test`, `typecheck`, `lint`, `smoke:agents`, `smoke:workflows` scripts. The "drawer" concept: independently installable OpenCode plugins sharing one engine.
+
+**Implementation vision:** Short root README: the drawer concept (two paragraphs max), a plugin matrix table linking to each package README, quickstart install, development section (bun install / test / typecheck / lint / smoke harnesses — note smoke requires a real opencode binary and hits a live model), repo layout, license. The root README routes; the package READMEs teach. No duplication of tool reference content.
+
+**Files:**
+- Create: `README.md`
+
+**Verification:** Every script name matches root `package.json`; links resolve to real paths; docs-reviewer pass in Task 5.1.4.
+
+**Done when:** a visitor understands what the repo ships and how to develop in it within one screen of reading.
+
+#### Task 5.1.4: Documentation review pass
+
+- [ ] Done
+
+**Context:** Tasks 5.1.1–5.1.3 are written in parallel by separate agents; cross-document consistency (terminology, install instructions, the passive-notification story told the same way twice) is nobody's job until this task.
+
+**Implementation vision:** Dispatch docs-reviewer over the three new READMEs with the source tree available. Review for: factual accuracy against code (tool names, parameters, paths, env vars, caps, defaults), internal consistency across the three docs, voice (technical, terse, no marketing), and completeness against each task's done-when. Findings fixed in place; re-review only the changed sections.
+
+**Files:**
+- Modify: `README.md`, `packages/background-agents/README.md`, `packages/workflows/README.md` (fixes only)
+
+**Verification:** docs-reviewer reports no blocking findings; orchestrator spot-checks one fact per doc independently.
+
+**Done when:** review clean; Epic 5.1 done-when satisfied.
+
+### Epic 5.2: npm publish
+
+**Goal:** Both plugins on npm (`opencode-drawer-agents`, `opencode-drawer-workflows`), each self-contained (core bundled or published as `@drawers/core` dependency — decide at publish against OpenCode's npm-install behavior); publishing per `.claude/skills/opencode-plugin-dev/references/publishing.md`; MIT license.
+**Scope:** `packages/*/package.json`, build/bundle config, `LICENSE`
+**Dependencies:** Epic 5.1 (READMEs ship inside the packages)
 **Done when:** a clean project with only `"plugin": ["opencode-drawer-agents", "opencode-drawer-workflows"]` in `opencode.json` gets working tools on startup.
+
+*(Tasks elaborated when execution reaches this epic — requires interactive npm auth; scheduled for a separate session.)*
 
 ---
 
