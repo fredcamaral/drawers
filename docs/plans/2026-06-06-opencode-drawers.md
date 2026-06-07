@@ -23,10 +23,11 @@
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
 | 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Complete / 5.2 Epic-level |
+| 6 | CC parity: structured results survive slow real-world turns (completion-gate watermark), absolute `script_path` works, live in-session workflow observability, active parent wake | 6.1, 6.2, 6.3 | 6.1 Detailed / rest Epic-level |
 
 ## Design decisions (binding across phases)
 
-1. **No active parent-wake.** Completion notices are delivered passively (flushed into the parent's next user message via the `chat.message` hook) plus a TUI toast. The workflow runner never needs a wake: it awaits its own in-process promises. Rationale: OpenCode does not serialize concurrent session prompts; oh-my-opencode's active wake costs ~24 files of crash-mitigation (`.references/oh-my-opencode/src/features/background-agent/parent-wake-*.ts`).
+1. ~~**No active parent-wake.**~~ **REVERSED 2026-06-07 (Phase 6, user decision: CC parity).** Active wake is now the goal — Epic 6.3. The original rationale stands as a CONSTRAINT, not a veto: OpenCode does not serialize concurrent session prompts (oh-my-opencode's wake costs ~24 files of crash-mitigation at `.references/oh-my-opencode/src/features/background-agent/parent-wake-*.ts`), so the wake fires ONLY on an idle parent; a busy parent falls back to the existing passive flush. Passive delivery (chat.message flush + toast) remains as the fallback layer.
 2. **Event-primary completion, poll as safety net.** `session.idle` gated by min-idle grace + output validation; sparse (≥5s) re-entrancy-guarded poll only as fallback; `client.session.status()` treated as best-effort.
 3. **Typed SDK surface only.** No `as any` calls (better-async relies on untyped `tui.showToast` / `session.fork` — brittle). Anything untyped is treated as unavailable.
 4. **The child session IS the durable task.** Persist metadata only — but ALL fields needed for notify/resume after restart (better-async drops parent context and breaks resume: `.references/better-opencode-async-agents/src/manager/index.ts:325-339`).
@@ -790,6 +791,83 @@ interface SessionRunner {
 **Done when:** a clean project with only `"plugin": ["opencode-drawer-agents", "opencode-drawer-workflows"]` in `opencode.json` gets working tools on startup.
 
 *(Tasks elaborated when execution reaches this epic — requires interactive npm auth; scheduled for a separate session.)*
+
+---
+
+## Phase 6 — CC parity: correctness, observability, wake
+
+**Milestone:** Workflows and background agents behave like Claude Code's: structured results survive slow real-world turns, the main session sees live workflow progress, and completion actively wakes an idle parent session.
+
+> **Origin (2026-06-07):** Fred's first real workflow (`wf_801501pc`, 4 ring reviewers vs the helm branch) returned `null` from all four agents despite every reviewer producing a valid schema-conforming verdict. Root cause traced live (registry instrumentation + exact-script replay + opencode SQLite transcript forensics): the completion gate's missed-idle poll fallback (`packages/core/src/completion.ts`, `DEFAULT_MIN_IDLE_MS`/`DEFAULT_POLL_MS` = 5000) validates ANY assistant output in the transcript — including the PREVIOUS turn's — so a ≥2-poll silent gap (e.g. ~28s first-token latency on an opus reviewer's nudge turn) completes the task mid-turn. `resolveStructured` then reads an empty registry slot, degrades to null, and its `finally` clears the schema; the child's later `structured_output` call gets "no structured output expected". Evidence: task-record spans of exactly 10.002s/15.011s/14.995s/25.01s (poll multiples), replay diag showing `clear` with no prior `lookup`. A second bug found during replay: absolute `script_path` is broken (`resolve-source.ts` `joinPath` strips the leading `/` and roots it at the project dir).
+
+### Epic 6.1: Correctness — turn watermark + absolute script_path
+
+**Goal:** A resumed (nudged) child that thinks for >10s before its first token is no longer falsely completed; structured output survives real reviewer workloads; `workflow` accepts the absolute `script_path` it itself hands out; the smoke harness exercises the schema path e2e.
+**Scope:** `packages/core/src/completion.ts` (+ session-runner reset seam), `packages/workflows/src/plugin/resolve-source.ts`, `packages/workflows/test-harness/run-smoke.ts`
+**Dependencies:** none
+**Done when:** unit tests prove stale-output polls cannot complete a freshly-dispatched turn; absolute script_path resolves; smoke includes a schema scenario whose returnValue carries the validated object.
+
+#### Task 6.1.1: Completion-gate turn watermark
+
+- [ ] Done
+
+**Context:** `packages/core/src/completion.ts` — the gate completes a task via (a) `session.idle` + min-idle grace and (b) a 5s safety poll whose quiet-session branch calls `outputIsValid(sessionID)` (`completion.ts:334-353`). `outputIsValid` fetches messages and accepts ANY assistant output (`hasValidOutput`), and caches positives in `validatedSessions`. After `resume()` (`session-runner.ts:530-575`, used by the structured-output nudge at `agent-call.ts:320-332`), the previous turn's output instantly validates → premature completion during any silent gap. The gate already exposes a resume-reset seam (`completion.ts:132` — "restarts the idle/stale activity clock"); `session-runner.resume` calls it after flipping the task to running.
+
+**Implementation vision:** Per-task **turn watermark**: record when the current turn was dispatched — set on launch's `dispatchPrompt` and again on resume's. Output validation only accepts assistant messages created AFTER the watermark (verify the fetched message shape carries a creation timestamp via the typed SDK — see `docs/sdk-surface-audit.md`; if timestamps are unavailable, fall back to a message-count/last-id watermark captured at dispatch). The resume reset MUST also evict the session from `validatedSessions` (a turn-N validation must not carry into turn N+1). `session.idle`-driven completion keeps its existing grace logic (the stale-idle guard at `completion.ts:581` already covers it) — the watermark applies wherever `outputIsValid`/`hasValidOutput` decide completion; map every caller and apply uniformly. No new config knobs; `DEFAULT_MIN_IDLE_MS`/`DEFAULT_POLL_MS` unchanged. TDD non-negotiable: RED test first reproducing the false completion (launch → turn 1 completes → resume → silent gap → poll with only-stale output MUST NOT complete → post-watermark output arrives → completes).
+
+**Files:**
+- Modify: `packages/core/src/completion.ts`
+- Modify: `packages/core/src/session-runner.ts` (watermark stamping at both dispatch sites)
+- Test: `packages/core/src/completion.test.ts`, `packages/core/src/session-runner.test.ts`
+
+**Verification:** `cd packages/core && bun test` — new watermark describe RED first (captured), then GREEN; full suite + `bun run typecheck` + `bun run lint` clean.
+
+**Done when:** the stale-output false-completion is reproduced by a failing test, fixed, and the whole-repo suite passes.
+
+#### Task 6.1.2: Absolute script_path resolution
+
+- [ ] Done
+
+**Context:** `packages/workflows/src/plugin/resolve-source.ts:80` — `joinPath(directory, nameOrRef.scriptPath)` strips a leading `/`, so an absolute path is silently rooted at the project dir and fails to read. The `workflow` tool's own output hands the model the persisted ABSOLUTE script path for iteration, so this breaks our documented resume/iterate loop.
+
+**Implementation vision:** In the resolver, a `scriptPath` starting with `/` is used verbatim; relative paths keep the existing project-dir join. No tilde expansion, no normalization beyond that — smallest correct change. RED test: resolver with an absolute path outside the project dir reads the file (in-memory fs fixture keyed by the absolute path).
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/resolve-source.ts`
+- Test: `packages/workflows/src/plugin/resolve-source.test.ts`
+
+**Verification:** `cd packages/workflows && bun test resolve-source` RED → GREEN; full suite clean.
+
+**Done when:** absolute and relative `script_path` both resolve; tests prove each.
+
+#### Task 6.1.3: Smoke scenario D — structured output e2e
+
+- [ ] Done
+
+**Context:** `packages/workflows/test-harness/run-smoke.ts` covers pipeline/parallel/phase/sub-workflow/stop/resume but NEVER passes `schema` — the gap that let the registry/gate bug ship. The schema happy path is cheap to verify live (haiku answers the structured suffix within the grace window; see the 2026-06-07 repro).
+
+**Implementation vision:** Add Scenario D after C: a one-agent workflow with `schema: { type:'object', properties:{ verdict:{type:'string'} }, required:['verdict'] }`, asserting the persisted run record's `returnValue` carries the validated OBJECT (not a string, not null). Follow the existing scenario structure (`runUntilRunAppears` + `waitForTerminal`). The slow-gap/nudge case is NOT live-testable deterministically (model-behavior dependent) — it is covered by 6.1.1's unit tests; note that honestly in the scenario comment.
+
+**Files:**
+- Modify: `packages/workflows/test-harness/run-smoke.ts`
+
+**Verification:** `bun packages/workflows/test-harness/run-smoke.ts` — all scenarios PASS including D.
+
+**Done when:** smoke fails if structured output regresses to null/string on the happy path.
+
+### Epic 6.2: In-session workflow observability
+
+**Goal:** The main session can see what a running workflow is doing — CC-style: architecture echo at submit, per-agent elapsed, live progress while blocked.
+**Scope:** `packages/workflows/src/runtime/types.ts` (ProgressEvent timestamps), `plugin/tools/workflow.ts` (submit-time architecture echo: meta phases + detected primitives), `plugin/tools/workflow-status.ts` (elapsed per agent + live totals + richer header; live `ctx.metadata({title})` streaming during `wait_ms`), `plugin/index.ts` (live-run digest prepended by the `chat.message` flush while a run is in flight)
+**Dependencies:** Epic 6.1 (status must report trustworthy results)
+**Done when:** during a live run, `workflow_status` shows per-agent elapsed and the TUI tool line updates while `wait_ms` blocks; the `workflow` return echoes the flow architecture; sending any message mid-run surfaces a one-line digest.
+
+### Epic 6.3: Active parent wake
+
+**Goal:** Workflow/bg-task completion wakes an IDLE parent session with a demarcated automated notice (CC task-notification parity); busy parents keep passive flush. Coalescing: N completions while busy → one wake carrying all pending notices, deduped against the chat.message flush.
+**Scope:** `packages/core` (wake notifier seam on the notification queue + idle detection via typed SDK surface), both plugins' `index.ts` wiring
+**Dependencies:** Epic 6.1; constraint from reversed design decision 1 — wake ONLY on idle parent, passive fallback otherwise, no oh-my-opencode-style crash-mitigation sprawl
+**Done when:** with the TUI parent idle, a completing workflow triggers a parent turn that reads the result without user input; with the parent busy, notices arrive via the existing flush exactly once.
 
 ---
 
