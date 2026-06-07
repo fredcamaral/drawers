@@ -309,6 +309,61 @@ describe("createWorkflowTool — args coercion", () => {
 	});
 });
 
+describe("createWorkflowTool — budget_tokens coercion", () => {
+	test("a finite positive number threads budgetTokens to startRun", async () => {
+		const calls: { budgetTokens?: number }[] = [];
+		const engine = {
+			startRun: async (a: { budgetTokens?: number }) => {
+				calls.push({ budgetTokens: a.budgetTokens });
+				return { runId: "wf_x", scriptPath: "/p", name: "n" };
+			},
+			statusOf: () => undefined,
+			runs: new Map(),
+		} as unknown as WorkflowEngine;
+		const { facade } = makeFs();
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		await run(t, { script: HANGING, budget_tokens: 5000 }, ctx("ses_parent"));
+		expect(calls[0]?.budgetTokens).toBe(5000);
+	});
+
+	test("a numeric string coerces to a number", async () => {
+		const calls: { budgetTokens?: number }[] = [];
+		const engine = {
+			startRun: async (a: { budgetTokens?: number }) => {
+				calls.push({ budgetTokens: a.budgetTokens });
+				return { runId: "wf_x", scriptPath: "/p", name: "n" };
+			},
+			statusOf: () => undefined,
+			runs: new Map(),
+		} as unknown as WorkflowEngine;
+		const { facade } = makeFs();
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		await run(t, { script: HANGING, budget_tokens: "5000" }, ctx("ses_parent"));
+		expect(calls[0]?.budgetTokens).toBe(5000);
+	});
+
+	test("NaN / non-numeric / zero / negative / absent all coerce to undefined (no budget)", async () => {
+		for (const raw of [Number.NaN, "not a number", 0, -100, undefined, ""]) {
+			const calls: { budgetTokens?: number }[] = [];
+			const engine = {
+				startRun: async (a: { budgetTokens?: number }) => {
+					calls.push({ budgetTokens: a.budgetTokens });
+					return { runId: "wf_x", scriptPath: "/p", name: "n" };
+				},
+				statusOf: () => undefined,
+				runs: new Map(),
+			} as unknown as WorkflowEngine;
+			const { facade } = makeFs();
+			const t = createWorkflowTool(engine, {
+				directory: DIRECTORY,
+				fs: facade,
+			});
+			await run(t, { script: HANGING, budget_tokens: raw }, ctx("ses_parent"));
+			expect(calls[0]?.budgetTokens).toBeUndefined();
+		}
+	});
+});
+
 describe("createWorkflowTool — resume", () => {
 	const META_LOCAL = `export const meta = { name: "demo", description: "d" };\n`;
 	const ONE_AGENT = `${META_LOCAL}const r = await agent("do work");\nreturn r;\n`;

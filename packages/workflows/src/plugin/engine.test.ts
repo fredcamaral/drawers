@@ -865,6 +865,140 @@ describe("createWorkflowEngine — resume (same instance)", () => {
 	});
 });
 
+// ---- Task 4.3.1: token budget --------------------------------------------
+
+/**
+ * A completing client whose assistant messages carry `tokens` metadata, so the
+ * budget provider can sum real output+reasoning spend. Each launched child gets
+ * a distinct session id; `session.messages` returns one assistant message with
+ * the scripted token counts.
+ */
+function makeBudgetClient(tokens: { output: number; reasoning: number }) {
+	const sessions: string[] = [];
+	let seq = 0;
+	return {
+		sessions,
+		client: {
+			session: {
+				create: async () => {
+					seq += 1;
+					const id = `ses_child_${seq}`;
+					sessions.push(id);
+					return { data: { id } };
+				},
+				promptAsync: async () => undefined,
+				abort: async () => undefined,
+				messages: async () => ({
+					data: [
+						{
+							info: { role: "assistant" as const, tokens },
+							parts: [{ type: "text", text: "REPLY" }],
+						},
+					],
+				}),
+				get: async () => ({ data: { id: "ses_child" } }),
+			},
+		},
+	};
+}
+
+describe("createWorkflowEngine — token budget", () => {
+	test("budgetTokens threads a budget; settle fills budgetTotal/budgetSpent", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeBudgetClient({ output: 30, reasoning: 5 });
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_budget01"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+			budgetTokens: 1000,
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		// One child spent 30 output + 5 reasoning = 35 against a 1000 ceiling.
+		expect(status?.record.budgetTotal).toBe(1000);
+		expect(status?.record.budgetSpent).toBe(35);
+
+		await engine.dispose();
+	});
+
+	test("a live run exposes the budget view on its handle for live spend reads", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeBudgetClient({ output: 30, reasoning: 5 });
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_budget02"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+			budgetTokens: 1000,
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		// The handle carries a live budget view reading the SAME accumulator.
+		const h = engine.statusOf(handle.runId);
+		expect(h?.budget?.total).toBe(1000);
+		expect(h?.budget?.spent()).toBe(35);
+		expect(h?.budget?.remaining()).toBe(965);
+
+		await engine.dispose();
+	});
+
+	test("absent budgetTokens → no budget on the handle, no budget fields on the record", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeBudgetClient({ output: 30, reasoning: 5 });
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_budget03"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.budget).toBeUndefined();
+		expect(status?.record.budgetTotal).toBeUndefined();
+		expect(status?.record.budgetSpent).toBeUndefined();
+
+		await engine.dispose();
+	});
+});
+
 describe("createWorkflowEngine — resume across restart", () => {
 	test("a second engine instance over the SAME fake-fs resumes to an all-cache replay", async () => {
 		const { facade, files } = makeFs();

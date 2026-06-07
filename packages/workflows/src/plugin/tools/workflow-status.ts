@@ -124,6 +124,25 @@ function agentCallTally(progress: ProgressEvent[]): {
 	return { cached, live };
 }
 
+/**
+ * The budget line, when the run carries a budget (Task 4.3.1). A LIVE run reads
+ * spend from the handle's budget view (so the line tracks real-time consumption);
+ * a terminal/recovered run reads the settled `budgetSpent` snapshot off the
+ * record (the view's accumulator died with the process). Reasoning tokens are
+ * folded into output spend (output-priced) — hence "output tokens".
+ */
+function budgetLine(handle: RunHandle): string | undefined {
+	const total = handle.record.budgetTotal;
+	if (total === undefined) {
+		return undefined;
+	}
+	const spent =
+		handle.budget !== undefined
+			? handle.budget.spent()
+			: (handle.record.budgetSpent ?? 0);
+	return `budget: ${spent}/${total} output tokens`;
+}
+
 /** Render the full status text for one run handle. */
 function render(handle: RunHandle): string {
 	const record: RunRecord = handle.record;
@@ -142,6 +161,11 @@ function render(handle: RunHandle): string {
 	const progressLines = renderProgress(handle.progress);
 	if (progressLines.length > 0) {
 		parts.push("", ...progressLines);
+	}
+
+	const budget = budgetLine(handle);
+	if (budget !== undefined) {
+		parts.push("", budget);
 	}
 
 	if (record.status === "completed") {

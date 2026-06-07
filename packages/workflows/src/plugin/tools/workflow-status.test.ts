@@ -270,6 +270,78 @@ describe("createWorkflowStatusTool — resume (Task 4.2.2)", () => {
 		expect(out).not.toContain("resumed from");
 	});
 
+	test("a running run does NOT append the cached/live tally — placeholder", async () => {
+		const progress: ProgressEvent[] = [
+			{ type: "agent:start", label: "a", phase: "p" },
+			{ type: "agent:end", label: "a", status: "cached" },
+		];
+		const engine = fakeEngine([
+			{ record: makeRecord({ id: "wf_run_old1" }), progress },
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_run_old1" }, ctx());
+		expect(out).not.toContain("agent calls");
+	});
+});
+
+describe("createWorkflowStatusTool — budget line (Task 4.3.1)", () => {
+	test("a terminal run with a budget shows spent/total at the settled snapshot", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_bud00001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: 1,
+					budgetTotal: 1000,
+					budgetSpent: 350,
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_bud00001" }, ctx());
+		expect(out).toContain("budget: 350/1000 output tokens");
+	});
+
+	test("a live run reads LIVE spend from the budget view on the handle", async () => {
+		const liveBudget = {
+			total: 1000,
+			spent: () => 120,
+			remaining: () => 880,
+		};
+		const engine = fakeEngine([
+			{
+				record: makeRecord({ id: "wf_bud00002", budgetTotal: 1000 }),
+				progress: [],
+				budget: liveBudget,
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_bud00002" }, ctx());
+		// Live spend comes from the view (120), not the record's settled snapshot.
+		expect(out).toContain("budget: 120/1000 output tokens");
+	});
+
+	test("a run with NO budget shows no budget line", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_bud00003",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: 1,
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_bud00003" }, ctx());
+		expect(out).not.toContain("budget:");
+	});
+});
+
+describe("createWorkflowStatusTool — running tally suppression", () => {
 	test("a running run does NOT append the cached/live tally", async () => {
 		const progress: ProgressEvent[] = [
 			{ type: "agent:start", label: "a", phase: "p" },

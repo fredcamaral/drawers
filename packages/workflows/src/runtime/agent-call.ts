@@ -12,6 +12,27 @@ import {
 	type ProgressEmitter,
 } from "./types";
 
+/**
+ * The structural seam the runtime uses to charge a settled child against the
+ * budget WITHOUT importing the plugin's TokenBudget. The runtime keeps zero
+ * plugin knowledge: it runtime-checks `typeof budget.recordTask === "function"`
+ * and, when present with a sessionID, awaits it at settle. A plain
+ * {@link BudgetView} (no recordTask) is left untouched.
+ *
+ * Sequential accuracy: because `recordTask` is awaited BEFORE this call resolves,
+ * the NEXT sequential `agent()` call's budget pre-check (§6) sees this call's
+ * spend. Concurrent calls are best-effort by nature — overlapping settles both
+ * record, but a pre-check between them may not yet have seen the other.
+ */
+interface RecordableBudget {
+	recordTask(sessionID: string): Promise<void>;
+}
+
+/** Runtime-check whether a budget structurally exposes `recordTask`. */
+function isRecordable(budget: unknown): budget is RecordableBudget {
+	return typeof (budget as { recordTask?: unknown }).recordTask === "function";
+}
+
 /** Lifetime agent-count backstop per workflow (spec §5). */
 const AGENT_LIFETIME_CAP = 1_000;
 /** Default per-agent completion timeout: 30 minutes. */
@@ -216,6 +237,15 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			// 8. Wait for it to reach a terminal status.
 			const done = await runner.awaitCompletion(task.id, awaitTimeoutMs);
 			status = done.status;
+
+			// 8b. Budget accounting (§6, Task 4.3.1): once the child has settled on
+			// ANY terminal status, charge its token spend against the budget BEFORE
+			// resolving — so the next sequential call's pre-check sees it. Fenced
+			// inside recordTask itself (degrade, don't detonate). A failed agent
+			// still consumed tokens, so it is charged just like a completed one.
+			if (sessionId !== undefined && isRecordable(budget)) {
+				await budget.recordTask(sessionId);
+			}
 
 			// 10. Map terminal status to a result, then journal it if non-null.
 			let result: unknown;

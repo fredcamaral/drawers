@@ -674,7 +674,7 @@ interface SessionRunner {
 
 #### Task 4.3.1: Token budget provider
 
-- [ ] Done
+- [x] Done — strict TDD, 12 budget tests + integration. Sequential accuracy proven (call 2's pre-check sees call 1's spend); the §6 loop idiom halts via its own guard with the direct-call throw asserted separately (truer conformance than forcing mid-loop). recordTask on the live path only — cached replays charge nothing. One honest widening at the engine fetchMessages closure (GateMessage narrows tokens away).
 
 **Context:** Audit row m confirms `AssistantMessage.tokens = { input, output, reasoning, cache: { read, write } }` + `cost`, carried by `session.messages()` (the adapter does not strip them at runtime — engine.ts widening precedent from fork). The spike the epic asked for is therefore already answered: token metadata is typed and reachable; no char-based fallback needed. Per elaboration deviation (d): `spent()` counts workflow children only.
 

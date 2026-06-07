@@ -49,7 +49,8 @@ import {
 	createSchemaRegistry,
 	type SchemaRegistry,
 } from "../runtime/structured/registry";
-import type { JournalEntry, ProgressEvent } from "../runtime/types";
+import type { BudgetView, JournalEntry, ProgressEvent } from "../runtime/types";
+import { createTokenBudget, type TokenBudget } from "./budget";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
@@ -83,6 +84,10 @@ export interface RunRecord {
 	agentCount?: number;
 	/** The prior runId this run was resumed from (spec §7); absent on fresh runs. */
 	resumedFrom?: string;
+	/** The token budget ceiling, when one was set (Task 4.3.1); absent otherwise. */
+	budgetTotal?: number;
+	/** Output tokens spent at settle, when a budget was set (Task 4.3.1). */
+	budgetSpent?: number;
 }
 
 /** In-memory handle for a run: live run (absent for recovered records), record, progress. */
@@ -90,6 +95,13 @@ export interface RunHandle {
 	run?: WorkflowRun;
 	record: RunRecord;
 	progress: ProgressEvent[];
+	/**
+	 * The live token budget view (Task 4.3.1), present only when this run was
+	 * launched with `budgetTokens`. `workflow_status` reads it for LIVE spend
+	 * while the run is in flight; the record's `budgetSpent` is the settled
+	 * snapshot. Absent for recovered records (the accumulator died with the process).
+	 */
+	budget?: BudgetView;
 }
 
 /** Arguments to launch a run. */
@@ -112,6 +124,12 @@ export interface StartRunArgs {
 	 * and args default to the prior record's when absent.
 	 */
 	resumeFromRunId?: string;
+	/**
+	 * Token budget ceiling for the run (spec §6, Task 4.3.1). MUST already be a
+	 * positive finite number — the workflow tool coerces (Number.isFinite gate)
+	 * before passing it. Absent → no budget (the runtime's null-budget default).
+	 */
+	budgetTokens?: number;
 }
 
 /** What `startRun` returns synchronously (before the run settles). */
@@ -485,7 +503,32 @@ export function createWorkflowEngine(
 				? { resumedFrom: resolved.resumedFrom }
 				: {}),
 		};
-		const handle: RunHandle = { record, progress: [] };
+		// Token budget (Task 4.3.1): only when budgetTokens was given (already
+		// coerced to a positive finite number by the workflow tool). fetchMessages
+		// closes over the SDK client; its `data` is a GateMessage[] that narrows
+		// AWAY the assistant token metadata (audit row m), so widen through unknown
+		// ONCE here — the same honest widening as background-agents' fetchSession-
+		// Messages fork. The budget reads each message defensively.
+		const budget: TokenBudget | undefined =
+			args.budgetTokens !== undefined
+				? createTokenBudget({
+						total: args.budgetTokens,
+						fetchMessages: async (sid) => {
+							const res = await opts.client.session.messages({
+								path: { id: sid },
+							});
+							return (res.data ?? []) as unknown[];
+						},
+						logger: logger
+							? { warn: (msg, meta) => logger.warn(msg, meta) }
+							: undefined,
+					})
+				: undefined;
+		if (budget !== undefined) {
+			record.budgetTotal = budget.total ?? undefined;
+		}
+
+		const handle: RunHandle = { record, progress: [], budget };
 		runs.set(runId, handle);
 		persistRecord(record);
 
@@ -505,6 +548,7 @@ export function createWorkflowEngine(
 			runId,
 			args: resolved.runArgs,
 			registry,
+			...(budget !== undefined ? { budget } : {}),
 			onProgress: (e) => {
 				handle.progress.push(e);
 				logger?.debug("workflow progress", { runId, event: e });
@@ -532,6 +576,8 @@ export function createWorkflowEngine(
 					returnValue: result.returnValue,
 					error: result.error,
 					agentCount: result.agentCount,
+					// Snapshot the budget spend at settle for status display (Task 4.3.1).
+					...(budget !== undefined ? { budgetSpent: budget.spent() } : {}),
 				});
 			})
 			.catch((err: unknown) => {

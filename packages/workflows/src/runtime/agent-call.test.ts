@@ -748,3 +748,140 @@ describe("createAgentPrimitive — cached replay path", () => {
 		expect((runner as FakeRunner).launches.length).toBe(1);
 	});
 });
+
+// ---- Task 4.3.1: settle-path budget recordTask ---------------------------
+
+/**
+ * A BudgetView that ALSO exposes `recordTask` and a scripted per-session spend.
+ * `spend` maps a sessionID to the tokens that session "cost"; `recordTask` folds
+ * it into the accumulator, so a later call's pre-check sees the prior spend.
+ */
+function recordingBudget(
+	total: number,
+	spend: Record<string, number>,
+): BudgetView & {
+	recordTask(sessionID: string): Promise<void>;
+	recorded: string[];
+} {
+	let accumulated = 0;
+	const recorded: string[] = [];
+	return {
+		total,
+		spent: () => accumulated,
+		remaining: () => Math.max(0, total - accumulated),
+		recorded,
+		async recordTask(sessionID: string): Promise<void> {
+			recorded.push(sessionID);
+			accumulated += spend[sessionID] ?? 0;
+		},
+	};
+}
+
+describe("createAgentPrimitive — budget recordTask at settle", () => {
+	test("records the settled task's sessionID so the NEXT call's pre-check sees its spend", async () => {
+		// Two sequential calls, scripted per-session token costs. After call 1
+		// settles, recordTask folds its spend in; call 2's budget pre-check reads it.
+		let seq = 0;
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		// Override launch's sessionID per call deterministically.
+		const origLaunch = runner.launch.bind(runner);
+		runner.launch = async (req) => {
+			seq += 1;
+			(runner as unknown as { opts: FakeRunnerOpts }).opts.sessionID =
+				`ses_call_${seq}`;
+			return origLaunch(req);
+		};
+		const b = recordingBudget(100, { ses_call_1: 40, ses_call_2: 40 });
+		const { agent } = harness({ runner, budget: b });
+
+		expect(await agent("first")).toBe("OK");
+		// Call 1 settled → its session recorded → spend now 40.
+		expect(b.recorded).toEqual(["ses_call_1"]);
+		expect(b.spent()).toBe(40);
+
+		expect(await agent("second")).toBe("OK");
+		expect(b.recorded).toEqual(["ses_call_1", "ses_call_2"]);
+		expect(b.spent()).toBe(80);
+	});
+
+	test("exhaustion mid-loop: pre-check halts the loop with BudgetExhaustedError", async () => {
+		// Conformance-style ceiling loop: each call costs 40 against a 100 budget.
+		// After two calls (80 spent) a third would exceed, but the gate is
+		// `remaining() > 0`, so the THIRD call's pre-check (remaining 20 > 0) still
+		// runs; the FOURTH (remaining 0) throws. We script all sessions at 40.
+		let seq = 0;
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const origLaunch = runner.launch.bind(runner);
+		runner.launch = async (req) => {
+			seq += 1;
+			(runner as unknown as { opts: FakeRunnerOpts }).opts.sessionID =
+				`ses_${seq}`;
+			return origLaunch(req);
+		};
+		const b = recordingBudget(100, {
+			ses_1: 40,
+			ses_2: 40,
+			ses_3: 40,
+			ses_4: 40,
+		});
+		const { agent } = harness({ runner, budget: b });
+
+		// Drive the conformance loop: keep calling while remaining > 0.
+		const calls: number[] = [];
+		let threw = false;
+		try {
+			while (b.remaining() > 0) {
+				await agent(`call ${calls.length}`);
+				calls.push(b.spent());
+			}
+		} catch (err) {
+			threw = err instanceof BudgetExhaustedError;
+		}
+		// 40, 80, 120 spent across three live calls; the loop re-checks remaining()
+		// == 0 after the third and exits WITHOUT a throw (gate is remaining > 0).
+		expect(calls).toEqual([40, 80, 120]);
+		// No throw needed — the loop's own guard halted at the ceiling. But a direct
+		// extra call now MUST throw (remaining 0).
+		expect(threw).toBe(false);
+		await expect(agent("over")).rejects.toBeInstanceOf(BudgetExhaustedError);
+	});
+
+	test("records on a FAILED terminal status too (any terminal status)", async () => {
+		const runner = new FakeRunner({ status: "error", sessionID: "ses_failed" });
+		const b = recordingBudget(100, { ses_failed: 10 });
+		const { agent } = harness({ runner, budget: b });
+		expect(await agent("x")).toBeNull();
+		// Even though the result was null (failed), the session's tokens are recorded.
+		expect(b.recorded).toEqual(["ses_failed"]);
+		expect(b.spent()).toBe(10);
+	});
+
+	test("cached replay records NOTHING (no session to charge)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+		];
+		const b = recordingBudget(100, {});
+		const { agent } = harness({
+			runner,
+			budget: b,
+			replay: { entries, onRecord: () => {} },
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(b.recorded).toEqual([]);
+		expect(b.spent()).toBe(0);
+	});
+
+	test("a budget WITHOUT recordTask (plain BudgetView) is left untouched", async () => {
+		// The runtime keeps zero plugin knowledge: recordTask is a structural
+		// optional. A plain BudgetView must not crash the settle path.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const { agent } = harness({ runner, budget: budget(100, 100) });
+		expect(await agent("x")).toBe("OK");
+	});
+});

@@ -46,6 +46,22 @@ function trimmedOrAbsent(raw: unknown): string | undefined {
 	return t.length > 0 ? t : undefined;
 }
 
+/**
+ * Coerce `budget_tokens` to a positive finite number, or undefined (Phase 2 NaN
+ * lesson: opencode's raw execute path applies no Zod coercion, so the arg may
+ * arrive as a number, a numeric string, an empty string, NaN, or absent).
+ * `Number("")` is 0 and `Number("x")` is NaN — both fail the finite/>0 gate and
+ * become undefined (no budget), so a garbage value never silently disables caps
+ * NOR detonates the factory.
+ */
+function coerceBudgetTokens(raw: unknown): number | undefined {
+	if (raw === undefined || raw === null) {
+		return undefined;
+	}
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 /** Join two path segments with a single separator (no node:path dependency). */
 function joinPath(base: string, rel: string): string {
 	const b = base.endsWith("/") ? base.slice(0, -1) : base;
@@ -187,9 +203,19 @@ export function createWorkflowTool(
 						"prefix of agent() calls replays from cache, the rest runs live. " +
 						"Source/args default to the prior run's when omitted.",
 				),
+			budget_tokens: tool.schema
+				.number()
+				.optional()
+				.describe(
+					"Output-token ceiling for the whole workflow (sum of child agents' " +
+						"output+reasoning tokens). When the budget is exhausted, further " +
+						"agent() calls are refused. Omit for no ceiling.",
+				),
 		},
 		async execute(args, context: ToolContext) {
 			const resumeFrom = trimmedOrAbsent(args.resume_from_run_id);
+			// Coerce defensively (raw execute path skips Zod) → number | undefined.
+			const budgetTokens = coerceBudgetTokens(args.budget_tokens);
 
 			const script = trimmedOrAbsent(args.script);
 			const scriptPath = trimmedOrAbsent(args.script_path);
@@ -248,6 +274,7 @@ export function createWorkflowTool(
 					args: argsResult.value,
 					parentSessionID: context.sessionID,
 					...(resumeFrom !== undefined ? { resumeFromRunId: resumeFrom } : {}),
+					...(budgetTokens !== undefined ? { budgetTokens } : {}),
 				});
 			} catch (err) {
 				// Resume guards (unknown id / still-running) throw — surface them as
