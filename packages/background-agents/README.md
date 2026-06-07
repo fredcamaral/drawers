@@ -91,15 +91,17 @@ What survives a restart:
 
 Terminal tasks are swept on load once older than 24 hours (by completion time). Running and pending tasks are never swept regardless of age. Corrupt or unreadable task files are skipped individually and logged; the rest still load.
 
-The storage directory is resolved in this order:
+Tasks live under the `tasks/` leaf of one canonical base directory (shared with the workflows plugin). The base is resolved in this order:
 
-1. `$OPENCODE_DRAWERS_DATA_DIR`, if set and non-empty — used as the task directory **directly**; no `opencode-drawers/tasks` suffix is appended.
-2. `$XDG_DATA_HOME/opencode-drawers/tasks`, if `XDG_DATA_HOME` is set.
-3. `~/.local/share/opencode-drawers/tasks` otherwise.
+1. `$OPENCODE_DRAWERS_DATA_DIR`, if set and non-empty.
+2. `$XDG_DATA_HOME/opencode-drawers`, if `XDG_DATA_HOME` is set.
+3. `~/.local/share/opencode-drawers` otherwise.
+
+Task files are then written to `<base>/tasks/`.
 
 ## Environment variables
 
 | Variable | Effect |
 |----------|--------|
-| `OPENCODE_DRAWERS_DATA_DIR` | Storage directory for persisted task files. Takes precedence over the XDG default. Used verbatim as the task directory — unlike the XDG default, no namespaced subpath is appended. |
-| `XDG_DATA_HOME` | When `OPENCODE_DRAWERS_DATA_DIR` is unset, the store base is `$XDG_DATA_HOME/opencode-drawers/tasks`; otherwise `~/.local/share/opencode-drawers/tasks`. |
+| `OPENCODE_DRAWERS_DATA_DIR` | Base directory for persistence. Takes precedence over the XDG default. Task files live under its `tasks/` subdirectory (e.g. `$OPENCODE_DRAWERS_DATA_DIR/tasks`). |
+| `XDG_DATA_HOME` | When `OPENCODE_DRAWERS_DATA_DIR` is unset, the base is `$XDG_DATA_HOME/opencode-drawers`; otherwise `~/.local/share/opencode-drawers`. Tasks live under `<base>/tasks`. |

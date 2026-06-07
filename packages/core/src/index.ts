@@ -27,7 +27,7 @@ export type {
 	TaskStoreLogger,
 	TaskStoreOptions,
 } from "./persistence";
-export { createTaskStore } from "./persistence";
+export { createTaskStore, resolveDataBaseDir } from "./persistence";
 export type { SdkSessionClient } from "./sdk-adapter";
 export { adaptSdkClient } from "./sdk-adapter";
 export type {

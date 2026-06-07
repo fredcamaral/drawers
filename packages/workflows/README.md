@@ -492,9 +492,9 @@ return { marker: reply, x: args && args.x };
 
 | Variable | Effect |
 |---|---|
-| `OPENCODE_DRAWERS_DATA_DIR` | Base directory for the plugin's persistence (run records, child-task records, persisted scripts, journals). When unset, an XDG default is used. |
+| `OPENCODE_DRAWERS_DATA_DIR` | Base directory for the plugin's persistence (run records, child-task records, persisted scripts, journals). When unset, the XDG default base `$XDG_DATA_HOME/opencode-drawers` (or `~/.local/share/opencode-drawers`) is used — so persistence and restart-resume work out of the box on a default install. |
 
-Under the data dir the plugin maintains: `workflow-runs/` (run records), `workflow-tasks/` (child-task records, one per launched agent), `workflow-scripts/` (the persisted source per run id), and `workflow-journals/` (one `<runId>.jsonl` per run, powering resume).
+Under the base dir the plugin maintains its `workflow-*` subdirectories: `workflow-runs/` (run records), `workflow-tasks/` (child-task records, one per launched agent), `workflow-scripts/` (the persisted source per run id), and `workflow-journals/` (one `<runId>.jsonl` per run, powering resume).
 
 ---
 

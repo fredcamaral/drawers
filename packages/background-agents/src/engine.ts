@@ -2,8 +2,9 @@
  * Engine factory for the background-agents plugin.
  *
  * `createEngine` assembles the core collaborators into one wired unit:
- *   - {@link createTaskStore} (atomic per-task persistence) over a base dir
- *     resolved from `dataDir` → `$OPENCODE_DRAWERS_DATA_DIR` → the store default;
+ *   - {@link createTaskStore} (atomic per-task persistence) under the `tasks` leaf
+ *     of the canonical base dir ({@link resolveDataBaseDir}: `dataDir` →
+ *     `$OPENCODE_DRAWERS_DATA_DIR` → XDG), shared with the workflows plugin;
  *   - `store.load()` → recovered tasks, fed to the runner (re-validated) and to
  *     the notification queue's `seed` (un-notified terminals re-queued silently);
  *   - a {@link ConcurrencyManager} (defaults now; config-driven later);
@@ -18,6 +19,7 @@
  * trio the plugin entry wires: `{ runner, store, queue }`.
  */
 
+import { join } from "node:path";
 import {
 	type Clock,
 	ConcurrencyManager,
@@ -28,6 +30,7 @@ import {
 	type EngineClient,
 	type FsFacade,
 	type NotificationQueue,
+	resolveDataBaseDir,
 	type SessionRunner,
 	type TaskNotice,
 	type TaskStore,
@@ -46,8 +49,8 @@ export interface CreateEngineOptions {
 	/** The engine's structural SDK surface (wrap a real client with adaptSdkClient). */
 	client: EngineClient;
 	/**
-	 * Persistence base dir. Resolution order: explicit `dataDir` →
-	 * `$OPENCODE_DRAWERS_DATA_DIR` → the store's XDG-backed default.
+	 * Persistence BASE dir. Resolution order: explicit `dataDir` →
+	 * `$OPENCODE_DRAWERS_DATA_DIR` → XDG default. Tasks live under its `tasks` leaf.
 	 */
 	dataDir?: string;
 	/** Toast callback, left injectable for Epic 2.2 (TUI toasts). */
@@ -75,14 +78,6 @@ export interface Engine {
 
 const clock: Clock = { now: () => Date.now() };
 
-function resolveDataDir(explicit?: string): string | undefined {
-	if (explicit !== undefined) {
-		return explicit;
-	}
-	const env = process.env.OPENCODE_DRAWERS_DATA_DIR;
-	return env && env.length > 0 ? env : undefined;
-}
-
 export async function createEngine(opts: CreateEngineOptions): Promise<Engine> {
 	const { client, onNotify, logger } = opts;
 
@@ -95,9 +90,11 @@ export async function createEngine(opts: CreateEngineOptions): Promise<Engine> {
 			}
 		: undefined;
 
-	// `baseDir: undefined` lets the store fall back to its XDG default.
+	// Task files live under the `tasks` leaf of the ONE canonical base dir, so the
+	// env var (or explicit dataDir) is a BASE, shared with the workflows plugin —
+	// never the task dir verbatim.
 	const store = createTaskStore({
-		baseDir: resolveDataDir(opts.dataDir),
+		baseDir: join(resolveDataBaseDir(opts.dataDir), "tasks"),
 		fs: opts.fs,
 		clock,
 		logger: storeLogger,

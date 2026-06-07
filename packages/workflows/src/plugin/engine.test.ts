@@ -431,6 +431,114 @@ describe("createWorkflowEngine — default fs (no injected facade)", () => {
 	});
 });
 
+describe("createWorkflowEngine — default-install resolution (no dataDir, no env)", () => {
+	// Regression: with NO dataDir and NO OPENCODE_DRAWERS_DATA_DIR, the old engine
+	// resolved `base` to undefined, so scriptsDir/journalsDir were undefined and
+	// script persistence + journal writes silently no-op'd — breaking restart resume
+	// for DEFAULT installs. The canonical resolveDataBaseDir always returns a string
+	// (XDG-namespaced), so scripts and journals must persist under
+	// `$XDG/opencode-drawers/workflow-*`.
+	test("with no dataDir and no env var, scripts + journals persist under $XDG/opencode-drawers/workflow-*", async () => {
+		const xdg = await mkdtemp(join(tmpdir(), "wf-xdg-"));
+		const prevEnv = process.env.OPENCODE_DRAWERS_DATA_DIR;
+		const prevXdg = process.env.XDG_DATA_HOME;
+		delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+		process.env.XDG_DATA_HOME = xdg;
+		try {
+			const base = join(xdg, "opencode-drawers");
+			const { writeFile, mkdir } = await import("node:fs/promises");
+			const SCRIPT = `export const meta = { name: "j", description: "d" };\nconst r = await agent("do work", { label: "a" });\nreturn r;\n`;
+			const key = computeCallKey({ prompt: "do work", label: "a" });
+			const entry: JournalEntry = {
+				index: 0,
+				key,
+				status: "ok",
+				result: "CACHED_RESULT",
+			};
+
+			// Seed a terminal prior run (record + script + journal) directly under the
+			// XDG-resolved base so a resume replays the cached entry into a NEW journal.
+			await mkdir(join(base, "workflow-runs"), { recursive: true });
+			await mkdir(join(base, "workflow-scripts"), { recursive: true });
+			await mkdir(join(base, "workflow-journals"), { recursive: true });
+			await writeFile(
+				join(base, "workflow-scripts", "wf_prior0001.js"),
+				SCRIPT,
+				"utf-8",
+			);
+			await writeFile(
+				join(base, "workflow-journals", "wf_prior0001.jsonl"),
+				`${JSON.stringify(entry)}\n`,
+				"utf-8",
+			);
+			await writeFile(
+				join(base, "workflow-runs", "wf_prior0001.json"),
+				JSON.stringify({
+					id: "wf_prior0001",
+					parentSessionID: "ses_parent",
+					status: "completed",
+					description: "j",
+					createdAt: NOW - 1000,
+					completedAt: NOW - 500,
+					scriptPath: join(base, "workflow-scripts", "wf_prior0001.js"),
+				}),
+				"utf-8",
+			);
+
+			// NO dataDir, NO fs — the engine must resolve XDG and use a real node facade.
+			const engine = createWorkflowEngine({
+				client: makeClient(),
+				directory: "/proj",
+				clock,
+				logger: noopLogger,
+				ids: fixedIds("wf_resume0001"),
+			});
+			await engine.ready();
+
+			const h2 = await engine.startRun({
+				resumeFromRunId: "wf_prior0001",
+				parentSessionID: "ses_parent",
+			});
+			await engine.statusOf(h2.runId)?.settled;
+
+			// The new run's script was persisted (resume re-persists the prior script).
+			const persistedScript = await readFile(
+				join(base, "workflow-scripts", "wf_resume0001.js"),
+				"utf-8",
+			);
+			expect(persistedScript).toBe(SCRIPT);
+
+			// The new run's journal was written under the XDG-resolved journals dir —
+			// the path that silently no-op'd for default installs before the fix.
+			const newJournal = await readFile(
+				join(base, "workflow-journals", "wf_resume0001.jsonl"),
+				"utf-8",
+			);
+			const lines = newJournal
+				.split("\n")
+				.filter((l) => l.length > 0)
+				.map((l) => JSON.parse(l) as JournalEntry);
+			expect(lines).toHaveLength(1);
+			expect(lines[0]?.result).toBe("CACHED_RESULT");
+			expect(engine.statusOf(h2.runId)?.record.status).toBe("completed");
+
+			await engine.dispose();
+		} finally {
+			if (prevEnv === undefined) {
+				delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+			} else {
+				process.env.OPENCODE_DRAWERS_DATA_DIR = prevEnv;
+			}
+			if (prevXdg === undefined) {
+				delete process.env.XDG_DATA_HOME;
+			} else {
+				process.env.XDG_DATA_HOME = prevXdg;
+			}
+			await rm(xdg, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("createWorkflowEngine — journal is drained before settle (Task 4.3.2)", () => {
 	// Regression for the live-harness Scenario C SECOND bug: journal appends were
 	// fire-and-forget (`void journal?.record(e)`), so when a single-turn `opencode

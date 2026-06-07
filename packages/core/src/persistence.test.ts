@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTaskStore } from "./persistence";
+import { createTaskStore, resolveDataBaseDir } from "./persistence";
 import type { BgTask, Clock } from "./types";
 
 // ---- helpers --------------------------------------------------------------
@@ -219,6 +219,28 @@ describe("createTaskStore", () => {
 		await store.dispose();
 	});
 
+	test("default baseDir honors OPENCODE_DRAWERS_DATA_DIR (now folded into resolveDataBaseDir)", async () => {
+		const prevEnv = process.env.OPENCODE_DRAWERS_DATA_DIR;
+		const envDir = await mkdtemp(join(tmpdir(), "env-"));
+		process.env.OPENCODE_DRAWERS_DATA_DIR = envDir;
+		try {
+			const store = createTaskStore({ clock: fixedClock() });
+			await store.save(fullTask({ id: "bg_env000001" }));
+			await store.dispose();
+			// Env var is a BASE dir; the store default appends the `tasks` leaf.
+			const expectedDir = join(envDir, "tasks");
+			const files = await readdir(expectedDir);
+			expect(files).toContain("bg_env000001.json");
+			await rm(envDir, { recursive: true, force: true });
+		} finally {
+			if (prevEnv === undefined) {
+				delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+			} else {
+				process.env.OPENCODE_DRAWERS_DATA_DIR = prevEnv;
+			}
+		}
+	});
+
 	test("default baseDir honors XDG_DATA_HOME", async () => {
 		const prev = process.env.XDG_DATA_HOME;
 		const xdg = await mkdtemp(join(tmpdir(), "xdg-"));
@@ -238,5 +260,66 @@ describe("createTaskStore", () => {
 				process.env.XDG_DATA_HOME = prev;
 			}
 		}
+	});
+});
+
+describe("resolveDataBaseDir", () => {
+	let prevEnv: string | undefined;
+	let prevXdg: string | undefined;
+
+	beforeEach(() => {
+		prevEnv = process.env.OPENCODE_DRAWERS_DATA_DIR;
+		prevXdg = process.env.XDG_DATA_HOME;
+	});
+
+	afterEach(() => {
+		if (prevEnv === undefined) {
+			delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+		} else {
+			process.env.OPENCODE_DRAWERS_DATA_DIR = prevEnv;
+		}
+		if (prevXdg === undefined) {
+			delete process.env.XDG_DATA_HOME;
+		} else {
+			process.env.XDG_DATA_HOME = prevXdg;
+		}
+	});
+
+	test("explicit wins over env and XDG", () => {
+		process.env.OPENCODE_DRAWERS_DATA_DIR = "/env/base";
+		process.env.XDG_DATA_HOME = "/xdg";
+		expect(resolveDataBaseDir("/explicit/base")).toBe("/explicit/base");
+	});
+
+	test("env wins over XDG", () => {
+		process.env.OPENCODE_DRAWERS_DATA_DIR = "/env/base";
+		process.env.XDG_DATA_HOME = "/xdg";
+		expect(resolveDataBaseDir()).toBe("/env/base");
+	});
+
+	test("XDG fallback when env is unset, namespaced under opencode-drawers", () => {
+		delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+		process.env.XDG_DATA_HOME = "/xdg";
+		expect(resolveDataBaseDir()).toBe(join("/xdg", "opencode-drawers"));
+	});
+
+	test("home fallback when neither env nor XDG is set", () => {
+		delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+		delete process.env.XDG_DATA_HOME;
+		expect(resolveDataBaseDir()).toBe(
+			join(homedir(), ".local", "share", "opencode-drawers"),
+		);
+	});
+
+	test("empty-string env is ignored, falling through to XDG", () => {
+		process.env.OPENCODE_DRAWERS_DATA_DIR = "";
+		process.env.XDG_DATA_HOME = "/xdg";
+		expect(resolveDataBaseDir()).toBe(join("/xdg", "opencode-drawers"));
+	});
+
+	test("always returns a string (never undefined)", () => {
+		delete process.env.OPENCODE_DRAWERS_DATA_DIR;
+		delete process.env.XDG_DATA_HOME;
+		expect(typeof resolveDataBaseDir()).toBe("string");
 	});
 });

@@ -12,9 +12,12 @@ function basename(path: string): string {
 	return i === -1 ? path : path.slice(i + 1);
 }
 
-function makeFs(initial: Record<string, string> = {}): FsFacade {
+function makeFs(initial: Record<string, string> = {}): FsFacade & {
+	files: Map<string, string>;
+} {
 	const files = new Map<string, string>(Object.entries(initial));
 	return {
+		files,
 		mkdir: async () => undefined,
 		// The real node readdir returns BASENAMES; the store re-joins with baseDir.
 		readdir: async () => [...files.keys()].map(basename),
@@ -71,6 +74,9 @@ const noopLogger = {
 };
 
 const BASE = "/data";
+// The engine resolves the task store under `<base>/tasks` (the canonical
+// resolveDataBaseDir model), so seeded recovery files live there.
+const TASKS = `${BASE}/tasks`;
 
 // Recent timestamps so the store's 24h TTL sweep never expires the fixtures
 // (the engine uses a real Date-backed clock).
@@ -112,8 +118,8 @@ describe("createEngine", () => {
 	test("recovers persisted tasks: terminal + running both visible via runner.list", async () => {
 		const fs = makeFs(
 			Object.fromEntries([
-				[`${BASE}/bg_terminal.json`, JSON.stringify(terminalTask())],
-				[`${BASE}/bg_running.json`, JSON.stringify(runningTask())],
+				[`${TASKS}/bg_terminal.json`, JSON.stringify(terminalTask())],
+				[`${TASKS}/bg_running.json`, JSON.stringify(runningTask())],
 			]),
 		);
 		const engine = await createEngine({
@@ -134,8 +140,8 @@ describe("createEngine", () => {
 
 	test("seeds the notification queue with the recovered terminal (un-notified) task", async () => {
 		const fs = makeFs({
-			[`${BASE}/bg_terminal.json`]: JSON.stringify(terminalTask()),
-			[`${BASE}/bg_running.json`]: JSON.stringify(runningTask()),
+			[`${TASKS}/bg_terminal.json`]: JSON.stringify(terminalTask()),
+			[`${TASKS}/bg_running.json`]: JSON.stringify(runningTask()),
 		});
 
 		const engine = await createEngine({
@@ -155,7 +161,7 @@ describe("createEngine", () => {
 
 	test("already-notified terminal task is NOT re-seeded into the queue", async () => {
 		const fs = makeFs({
-			[`${BASE}/bg_terminal.json`]: JSON.stringify(
+			[`${TASKS}/bg_terminal.json`]: JSON.stringify(
 				terminalTask({ notified: true }),
 			),
 		});
@@ -173,7 +179,7 @@ describe("createEngine", () => {
 
 	test("flushing the queue persists notified=true via the store (markNotified wiring)", async () => {
 		const initial = {
-			[`${BASE}/bg_terminal.json`]: JSON.stringify(terminalTask()),
+			[`${TASKS}/bg_terminal.json`]: JSON.stringify(terminalTask()),
 		};
 		const fs = makeFs(initial);
 
@@ -193,6 +199,28 @@ describe("createEngine", () => {
 		const reloaded = await engine.store.load();
 		const persisted = reloaded.find((t) => t.id === "bg_terminal");
 		expect(persisted?.notified).toBe(true);
+
+		await engine.runner.dispose();
+	});
+
+	test("persisted task files land under <base>/tasks/, not <base>/ directly", async () => {
+		const fs = makeFs();
+		const engine = await createEngine({
+			client: makeClient(),
+			dataDir: BASE,
+			fs,
+			logger: noopLogger,
+		});
+
+		// Recover-then-save round-trip: seed an un-notified terminal so flushing
+		// triggers a markNotified store.save, exercising the write path.
+		await engine.store.save(terminalTask({ id: "bg_layout001" }));
+		await engine.store.dispose();
+
+		const written = [...fs.files.keys()];
+		// The file must be written under `<base>/tasks/`, never at `<base>/` directly.
+		expect(written).toContain(`${TASKS}/bg_layout001.json`);
+		expect(written).not.toContain(`${BASE}/bg_layout001.json`);
 
 		await engine.runner.dispose();
 	});

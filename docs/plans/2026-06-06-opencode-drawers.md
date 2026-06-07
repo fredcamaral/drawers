@@ -769,7 +769,7 @@ interface SessionRunner {
 
 #### Task 5.1.4: Documentation review pass
 
-- [x] Done — docs-reviewer found 2 HIGH factual errors (bg_output `timeout_ms` clamp range misstated; `OPENCODE_DRAWERS_DATA_DIR` appends no `tasks` suffix in the agents store — README implied symmetry with XDG tiers) + 1 gap (30-min per-agent timeout undocumented); all fixed and spot-checked against source. All other dimensions clean. ⚠️ Pre-publish flag for Epic 5.2: the same env var behaves differently across plugins (agents: verbatim task dir; workflows: base dir with `workflow-*` subdirs) — decide whether to align the agents store before first release.
+- [x] Done — docs-reviewer found 2 HIGH factual errors (bg_output `timeout_ms` clamp range misstated; `OPENCODE_DRAWERS_DATA_DIR` appends no `tasks` suffix in the agents store — README implied symmetry with XDG tiers) + 1 gap (30-min per-agent timeout undocumented); all fixed and spot-checked against source. All other dimensions clean. ~~⚠️ Pre-publish flag for Epic 5.2: the same env var behaves differently across plugins~~ — RESOLVED same day (user-ordered): one canonical `resolveDataBaseDir` in core (explicit → env → `$XDG/opencode-drawers`); agents tasks at `<base>/tasks`, workflows at `<base>/workflow-*`. The alignment also fixed a latent production gap: with the env var unset (default install), the workflows engine's `scriptsDir`/`journalsDir` were `undefined` → no script/journal persistence → no restart resume; regression test added (engine.test.ts default-install resume).
 
 **Context:** Tasks 5.1.1–5.1.3 are written in parallel by separate agents; cross-document consistency (terminology, install instructions, the passive-notification story told the same way twice) is nobody's job until this task.
 

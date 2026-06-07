@@ -85,11 +85,32 @@ const TMP_SUFFIX = ".json.tmp";
 
 const defaultClock: Clock = { now: () => Date.now() };
 
-/** Resolve the default storage dir, honoring `XDG_DATA_HOME`. */
-function defaultBaseDir(): string {
+/**
+ * Resolve the ONE canonical data BASE dir shared by every plugin (no leaf
+ * segment). Resolution: `explicit` → `$OPENCODE_DRAWERS_DATA_DIR` (non-empty) →
+ * `$XDG_DATA_HOME/opencode-drawers` → `~/.local/share/opencode-drawers`. Always
+ * returns a string. Each consumer appends its own leaf (`tasks`, `workflow-*`).
+ */
+export function resolveDataBaseDir(explicit?: string): string {
+	if (explicit !== undefined && explicit.length > 0) {
+		return explicit;
+	}
+	const env = process.env.OPENCODE_DRAWERS_DATA_DIR;
+	if (env && env.length > 0) {
+		return env;
+	}
 	const xdg = process.env.XDG_DATA_HOME;
 	const root = xdg && xdg.length > 0 ? xdg : join(homedir(), ".local", "share");
-	return join(root, "opencode-drawers", "tasks");
+	return join(root, "opencode-drawers");
+}
+
+/**
+ * The store's default storage dir: the canonical base + the `tasks` leaf. Folding
+ * it onto {@link resolveDataBaseDir} means one resolution algorithm everywhere —
+ * the store default now ALSO honors `$OPENCODE_DRAWERS_DATA_DIR`, not just XDG.
+ */
+function defaultBaseDir(): string {
+	return join(resolveDataBaseDir(), "tasks");
 }
 
 function errorText(err: unknown): string {

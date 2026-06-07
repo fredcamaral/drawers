@@ -39,6 +39,7 @@ import {
 	type FsFacade,
 	type IdGenerator,
 	type NotificationQueue,
+	resolveDataBaseDir,
 	type SessionRunner,
 	type TaskNotice,
 	type TaskStore,
@@ -154,8 +155,9 @@ export interface CreateWorkflowEngineOptions {
 	/** Project directory; saved-workflow lookup (`.opencode/workflows`) lands in 4.1.3. */
 	directory: string;
 	/**
-	 * Persistence base dir. Resolution: explicit `dataDir` →
-	 * `$OPENCODE_DRAWERS_DATA_DIR` → XDG default, namespaced for workflows.
+	 * Persistence BASE dir. Resolution ({@link resolveDataBaseDir}): explicit
+	 * `dataDir` → `$OPENCODE_DRAWERS_DATA_DIR` → XDG default. The plugin's
+	 * `workflow-*` subdirs hang off it; ALWAYS resolves to a real path.
 	 */
 	dataDir?: string;
 	/** Toast callback for terminal notices. */
@@ -254,15 +256,6 @@ function nodeFsFacade(): FsFacade {
 	return require("node:fs/promises") as FsFacade;
 }
 
-/** Resolve the base data dir: explicit → env → undefined (store's XDG default). */
-function resolveDataDir(explicit?: string): string | undefined {
-	if (explicit !== undefined) {
-		return explicit;
-	}
-	const env = process.env.OPENCODE_DRAWERS_DATA_DIR;
-	return env && env.length > 0 ? env : undefined;
-}
-
 /** Cheap meta-name extraction: parse JUST for the name, fall back to "workflow". */
 function extractName(source: string): string {
 	try {
@@ -319,10 +312,13 @@ export function createWorkflowEngine(
 	// before, breaking resume in production (live-harness Scenario C regression).
 	const fs = opts.fs ?? nodeFsFacade();
 	const logger = opts.logger;
-	const base = resolveDataDir(opts.dataDir);
+	// The ONE canonical base, shared with the background-agents plugin. ALWAYS a
+	// string (XDG default when no dataDir/env), so every subdir is a real path and
+	// scripts/journals/runs/tasks always persist — even on a default install.
+	const base = resolveDataBaseDir(opts.dataDir);
 	const ids = opts.ids ?? createIdGenerator({ prefix: RUN_PREFIX });
 
-	const subdir = (name: string) => (base ? join(base, name) : undefined);
+	const subdir = (name: string) => join(base, name);
 	const scriptsDir = subdir(SUBDIR_SCRIPTS);
 	const journalsDir = subdir(SUBDIR_JOURNALS);
 
@@ -336,10 +332,7 @@ export function createWorkflowEngine(
 	});
 
 	/** The journal file path for a runId (under the journals subdir). */
-	const journalPath = (id: string) =>
-		journalsDir
-			? join(journalsDir, `${id}.jsonl`)
-			: `${SUBDIR_JOURNALS}/${id}.jsonl`;
+	const journalPath = (id: string) => join(journalsDir, `${id}.jsonl`);
 
 	const journalFs = fs ? journalFsFromFacade(fs) : undefined;
 	const journalLogger = logger
@@ -516,9 +509,7 @@ export function createWorkflowEngine(
 		const resolved = await resolveResume(args);
 		const runId = ids.next(liveRunIds());
 		const name = extractName(resolved.source);
-		const scriptPath = scriptsDir
-			? join(scriptsDir, `${runId}.js`)
-			: `${SUBDIR_SCRIPTS}/${runId}.js`;
+		const scriptPath = join(scriptsDir, `${runId}.js`);
 
 		// Persist the script source BEFORE execution (the spec's "persisted script
 		// path"). On resume with no explicit source, this re-persists the prior
