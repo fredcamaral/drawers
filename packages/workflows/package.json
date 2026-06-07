@@ -4,7 +4,8 @@
 	"private": true,
 	"exports": {
 		".": "./src/plugin/index.ts",
-		"./lib": "./src/index.ts"
+		"./lib": "./src/index.ts",
+		"./tui": "./src/tui/index.ts"
 	},
 	"dependencies": {
 		"@drawers/core": "workspace:*",
@@ -12,7 +13,31 @@
 		"acorn": "8.16.0",
 		"ajv": "8.20.0"
 	},
+	"peerDependencies": {
+		"@opentui/core": "0.3.2",
+		"@opentui/keymap": "0.3.2",
+		"@opentui/solid": "0.3.2",
+		"solid-js": "1.9.12"
+	},
+	"peerDependenciesMeta": {
+		"@opentui/core": {
+			"optional": true
+		},
+		"@opentui/keymap": {
+			"optional": true
+		},
+		"@opentui/solid": {
+			"optional": true
+		},
+		"solid-js": {
+			"optional": true
+		}
+	},
 	"devDependencies": {
-		"bun-types": "1.3.14"
+		"@opentui/core": "0.3.2",
+		"@opentui/keymap": "0.3.2",
+		"@opentui/solid": "0.3.2",
+		"bun-types": "1.3.14",
+		"solid-js": "1.9.12"
 	}
 }
