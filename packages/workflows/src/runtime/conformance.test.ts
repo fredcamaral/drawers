@@ -121,6 +121,14 @@ function makeScriptedClient() {
 	let createSeq = 0;
 	let highWater = 0;
 	let createThrowsNext = false;
+	// Prompt-keyed scripting (order-independent): create() consumes the FIFO queue,
+	// but concurrent launches (pipeline/parallel) create sessions in a NON-deterministic
+	// order, so a FIFO transcript/poison can land on the wrong item. These map a
+	// transcript/poison to the agent's PROMPT instead — applied in promptAsync, after
+	// the session exists — so "item 2 fails" holds regardless of which session was
+	// created first.
+	const promptTranscripts: { match: string; messages: MessageEntry[] }[] = [];
+	const promptFailures: string[] = [];
 
 	const client: EngineClient = {
 		session: {
@@ -144,6 +152,23 @@ function makeScriptedClient() {
 				const parts = opts.body?.parts ?? [];
 				const text = parts.map((p: { text?: string }) => p.text ?? "").join("");
 				prompts.push({ sessionID: opts.path.id, text });
+				// Prompt-keyed overrides land here (the session now exists), so they are
+				// order-independent. A transcript match assigns the child's output; a
+				// failure match REJECTS the dispatch — the runner's promptAsync `.catch`
+				// finalizes the task error and `agent()` degrades to null INSTANTLY (no
+				// idle/timer needed, unlike a poisoned session).
+				for (const pt of promptTranscripts) {
+					if (text.includes(pt.match)) {
+						transcripts.set(opts.path.id, pt.messages);
+					}
+				}
+				for (const match of promptFailures) {
+					if (text.includes(match)) {
+						return Promise.reject(
+							new Error(`prompt dispatch failed: ${match}`),
+						);
+					}
+				}
 				return Promise.resolve(undefined);
 			},
 			abort(opts) {
@@ -173,8 +198,13 @@ function makeScriptedClient() {
 		prompts,
 		highWater: () => highWater,
 		liveCount: () => liveSessions.size,
-		/** Queue the script the NEXT create() consumes. */
+		/** Queue the script the NEXT create() consumes (FIFO, order-dependent). */
 		queueScript: (s: SessionScript) => scripts.push(s),
+		/** Assign a transcript to whichever session is prompted with `match` (order-free). */
+		scriptOnPrompt: (match: string, messages: MessageEntry[]) =>
+			promptTranscripts.push({ match, messages }),
+		/** Reject promptAsync for the session prompted with `match` (order-free, instant → null). */
+		failOnPrompt: (match: string) => promptFailures.push(match),
 		setCreateThrows: (v: boolean) => {
 			createThrowsNext = v;
 		},
@@ -233,23 +263,42 @@ function makeHarness(): Harness {
 	return { runner, client, clock, timers, concurrency };
 }
 
-/** Drive every currently-live session to completed via idle + grace. */
+/**
+ * Drive every live session to completed via idle + grace.
+ *
+ * LOOPS until no non-poisoned session is live, rather than sweeping once: a
+ * concurrent `pipeline`/`parallel` launches its children across an unknown number
+ * of microtask turns, and a single `await flush()` may not have registered them
+ * all (this flaked on CI — slower scheduling meant the first sweep missed a
+ * child, which then never got driven and the run hung). Each round flushes,
+ * drives whatever is live, and completing one child can free a gate slot that
+ * launches the next — so the loop converges. Bounded to avoid an infinite spin
+ * if a non-poisoned session never appears.
+ */
 async function completeAllLive(h: Harness): Promise<void> {
-	// Let launches register their sessions first.
-	await flush();
-	const live = h.client.liveSessionIds();
-	h.clock.set(1000 + MIN_IDLE + 1);
-	for (const id of live) {
-		if (h.client.isPoisoned(id)) {
-			continue; // poison: never produce a valid idle.
+	let clockAt = 1000;
+	for (let round = 0; round < 100; round++) {
+		await flush();
+		const live = h.client
+			.liveSessionIds()
+			.filter((id) => !h.client.isPoisoned(id));
+		if (live.length === 0) {
+			break;
 		}
-		await h.runner.handleEvent({
-			type: "session.idle",
-			properties: { sessionID: id },
-		} as never);
-		h.client.completeSession(id);
+		clockAt += MIN_IDLE + 1;
+		h.clock.set(clockAt);
+		for (const id of live) {
+			await h.runner.handleEvent({
+				type: "session.idle",
+				properties: { sessionID: id },
+			} as never);
+			h.client.completeSession(id);
+		}
+		await flush();
+		h.timers.fireAllTimers();
+		await flush();
 	}
-	await flush();
+	// Settle any intentionally-poisoned session left live via its stale/poll timer.
 	h.timers.fireAllTimers();
 	await flush();
 }
@@ -359,9 +408,14 @@ describe("conformance (c) — degrade to null filters out", () => {
 describe("conformance (d) — pipeline with one poisoned stage", () => {
 	test("pipeline over 3 items, middle fails → [x, null, y] shape", async () => {
 		const h = makeHarness();
-		h.client.queueScript({ messages: done("X") });
-		h.client.queueScript({ createThrows: true }); // middle item agent dies
-		h.client.queueScript({ messages: done("Y") });
+		// Prompt-keyed, NOT FIFO: a pipeline launches its items concurrently, so the
+		// session create() order is non-deterministic (a low/standard gate still lets
+		// all three launch). Mapping by prompt makes "item 2 is the one that dies"
+		// hold regardless of which session was created first — the FIFO form flaked on
+		// CI when item 3 created before item 2.
+		h.client.scriptOnPrompt("item 1", done("X"));
+		h.client.failOnPrompt("item 2"); // middle item's dispatch fails → agent null
+		h.client.scriptOnPrompt("item 3", done("Y"));
 		const run = createWorkflowRun({
 			runner: h.runner,
 			parentSessionID: "ses_root",
