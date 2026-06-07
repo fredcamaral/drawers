@@ -24,11 +24,12 @@
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
 | 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Complete / 5.2 Epic-level |
 | 6 | CC parity: structured results survive slow real-world turns (completion-gate watermark), absolute `script_path` works, live in-session workflow observability, active parent wake | 6.1, 6.2, 6.3 | Complete |
+| 7 | Mid-turn completion eliminated (turn-liveness gate: session status + message `time.completed`); structured/empty failures carry diagnostics and full results are retrievable; resume replays journaled items per-item (key+occurrence) instead of prefix | 7.1, 7.2, 7.3 | 7.1 Detailed |
 
 ## Design decisions (binding across phases)
 
 1. ~~**No active parent-wake.**~~ **REVERSED 2026-06-07 (Phase 6, user decision: CC parity).** Active wake is now the goal — Epic 6.3. The original rationale stands as a CONSTRAINT, not a veto: OpenCode does not serialize concurrent session prompts (oh-my-opencode's wake costs ~24 files of crash-mitigation at `.references/oh-my-opencode/src/features/background-agent/parent-wake-*.ts`), so the wake fires ONLY on an idle parent; a busy parent falls back to the existing passive flush. Passive delivery (chat.message flush + toast) remains as the fallback layer.
-2. **Event-primary completion, poll as safety net.** `session.idle` gated by min-idle grace + output validation; sparse (≥5s) re-entrancy-guarded poll only as fallback; `client.session.status()` treated as best-effort.
+2. **Event-primary completion, poll as safety net.** `session.idle` gated by min-idle grace + output validation; sparse (≥5s) re-entrancy-guarded poll only as fallback; `client.session.status()` treated as best-effort. **AMENDED 2026-06-07 (Phase 7):** quiet-time is NOT sufficient evidence of turn end — silent windows >5s are normal mid-turn (first-token latency on large prompts, API retry backoff). Completion additionally requires turn liveness to be negative: `session.status()` not `busy`/`retry` (veto, never trigger — best-effort stance preserved: a status read failure blocks completion conservatively) AND the newest post-watermark assistant message has `time.completed` stamped.
 3. **Typed SDK surface only.** No `as any` calls (better-async relies on untyped `tui.showToast` / `session.fork` — brittle). Anything untyped is treated as unavailable.
 4. **The child session IS the durable task.** Persist metadata only — but ALL fields needed for notify/resume after restart (better-async drops parent context and breaks resume: `.references/better-opencode-async-agents/src/manager/index.ts:325-339`).
 5. **Narrow version pin.** Support the `@opencode-ai/plugin` version captured at scaffold time; refuse cross-version event-normalization complexity.
@@ -982,6 +983,67 @@ interface SessionRunner {
 **Verification:** reread sections against the shipped behavior; no stale "no active wake" claims remain (`grep -ri "active wake" packages/*/README.md`).
 
 **Done when:** READMEs match the implementation.
+
+---
+
+## Phase 7 — Completion correctness: turn liveness, output diagnostics, per-item replay
+
+**Origin (2026-06-07, post-Phase-6 field failure).** A real 5-reviewer helm review (runs `wf_0ybs7l96` → `wf_566l0gvc` → `wf_jpxdrxl8`, after-action report at `~/repos/lerianstudio/helm/docs/workflow-reliability-report.md`) failed three times WITH the Phase 6 watermark fix live (plugin loaded 08:37 -03, merge `96fc916` at 08:25). Forensics (SQLite message timelines vs `workflow-tasks/*.json` `completedAt`): the gate completed tasks MID-TURN. Proof: `bg_ta1rn5kd` was nudged 31s into a turn whose in-flight assistant message ran 08:40:32→08:45:02 (no `time.completed` yet — ECONNRESET retry backoff, error in opencode log `2026-06-07T113740.log`); `bg_7uz0uzne` completed 08:44:52 while its session produced output until 08:45:13. Root cause: the poll's quiet heuristic (5s without SDK events) is satisfied by normal mid-turn silent windows — first-token latency on 384KB-diff prompts, retry backoff — and `hasValidOutput` accepts ANY post-watermark tool part, so the gate completes as soon as both coincide. The watermark (Epic 6.1) only killed the *previous-turn* variant. Downstream symptoms, all one mechanism: schema `null`s (completed before `structured_output` was called → nudge → nudge turn also tripwired), consistently empty `""` outputs on the two heaviest reviewers (longest prompt → first silent window precedes first text), and mid-thought truncated captures (`lastAssistantText` snapshots whatever exists at the false completion moment). Report findings R1/R2/R3 share this root cause; R4/R5 (resume economics) are independent and addressed in Epic 7.3.
+
+### Epic 7.1: Turn-liveness completion gate
+
+**Goal:** the gate can no longer complete a task whose turn is still running: completion requires quiet + grace (existing) AND `session.status()` not `busy`/`retry` AND the newest post-watermark assistant message has `time.completed`.
+**Scope:** `packages/core/src/completion.ts`, `packages/core/src/sdk-adapter.ts`, engine wiring in both plugins' composition roots.
+**Dependencies:** none (root cause; lands first).
+**Done when:** unit suite pins all liveness-veto branches; the 4-parallel heavy-turn repro (silent gap > poll window mid-turn) no longer completes early; existing 498 tests still pass.
+
+#### Task 7.1.1: Add turn-liveness veto to the completion gate
+
+- [ ] Done
+
+**Context:** `packages/core/src/completion.ts` — `maybeCompleteOnOutput` (completion.ts:466) and the poll's quiet branch (completion.ts:573) decide completion on `graceElapsed` + `outputIsValid` alone. `hasValidOutput` (completion.ts:193) returns true for any post-watermark tool part. The SDK already exposes the two liveness signals: the global status map (adapted at `packages/core/src/sdk-adapter.ts:111-120` for the wake notifier, audit row f) and `AssistantMessage.time.completed` (typed in `types.gen.d.ts`; `GateMessage.info.time` currently narrows only `created`, completion.ts:65-68).
+
+**Implementation vision:** Add an injected `fetchStatus(sessionID): Promise<"busy" | "retry" | "idle" | undefined>` dep to `CompletionGateDeps` (undefined = absent from map = idle-equivalent, same semantics the wake notifier uses). Widen `GateMessage.info.time` to `{ created: number; completed?: number }`. Create one choke point — a `turnIsLive(task, sessionID, messages)` check used by BOTH completion paths (deferred-idle fire and poll quiet branch), evaluated AFTER grace but BEFORE `tryComplete`: (a) `fetchStatus` returns `busy`/`retry` → live, do not complete; a status read THROW also blocks (conservative: better to wait for the next poll tick than complete mid-turn); (b) the newest post-watermark assistant message lacks `time.completed` → live. Reuse the messages already fetched by `outputIsValid` rather than fetching twice — restructure `outputIsValid` to return the fetched messages (or fold validity + liveness into one `assessTurn` that fetches once). The `validatedSessions` positive-cache must NOT bypass the liveness check: cache only the validity half (messages exist), never the liveness half (liveness is a point-in-time property). `session.error` path unchanged. Stale-timeout force-cancel unchanged (it must still kill a hung turn). Wire `fetchStatus` through `sdk-adapter.ts` reusing the existing status-map narrowing, and through both plugins' composition roots.
+
+**Files:**
+- Modify: `packages/core/src/completion.ts`
+- Modify: `packages/core/src/sdk-adapter.ts`
+- Modify: `packages/core/src/session-runner.ts` (deps plumbing)
+- Modify: `packages/background-agents/src/index.ts`, `packages/workflows/src/plugin/index.ts` (composition)
+- Test: `packages/core/src/completion.test.ts`
+
+**Verification:** new tests RED first: (1) quiet + valid output + status `busy` → no completion, then status flips idle → next poll completes; (2) status `retry` → no completion; (3) status read throws → no completion (and a later successful read completes); (4) newest post-watermark assistant message without `time.completed` → no completion, stamped → completes; (5) absent status (undefined) + completed message → completes (no regression for fast turns); (6) stale timeout still force-cancels a permanently-busy session. Then `bun test` full suite.
+
+**Done when:** all six branches pinned green; full suite passes; no `as any` (decision 3).
+
+#### Task 7.1.2: Live repro proves the fix end-to-end
+
+- [ ] Done
+
+**Context:** the Phase 6 smoke (`packages/workflows/test-harness/run-smoke.ts`) asserts persisted state, but its scenarios use fast haiku turns that rarely open a >5s silent mid-turn window — they cannot catch this class. The field failure needed opus + a 384KB-diff prompt to reproduce. A deterministic repro needs an artificially slow turn, not a heavy model.
+
+**Implementation vision:** Add smoke Scenario E: one `agent()` whose prompt instructs the child to run a single bash sleep ~15s (tool execution = a silent window longer than `DEFAULT_POLL_MS`+grace while status stays `busy`) and THEN emit a distinctive final marker text. Assert the persisted run record's `returnValue` contains the final marker — pre-fix, the gate completes during the sleep and captures `""`/pre-sleep text; post-fix, the full turn survives. Keep the model-rendered-stdout rule: assert ONLY persisted state (Phase 6 lesson). If the harness agent cannot reliably sleep via bash, fall back to a prompt that forces a long tool chain; the assertion (final marker present in persisted returnValue) stays the same.
+
+**Files:**
+- Modify: `packages/workflows/test-harness/run-smoke.ts`
+
+**Verification:** `bun run-smoke.ts` scenario E passes post-fix; capture a RED run by stashing the 7.1.1 fix once (or running against the pre-fix commit) to prove the scenario actually detects the bug.
+
+**Done when:** scenario E green on main with RED evidence captured in the commit message.
+
+### Epic 7.2: Output reliability and diagnostics
+
+**Goal:** no silent total losses: structured-output failures persist a typed reason + the raw final text on the child task record and surface in `workflow_status`; empty (`""`) agent results render a warning; full untruncated results retrievable through the tool (no shell access to the drawers dir required).
+**Scope:** `packages/workflows/src/runtime/structured/`, `packages/workflows/src/plugin/tools/workflow-status.ts`, `packages/workflows/src/plugin/engine.ts`, core task-record fields.
+**Dependencies:** Epic 7.1 (most nulls/empties die with the root cause; this epic handles the residue honestly).
+**Done when:** a forced schema-mismatch run shows `null (schema: <reason>; raw N chars preserved)` in status and the raw text is retrievable; `workflow_status full:true` returns the complete `returnValue` untruncated. Report findings R1, R2; usability #1, #2, #3.
+
+### Epic 7.3: Per-item journal replay (key + occurrence)
+
+**Goal:** resume replays every journaled item whose call key matches, independent of position — editing item 0's prompt no longer re-runs an unchanged expensive item 1 (report finding R4: identical key `1d2e8321…` re-executed for 4m17s and produced a different answer).
+**Scope:** `packages/workflows/src/plugin/engine.ts` (replay matching), `packages/workflows/src/runtime/keys.ts` (occurrence counting), journal docs.
+**Dependencies:** none (independent of 7.1/7.2).
+**Done when:** resume with an edited early `parallel()` item replays unchanged siblings from journal (zero re-execution) while re-running edited items and previously-null items (nulls stay unjournaled — that is the failure-targeted retry path); duplicate identical calls keep correct semantics via nth-occurrence matching (the CC adversarial-verify pattern spawns N byte-identical refuters — key alone would wrongly dedupe them); agent non-determinism on cache MISS documented in the tool description (finding R5). **Declared deviation from CC:** CC documents longest-unchanged-prefix replay; key+occurrence matching strictly dominates for `parallel()` sets and is what the field report requests — flagged, not silent.
 
 ---
 
