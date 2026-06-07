@@ -610,7 +610,7 @@ interface SessionRunner {
 
 #### Task 4.1.3: `workflow` / `workflow_status` / `workflow_stop` tools + saved workflows
 
-- [ ] Done
+- [x] Done — strict TDD, 27 tool tests. Status renders flat chronological list with phase headers (faithful to event order, no re-sorted tree). Note: saved dir is `.opencode/workflows/` (the spec's `.claude/` describes CC; the port follows the host's convention — already fixed in the epic goal). **Epic 4.1 exit.**
 
 **Context:** Tool patterns: `packages/background-agents/src/tools/*.ts` (defensive arg coercion per the Phase 2 NaN lesson — opencode does NOT apply Zod defaults). `PluginInput.directory` is the project root — saved workflows live at `<directory>/.opencode/workflows/<name>.js`. Spec §2.2/§2.3.
 

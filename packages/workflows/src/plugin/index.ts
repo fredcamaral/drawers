@@ -16,9 +16,10 @@
  *   - `chat.message` → drains the per-parent notice queue into the parent's next
  *     message (core's `createChatMessageHook`); fully fenced so a queue/render
  *     failure never kills the prompt;
- *   - `tool` — the single global `structured_output` tool over the engine's shared
- *     registry, so any workflow child can return a schema-conforming result. The
- *     `workflow` / `workflow_status` / `workflow_stop` tools arrive in Task 4.1.3.
+ *   - `tool` — the global `structured_output` tool over the engine's shared
+ *     registry (so any workflow child can return a schema-conforming result),
+ *     plus `workflow` / `workflow_status` / `workflow_stop`: launch a run, inspect
+ *     its progress/result, and stop a live run.
  *
  * Completion toasts ride the engine's `onNotify` seam: a `client.tui.showToast`-
  * backed notifier fires per terminal transition. All logging goes through
@@ -33,6 +34,9 @@ import {
 import type { Plugin } from "@opencode-ai/plugin";
 import { createStructuredOutputTool } from "../runtime/structured/tool";
 import { createWorkflowEngine, type EngineLogger } from "./engine";
+import { createWorkflowTool } from "./tools/workflow";
+import { createWorkflowStatusTool } from "./tools/workflow-status";
+import { createWorkflowStopTool } from "./tools/workflow-stop";
 
 const SERVICE = "opencode-drawer-workflows";
 
@@ -83,6 +87,9 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory }) => {
 		"chat.message": createChatMessageHook(engine.queue, logger),
 		tool: {
 			structured_output: createStructuredOutputTool(engine.registry),
+			workflow: createWorkflowTool(engine, { directory }),
+			workflow_status: createWorkflowStatusTool(engine),
+			workflow_stop: createWorkflowStopTool(engine),
 		},
 	};
 };
