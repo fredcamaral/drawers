@@ -6,7 +6,7 @@
  * (packages/workflows/src/plugin/index.ts, registered by absolute file:// path in
  * test-harness/opencode.json) and proves the workflow tool family end-to-end.
  *
- * Three scenarios:
+ * Scenarios:
  *
  *   A. canonical review workflow — the model calls `workflow` with an inline script
  *      that exercises phase()/pipeline()/parallel() AND a saved sub-workflow
@@ -32,6 +32,19 @@
  *      plugin's own child-task store gained NO new task files for the resumed run —
  *      the authoritative cross-process "nothing relaunched" signal (see the note in
  *      the README on why this, not opencode's global session DB, is the honest probe).
+ *
+ *   E. liveness-veto over-block guard — one agent whose child runs a single bash
+ *      command that sleeps 15s (past the completion gate's ~10s poll+grace) BEFORE
+ *      echoing a distinctive final marker. The harness asserts the persisted
+ *      returnValue (the child's final text) is a non-empty string carrying that
+ *      marker — proving Task 7.1.1's turn-liveness veto does NOT hang a legitimate
+ *      long-running turn: it releases once the turn truly finishes. This scenario
+ *      deliberately does NOT detect the mid-turn early-completion bug 7.1.1 fixes
+ *      (a blocking in-session tool starves both turn events and the gate's own SDK
+ *      reads, so the gate is incidentally protected even without the veto; the
+ *      production window is server-responsive-but-eventless — first-token latency /
+ *      API retry backoff — which a tool cannot emulate). That bug class is owned by
+ *      the six deterministic unit tests in packages/core/src/completion.test.ts.
  *
  * Cross-process observation: the harness reads the persisted run-record + task JSON
  * files under $OPENCODE_DRAWERS_DATA_DIR directly (the authoritative signal), in
@@ -387,11 +400,11 @@ async function scenarioD(dataDir: string, beforeCount: number): Promise<void> {
 	log("=== Scenario D: structured output (agent({ schema })) e2e ===");
 	// The ONLY scenario that exercises `agent({ schema })` — the registry/gate path
 	// whose regression (returnValue null) shipped to production (plan §6.1, the
-	// 2026-06-07 repro). The slow-gap/nudge false-completion case is NOT
-	// deterministically live-testable (it depends on model first-token latency
-	// crossing the idle-poll window); that case is covered by unit tests in
-	// packages/core/src/completion.test.ts (turn watermark). This scenario locks the
-	// happy path: a schema-conformant verdict must resolve as the validated OBJECT.
+	// 2026-06-07 repro). This scenario locks the happy path: a schema-conformant
+	// verdict must resolve as the validated OBJECT. The mid-turn early-completion
+	// class (a silent window crossing the idle-poll grace) is NOT deterministically
+	// live-testable — see Scenario E's comment for why a blocking tool can't emulate
+	// it — and is covered by the unit tests in packages/core/src/completion.test.ts.
 	const schemaScript = [
 		"export const meta = { name: 'verdict', description: 'one structured-output agent' };",
 		"const r = await agent('State your verdict on the number 42 being even.', {",
@@ -460,6 +473,107 @@ async function scenarioD(dataDir: string, beforeCount: number): Promise<void> {
 	);
 }
 
+/**
+ * The literal marker the child must echo as its FINAL assistant text, AFTER a
+ * long-blocking in-session tool returns. The script returns that text directly,
+ * so the persisted returnValue IS the child's final reply — the assertion target.
+ */
+const LIVENESS_MARKER = "LIVENESS_FINAL_E2E_77";
+
+async function scenarioE(dataDir: string, beforeCount: number): Promise<void> {
+	log("");
+	log(
+		"=== Scenario E: liveness veto over-block guard (long tool turn completes whole) ===",
+	);
+	// WHAT THIS GUARDS — the OVER-BLOCK risk of Task 7.1.1, not the bug it fixed.
+	// The turn-liveness veto must never HANG legitimate long-running work: a real
+	// turn that goes quiet for a while (a slow in-session tool) must still complete,
+	// with its FULL final text captured. One agent, no schema, runs a single bash
+	// command `sleep 15 && echo <marker>` (~15s, past the gate's ~10s poll+grace
+	// window), then echoes the marker as its final text. PASS iff the persisted
+	// returnValue is that complete final reply — proving the veto released once the
+	// turn truly finished rather than deadlocking it.
+	//
+	// WHAT THIS DOES NOT DO — and why. This scenario does NOT detect the mid-turn
+	// early-completion class (the bug 7.1.1 fixes). A blocking IN-SESSION tool
+	// starves BOTH the turn's SDK events AND the gate's own SDK reads
+	// (session.status / session.messages / session.get) — they are the same
+	// event-loop phenomenon — so the gate is INCIDENTALLY protected from completing
+	// mid-tool even with the veto removed (verified empirically: with the veto
+	// reverted, the safety poll ticks during the sleep but its reads serialize
+	// behind the busy session and never complete the task). The production window
+	// 7.1.1 targets is different: the opencode server is RESPONSIVE to status/message
+	// reads but no new turn events flow — first-token latency on large prompts, or
+	// API ECONNRESET retry backoff between turns — which a sleeping tool cannot
+	// emulate. That bug class is owned by the six deterministic unit tests in
+	// packages/core/src/completion.test.ts ("turn liveness — …", Task 7.1.1), which
+	// pin every veto branch (busy / retry / status-throw / missing time.completed /
+	// absent-status+completed / stale-force-cancel) with manual clocks and fakes.
+	const livenessScript = [
+		"export const meta = { name: 'liveness', description: 'one agent with a long-blocking tool' };",
+		"const r = await agent(",
+		"  'Run exactly one bash command: sleep 15 && echo " +
+			LIVENESS_MARKER +
+			". " +
+			"After the command returns, reply with exactly this text and nothing else: " +
+			LIVENESS_MARKER +
+			"', { label: 'liveness' });",
+		"return r;",
+	]
+		.join("\n")
+		.replace(/'/g, "\\'");
+	const prompt =
+		"You have tools named workflow and workflow_status. They ARE available. " +
+		"This is an explicit multi-agent orchestration request (opt-in satisfied). " +
+		"In this single turn, do EXACTLY this and nothing else: " +
+		`(1) call workflow with { "script": "${livenessScript}" }. ` +
+		"(2) Take the run_id it returns and immediately call workflow_status with " +
+		'that run_id and { "wait_ms": 90000 } so you BLOCK until the workflow settles. ' +
+		"(3) Then reply with only the result text workflow_status returned. " +
+		"Do not refuse, do not poll in a loop — workflow_status(wait_ms) already waits.";
+	// Snapshot the ids already on disk so we match only E's new run.
+	const priorIds = new Set((await readRuns(dataDir)).map((r) => r.id));
+	await runUntilRunAppears(prompt, dataDir, beforeCount);
+	const record = await waitForTerminal(
+		dataDir,
+		(r) => r.status === "completed" && !priorIds.has(r.id),
+		SETTLE_TIMEOUT_MS,
+	);
+	log(`  run ${record.id} completed`);
+
+	// The heart of the scenario: the persisted returnValue is the child's FINAL
+	// text. It must be a non-empty string carrying the marker. Distinguish the three
+	// failure shapes so an over-block regression points straight at its cause.
+	const ret = record.returnValue;
+	const shape = JSON.stringify(ret ?? null);
+	if (typeof ret !== "string") {
+		throw new Error(
+			`Scenario E: expected a string returnValue (the child's final text), got ` +
+				`${shape}. A null/object here means the long-tool turn degraded instead of ` +
+				`completing normally.`,
+		);
+	}
+	if (ret.trim() === "") {
+		throw new Error(
+			`Scenario E: returnValue is an EMPTY string — the long-tool turn settled with ` +
+				`no captured text. Either the veto released too early (before the final reply) ` +
+				`or the turn degraded; the legitimate long turn did not complete whole.`,
+		);
+	}
+	if (!ret.includes(LIVENESS_MARKER)) {
+		throw new Error(
+			`Scenario E: returnValue is non-empty but MISSING the marker '${LIVENESS_MARKER}' ` +
+				`— the long-tool turn's FINAL text was not captured in full (a partial/pre-tool ` +
+				`snapshot). returnValue=${shape}`,
+		);
+	}
+	log(
+		`Scenario E PASS: a legitimate long in-session tool turn (~15s quiet) completed ` +
+			`whole — the liveness veto did not hang it; persisted returnValue carries ` +
+			`'${LIVENESS_MARKER}'`,
+	);
+}
+
 async function main(): Promise<void> {
 	log(`opencode binary: ${OPENCODE_BIN}`);
 	log(`model (forced via --model): ${OPENCODE_MODEL}`);
@@ -474,6 +588,8 @@ async function main(): Promise<void> {
 		await scenarioC(dataDir, a);
 		const afterC = (await readRuns(dataDir)).length;
 		await scenarioD(dataDir, afterC);
+		const afterD = (await readRuns(dataDir)).length;
+		await scenarioE(dataDir, afterD);
 
 		log("");
 		log("================ PASS ================");
@@ -481,6 +597,7 @@ async function main(): Promise<void> {
 		log("B: workflow_stop → cancelled                              ✓");
 		log("C: resume all-cached, no child relaunch (new process)     ✓");
 		log("D: structured output → validated object returnValue       ✓");
+		log("E: liveness veto over-block guard (long tool turn whole)  ✓");
 		log("======================================");
 	} catch (err) {
 		exitCode = 1;
