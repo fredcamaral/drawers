@@ -1216,7 +1216,7 @@ interface SessionRunner {
 
 #### Task 8.2.1: `run:cancel-requested` feed line + `workflow-control` subdir constant
 
-- [ ] Done
+- [x] Done
 
 **Context:** the `FeedEvent` union (`packages/workflows/src/plugin/feed.ts:106-110`) has `EnrichedProgressEvent | RunStartLine | RunEndLine | AgentStatsLine`; each lifecycle line is a small interface with a `type` discriminant and an `at: number` engine wall-clock stamp (`feed.ts:56-98`). The engine declares its data subdirs as module constants (`engine.ts:315-319`: `SUBDIR_TASKS`/`SUBDIR_RUNS`/`SUBDIR_SCRIPTS`/`SUBDIR_JOURNALS`/`SUBDIR_FEED`) and resolves each to a path via `subdir(name)` (`engine.ts:467-470`). The control channel needs (a) a feed line a TUI viewer tails to learn a cancel was requested (between the request and the terminal `run:end`), and (b) a subdir constant for the sentinel directory, declared beside the others so the layout stays in one place.
 

@@ -62,6 +62,18 @@ export interface RunStartLine {
 	at: number;
 }
 
+/**
+ * Emitted once when an external sentinel requests cancel (Task 8.2.1), BEFORE the
+ * terminal `run:end`; a viewer tailing the feed renders a "cancelling…" state on
+ * sight. Feed-only/engine-only, like {@link RunStartLine} — the runtime
+ * `ProgressEvent` union is NOT widened.
+ */
+export interface RunCancelRequestedLine {
+	type: "run:cancel-requested";
+	runId: string;
+	at: number;
+}
+
 /** A run-lifecycle line bracketing the feed — written once at settle. */
 export interface RunEndLine {
 	type: "run:end";
@@ -106,6 +118,7 @@ export interface AgentStatsLine {
 export type FeedEvent =
 	| EnrichedProgressEvent
 	| RunStartLine
+	| RunCancelRequestedLine
 	| RunEndLine
 	| AgentStatsLine;
 

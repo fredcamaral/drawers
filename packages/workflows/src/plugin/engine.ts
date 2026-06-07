@@ -317,6 +317,11 @@ const SUBDIR_RUNS = "workflow-runs";
 const SUBDIR_SCRIPTS = "workflow-scripts";
 const SUBDIR_JOURNALS = "workflow-journals";
 const SUBDIR_FEED = "workflow-feed";
+// External control-channel sentinel dir (Task 8.2.1). Declared beside its sibling
+// subdirs so the on-disk layout stays in one place; the control watcher (Task
+// 8.2.2) resolves it via `subdir()` and polls it for `<runId>.cancel` sentinels.
+// biome-ignore lint/correctness/noUnusedVariables: consumed by the 8.2.2 watcher; this is the layout-vocabulary layer.
+const SUBDIR_CONTROL = "workflow-control";
 
 /**
  * Minimum gap between throttled `agent:stats` feed lines for one session (Task

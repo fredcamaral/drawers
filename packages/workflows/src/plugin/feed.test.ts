@@ -86,6 +86,34 @@ describe("createFeedWriter", () => {
 		}
 	});
 
+	test("round-trips a run:cancel-requested line, ordered in the chain like any other", async () => {
+		const dir = await tmpDir();
+		try {
+			const w = createFeedWriter({ dir, runId: "wf_cancel" });
+			w.append({
+				type: "run:start",
+				runId: "wf_cancel",
+				parentSessionID: "ses_p",
+				at: 10,
+			});
+			const cancel: FeedEvent = {
+				type: "run:cancel-requested",
+				runId: "wf_cancel",
+				at: 20,
+			};
+			w.append(cancel);
+			w.append({ type: "run:end", status: "cancelled", at: 30 });
+			await w.settled();
+
+			const lines = await readLines(join(dir, "wf_cancel.jsonl"));
+			expect(lines).toHaveLength(3);
+			expect(lines[1]).toEqual(cancel);
+			expect(lines[1]?.type).toBe("run:cancel-requested");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("creates the feed dir (mkdir -p) on first append", async () => {
 		const dir = await tmpDir();
 		try {
