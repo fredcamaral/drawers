@@ -25,11 +25,13 @@
  *      run record settles `cancelled`.
  *
  *   C. resume — a SECOND opencode process re-runs scenario A's persisted runId via
- *      `resume_from_run_id`. The harness asserts the resumed run is `completed`,
- *      `workflow_status` reports all-cached (`0 live agent calls`), AND the plugin's
- *      own child-task store gained NO new task files for the resumed run — the
- *      authoritative cross-process "nothing relaunched" signal (see the note in the
- *      README on why this, not opencode's global session DB, is the honest probe).
+ *      `resume_from_run_id`. The harness asserts on authoritative persisted state
+ *      ONLY (not model stdout, which paraphrases tool output nondeterministically):
+ *      the resumed run record is `completed`, its `returnValue` deep-equals the
+ *      original run's (a fully-cached replay reproduces the same result), AND the
+ *      plugin's own child-task store gained NO new task files for the resumed run —
+ *      the authoritative cross-process "nothing relaunched" signal (see the note in
+ *      the README on why this, not opencode's global session DB, is the honest probe).
  *
  * Cross-process observation: the harness reads the persisted run-record + task JSON
  * files under $OPENCODE_DRAWERS_DATA_DIR directly (the authoritative signal), in
@@ -323,9 +325,10 @@ async function scenarioB(dataDir: string, beforeCount: number): Promise<void> {
 	log(`Scenario B PASS: run ${record.id} settled 'cancelled'`);
 }
 
-async function scenarioC(dataDir: string, resumeId: string): Promise<void> {
+async function scenarioC(dataDir: string, original: RunRecord): Promise<void> {
 	log("");
 	log("=== Scenario C: resume (second process, all-cached, no relaunch) ===");
+	const resumeId = original.id;
 	const tasksBefore = await countTaskFiles(dataDir);
 	const runsBefore = (await readRuns(dataDir)).length;
 	log(`  child-task files before resume: ${tasksBefore}`);
@@ -338,7 +341,7 @@ async function scenarioC(dataDir: string, resumeId: string): Promise<void> {
 		"prior run. (2) Take the NEW run_id it returns and immediately call " +
 		'workflow_status with that run_id and { "wait_ms": 90000 } to block until it ' +
 		"settles. (3) Reply with only what workflow_status returned. Do not refuse.";
-	const run = await runUntilRunAppears(prompt, dataDir, runsBefore);
+	await runUntilRunAppears(prompt, dataDir, runsBefore);
 
 	// The resumed run is a NEW record (its own runId) resumed from the prior one.
 	const record = await waitForTerminal(
@@ -347,16 +350,12 @@ async function scenarioC(dataDir: string, resumeId: string): Promise<void> {
 	);
 	log(`  resumed run ${record.id} completed (resumed from ${resumeId})`);
 
-	// All-cached assertion: workflow_status reports "0 live agent calls" for a fully
-	// cached resume. The model echoes that line; assert on the run stdout.
-	if (!/0 live agent calls/.test(run.stdout)) {
-		throw new Error(
-			`Scenario C: expected workflow_status to report '0 live agent calls' on a ` +
-				`fully-cached resume. stdout:\n${trim(run.stdout, 1200)}`,
-		);
-	}
+	// NOTE: we do NOT assert on the model's stdout. workflow_status's "0 live agent
+	// calls" line is model-paraphrased — haiku reformats the tool output into its own
+	// JSON ("live_calls": 0), so a verbatim regex over stdout is nondeterministic and
+	// not an assertion surface. We anchor entirely on authoritative persisted state.
 
-	// Authoritative cross-process probe: a fully-cached resume relaunches NO child
+	// Authoritative probe 1 (cross-process): a fully-cached resume relaunches NO child
 	// agents, so the plugin's child-task store must not have grown.
 	const tasksAfter = await countTaskFiles(dataDir);
 	log(`  child-task files after resume: ${tasksAfter}`);
@@ -366,9 +365,98 @@ async function scenarioC(dataDir: string, resumeId: string): Promise<void> {
 				`${tasksBefore} to ${tasksAfter} (a cached resume must launch zero).`,
 		);
 	}
+
+	// Authoritative probe 2 (persisted truth): a fully-cached replay must reproduce the
+	// SAME result as the original run. Deep-equal the persisted returnValues.
+	const originalRet = JSON.stringify(original.returnValue ?? null);
+	const resumedRet = JSON.stringify(record.returnValue ?? null);
+	if (resumedRet !== originalRet) {
+		throw new Error(
+			`Scenario C: resumed returnValue does not match the original run's. ` +
+				`original=${originalRet}\nresumed=${resumedRet}`,
+		);
+	}
 	log(
-		`Scenario C PASS: resumed run completed all-cached; child-task store unchanged ` +
-			`(${tasksBefore} → ${tasksAfter})`,
+		`Scenario C PASS: resumed run completed; child-task store unchanged ` +
+			`(${tasksBefore} → ${tasksAfter}); returnValue reproduced from cache`,
+	);
+}
+
+async function scenarioD(dataDir: string, beforeCount: number): Promise<void> {
+	log("");
+	log("=== Scenario D: structured output (agent({ schema })) e2e ===");
+	// The ONLY scenario that exercises `agent({ schema })` — the registry/gate path
+	// whose regression (returnValue null) shipped to production (plan §6.1, the
+	// 2026-06-07 repro). The slow-gap/nudge false-completion case is NOT
+	// deterministically live-testable (it depends on model first-token latency
+	// crossing the idle-poll window); that case is covered by unit tests in
+	// packages/core/src/completion.test.ts (turn watermark). This scenario locks the
+	// happy path: a schema-conformant verdict must resolve as the validated OBJECT.
+	const schemaScript = [
+		"export const meta = { name: 'verdict', description: 'one structured-output agent' };",
+		"const r = await agent('State your verdict on the number 42 being even.', {",
+		"  label: 'verdict',",
+		"  schema: { type: 'object', properties: { verdict: { type: 'string' } }, required: ['verdict'] },",
+		"});",
+		"return { r };",
+	]
+		.join("\n")
+		.replace(/'/g, "\\'");
+	const prompt =
+		"You have tools named workflow and workflow_status. They ARE available. " +
+		"This is an explicit multi-agent orchestration request (opt-in satisfied). " +
+		"In this single turn, do EXACTLY this and nothing else: " +
+		`(1) call workflow with { "script": "${schemaScript}" }. ` +
+		"(2) Take the run_id it returns and immediately call workflow_status with " +
+		'that run_id and { "wait_ms": 90000 } so you BLOCK until the workflow settles. ' +
+		"(3) Then reply with only the result text workflow_status returned. " +
+		"Do not refuse, do not poll in a loop — workflow_status(wait_ms) already waits.";
+	// Snapshot the ids already on disk (A's + C's completed runs) so we match only
+	// D's new run, not a prior completed one.
+	const priorIds = new Set((await readRuns(dataDir)).map((r) => r.id));
+	await runUntilRunAppears(prompt, dataDir, beforeCount);
+	const record = await waitForTerminal(
+		dataDir,
+		(r) => r.status === "completed" && !priorIds.has(r.id),
+		SETTLE_TIMEOUT_MS,
+	);
+	log(`  run ${record.id} completed`);
+
+	// The heart of the scenario: the persisted returnValue must carry the VALIDATED
+	// OBJECT, not the production-regression shapes. record.returnValue is { r: <result> }.
+	const ret = record.returnValue;
+	const nested =
+		ret && typeof ret === "object" && !Array.isArray(ret)
+			? (ret as Record<string, unknown>).r
+			: undefined;
+	const shape = JSON.stringify(record.returnValue ?? null);
+	if (nested === null) {
+		throw new Error(
+			`Scenario D: structured output regressed to null (the production bug shape). ` +
+				`returnValue=${shape}`,
+		);
+	}
+	if (typeof nested === "string") {
+		throw new Error(
+			`Scenario D: structured output resolved as a plain string — schema was bypassed. ` +
+				`returnValue=${shape}`,
+		);
+	}
+	if (typeof nested !== "object" || Array.isArray(nested)) {
+		throw new Error(
+			`Scenario D: expected the agent result to be a non-null object. returnValue=${shape}`,
+		);
+	}
+	const verdict = (nested as Record<string, unknown>).verdict;
+	if (typeof verdict !== "string") {
+		throw new Error(
+			`Scenario D: validated object missing a string 'verdict' property. ` +
+				`returnValue=${shape}`,
+		);
+	}
+	log(
+		`Scenario D PASS: structured output resolved as a validated object with a ` +
+			`string verdict (returnValue=${shape})`,
 	);
 }
 
@@ -383,13 +471,16 @@ async function main(): Promise<void> {
 		const a = await scenarioA(dataDir);
 		const afterA = (await readRuns(dataDir)).length;
 		await scenarioB(dataDir, afterA);
-		await scenarioC(dataDir, a.id);
+		await scenarioC(dataDir, a);
+		const afterC = (await readRuns(dataDir)).length;
+		await scenarioD(dataDir, afterC);
 
 		log("");
 		log("================ PASS ================");
 		log("A: review workflow (pipeline+parallel+phase+sub-workflow) ✓");
 		log("B: workflow_stop → cancelled                              ✓");
 		log("C: resume all-cached, no child relaunch (new process)     ✓");
+		log("D: structured output → validated object returnValue       ✓");
 		log("======================================");
 	} catch (err) {
 		exitCode = 1;
