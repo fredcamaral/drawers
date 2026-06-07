@@ -29,6 +29,7 @@ import type {
 	SessionCreateBody,
 	SessionPromptAsyncBody,
 } from "./session-runner";
+import type { WakeClient, WakeSessionStatusMap } from "./wake-notifier";
 
 /**
  * A `RequestResult`-style envelope: the SDK resolves method calls to an object
@@ -61,6 +62,26 @@ export interface SdkSessionClient {
 }
 
 /**
+ * The structural subset the wake notifier (Task 6.3.1) needs: the GLOBAL
+ * `session.status` map read (audit row f) and `session.promptAsync` to the parent
+ * (audit row b). The real generated client satisfies this (broader, compatible
+ * generic signatures); like {@link SdkSessionClient} this avoids importing the
+ * full client type and keeps core free of a value-level SDK dependency.
+ */
+export interface SdkWakeSessionClient {
+	session: {
+		status(): Promise<SdkResult<WakeSessionStatusMap>>;
+		promptAsync(opts: {
+			path: { id: string };
+			body: {
+				agent?: string;
+				parts: Array<{ type: "text"; text: string }>;
+			};
+		}): Promise<unknown>;
+	};
+}
+
+/**
  * Wrap a real SDK client as the engine's structural {@link EngineClient}. Each
  * method forwards the engine's call shape verbatim and narrows the `{ data }`
  * result to exactly what the engine reads. This is the single place that breaks
@@ -81,6 +102,26 @@ export function adaptSdkClient(client: SdkSessionClient): EngineClient {
 				return { data: res.data ?? undefined };
 			},
 			get: async (opts) => client.session.get({ path: opts.path }),
+		},
+	};
+}
+
+/**
+ * Wrap a real SDK client as the wake notifier's structural {@link WakeClient}
+ * (Task 6.3.2). Narrows `session.status`'s `{ data }` envelope to the global
+ * status map and forwards `session.promptAsync` (no `agent` — the parent keeps its
+ * own). Written once in core; both plugins consume it from their entry, keeping
+ * the wake wiring thin composition rather than per-plugin SDK plumbing.
+ */
+export function adaptWakeClient(client: SdkWakeSessionClient): WakeClient {
+	return {
+		session: {
+			status: async () => {
+				const res = await client.session.status();
+				return { data: res.data ?? undefined };
+			},
+			promptAsync: async (opts) =>
+				client.session.promptAsync({ path: opts.path, body: opts.body }),
 		},
 	};
 }

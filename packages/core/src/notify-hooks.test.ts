@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
 	createChatMessageHook,
 	createToastNotifier,
+	createWakeOnNotify,
 	type NotificationQueue,
 	type NotificationQueueLogger,
 	type TaskNotice,
 	type TaskStatus,
+	type WakeNotifier,
 } from "./index";
 
 /** Rendered text-part shape the hook pushes — for typed test assertions. */
@@ -247,5 +249,67 @@ describe("createToastNotifier", () => {
 		await Promise.resolve();
 		expect(logger.errors).toHaveLength(1);
 		expect(logger.errors[0]?.[0]).toContain("showToast");
+	});
+});
+
+// ---- Task 6.3.2: createWakeOnNotify — toast + active wake composition -------
+
+describe("createWakeOnNotify", () => {
+	/** A wake notifier double recording every notice it was asked to wake. */
+	function makeWake(over?: { rejects?: boolean }): WakeNotifier & {
+		seen: TaskNotice[];
+	} {
+		const seen: TaskNotice[] = [];
+		return {
+			seen,
+			notify: (notice) => {
+				seen.push(notice);
+				return over?.rejects
+					? Promise.reject(new Error("wake boom"))
+					: Promise.resolve();
+			},
+		};
+	}
+
+	test("fires the toast AND the wake on a notice", () => {
+		const toasted: TaskNotice[] = [];
+		const wake = makeWake();
+		const onNotify = createWakeOnNotify(
+			(n) => toasted.push(n),
+			() => wake,
+		);
+		const notice = makeNotice();
+		onNotify(notice);
+		expect(toasted).toHaveLength(1);
+		expect(wake.seen).toHaveLength(1);
+		expect(wake.seen[0]).toBe(notice);
+	});
+
+	test("fires the toast even when the wake is not yet wired (getWake undefined)", () => {
+		const toasted: TaskNotice[] = [];
+		const onNotify = createWakeOnNotify(
+			(n) => toasted.push(n),
+			() => undefined,
+		);
+		expect(() => onNotify(makeNotice())).not.toThrow();
+		expect(toasted).toHaveLength(1);
+	});
+
+	test("a rejected wake is swallowed and logged; toast still fired", async () => {
+		const logger = makeLogger();
+		const toasted: TaskNotice[] = [];
+		const wake = makeWake({ rejects: true });
+		const onNotify = createWakeOnNotify(
+			(n) => toasted.push(n),
+			() => wake,
+			logger,
+		);
+		onNotify(makeNotice());
+		expect(toasted).toHaveLength(1);
+		// let the microtask rejection handler run.
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(logger.errors).toHaveLength(1);
+		expect(logger.errors[0]?.[0]).toContain("wake");
 	});
 });

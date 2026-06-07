@@ -20,6 +20,7 @@ export type { NotifyRenderOptions, ShowToast } from "./notify-hooks";
 export {
 	createChatMessageHook,
 	createToastNotifier,
+	createWakeOnNotify,
 } from "./notify-hooks";
 export type {
 	FsFacade,
@@ -28,8 +29,8 @@ export type {
 	TaskStoreOptions,
 } from "./persistence";
 export { createTaskStore, resolveDataBaseDir } from "./persistence";
-export type { SdkSessionClient } from "./sdk-adapter";
-export { adaptSdkClient } from "./sdk-adapter";
+export type { SdkSessionClient, SdkWakeSessionClient } from "./sdk-adapter";
+export { adaptSdkClient, adaptWakeClient } from "./sdk-adapter";
 export type {
 	EngineClient,
 	PersistFn,
@@ -51,3 +52,11 @@ export {
 	isTerminal,
 	TERMINAL_STATUSES,
 } from "./types";
+export type {
+	WakeClient,
+	WakeNotifier,
+	WakeNotifierDeps,
+	WakeSessionStatus,
+	WakeSessionStatusMap,
+} from "./wake-notifier";
+export { createWakeNotifier } from "./wake-notifier";

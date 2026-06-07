@@ -1,6 +1,6 @@
 # opencode-drawer-workflows
 
-Deterministic multi-agent orchestration scripts for [OpenCode](https://opencode.ai). You write a plain-JavaScript script that fans out to many sub-agents — in pipelines, in parallel, in phases — and the plugin runs it in the background. The launch returns immediately with a run id; the parent session is never blocked, and a passive toast fires when the run settles. Runs are journaled, so a crashed or edited run resumes by replaying the longest unchanged prefix of agent calls instead of re-spending tokens on work that already settled.
+Deterministic multi-agent orchestration scripts for [OpenCode](https://opencode.ai). You write a plain-JavaScript script that fans out to many sub-agents — in pipelines, in parallel, in phases — and the plugin runs it in the background. The launch returns immediately with a run id; the parent session is never blocked. When the run settles, an idle parent session is woken to read the result automatically; a busy parent gets a toast and a notice folded into its next message. Runs are journaled, so a crashed or edited run resumes by replaying the longest unchanged prefix of agent calls instead of re-spending tokens on work that already settled.
 
 This README is both the package landing page and the complete authoring manual. Everything needed to write a correct workflow script is here; you do not need to read the source.
 
@@ -58,7 +58,7 @@ Once loaded, the plugin contributes four tools to every session: `workflow`, `wo
 
 ### `workflow` — launch a run
 
-Selects a script source, loads it, and fires the run **detached**. It returns immediately with a `run_id` and the persisted script path — it does not block and you should not poll. Completion arrives as a passive notice.
+Selects a script source, loads it, and fires the run **detached**. It returns immediately with a `run_id` and the persisted script path — it does not block and you should not poll. When the run settles you are notified on three layers: an **active wake** of the parent session when it is idle (one prompt carrying a demarcated `[task-notification]` notice that points at `workflow_status`, so the assistant reads the result without you typing), a **TUI toast**, and a **next-message flush** that folds the notice into your next message. When the parent is busy mid-turn the wake is skipped — the host does not serialize concurrent session prompts — and the flush is the fallback. Wake and flush share one queue, so a completion is delivered exactly once; the toast is always additive.
 
 The tool is **opt-in** by design: a workflow can spawn dozens of agents and consume large token volumes, so the tool's own description instructs the model to use it only when the user has explicitly asked for multi-agent orchestration (e.g. an `ultracode` keyword, a standing toggle, a skill that invokes it, or a request to run a named workflow). Otherwise the model should use single agent calls or describe the cost and ask first.
 
@@ -500,7 +500,7 @@ Under the base dir the plugin maintains its `workflow-*` subdirectories: `workfl
 
 ## Honest limitations
 
-- **No active completion notification in a single-turn host.** A headless `opencode run` exits when the turn ends and has no mechanism to re-invoke the model on completion. The blocking option is `workflow_status` with `wait_ms` (capped at 120000ms); in an interactive session the passive toast fires on settle.
+- **No active wake in a single-turn host.** In an interactive session a settling run actively wakes an idle parent (and falls back to the toast + next-message flush when busy). But a headless `opencode run` exits — and the server shuts down — when the turn ends, so there is no live session to wake. The blocking option there is `workflow_status` with `wait_ms` (capped at 120000ms), which holds the turn open in-process until the run settles.
 - **`isolation: "worktree"` is recognized but unsupported.** There is no worktree session primitive, so the option warns and runs without isolation. Do not use it for safe parallel file mutation.
 - **Budget counts workflow-children only**, not the whole turn — a declared deviation from Claude Code's turn-wide pool (see [Budget](#budget)).
 ```

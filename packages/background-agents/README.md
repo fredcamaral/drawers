@@ -1,6 +1,6 @@
 # opencode-drawer-agents
 
-An [opencode](https://opencode.ai) plugin that runs agent tasks in the background. You launch a task from a session, your turn continues, and the task runs in its own child session independently. When it finishes, the result is delivered passively — a TUI toast plus a line folded into your next message — so you never poll. State is persisted per task and survives an opencode restart.
+An [opencode](https://opencode.ai) plugin that runs agent tasks in the background. You launch a task from a session, your turn continues, and the task runs in its own child session independently. When it finishes, an idle parent session is woken to read the result automatically; a busy parent gets a TUI toast plus a line folded into its next message — so you never poll. State is persisted per task and survives an opencode restart.
 
 The plugin registers four tools: `bg_task` (launch or resume), `bg_output` (read a result), `bg_cancel` (cancel), and `bg_list` (list this session's tasks).
 
@@ -71,14 +71,17 @@ List the background tasks started from the current session, one compact line per
 
 ## How notifications work
 
-Notifications are passive only. There is no active wake — a completed task never interrupts the parent turn. Two delivery paths fire on each terminal transition:
+On each terminal transition three delivery paths fire, layered so a completion always reaches you:
 
-1. **TUI toast.** A toast fires immediately via `client.tui.showToast`, with a `success` variant on completion, `error` on failure, and `info` on cancellation. Toast failures are swallowed and logged; a toast never breaks completion teardown.
-2. **Next-message flush.** The notice waits in a per-parent FIFO queue until you send your next message. At that point opencode's `chat.message` hook drains the queue and folds two parts into the message: one visible human-readable line per notice (for example `✅ bg_abc12345 'description' completed in 32s`), and one model-only synthetic hint instructing the assistant to call `bg_output(task_id="…")`.
+1. **Active wake (idle parent).** If the parent session is idle when the task completes, the plugin wakes it: it sends one prompt into the parent carrying a demarcated `[task-notification]` notice with the retrieval hint and an explicit "automated notice, not the user" framing, so the assistant reads the result without you typing anything. Completions for the same parent are coalesced into a single wake, and a wake is attempted only the moment a notice arrives — there are no retry timers or polling loops.
+2. **TUI toast.** A toast fires immediately via `client.tui.showToast`, with a `success` variant on completion, `error` on failure, and `info` on cancellation. Toast failures are swallowed and logged; a toast never breaks completion teardown.
+3. **Next-message flush (fallback).** When the parent is **busy** (mid-turn) the wake is skipped — the host does not serialize concurrent session prompts, so a child cannot safely interrupt an in-flight turn. The notice instead waits in a per-parent FIFO queue until you send your next message; opencode's `chat.message` hook then drains the queue and folds two parts into the message: one visible human-readable line per notice (for example `✅ bg_abc12345 'description' completed in 32s`), and one model-only synthetic hint instructing the assistant to call `bg_output(task_id="…")`.
 
-Notifications are passive because the host does not serialize concurrent session prompts: a child session cannot inject a prompt into the parent's turn, so completions are queued and delivered the next time the parent speaks.
+The wake and the flush share the same queue, so a completion is delivered **exactly once**: the wake consumes its notices only when the wake prompt succeeds, and any failure (busy parent, unreadable status, or a failed prompt) leaves them queued for the flush. The toast is always additive on top.
 
 The flush hook runs inside the prompt pipeline, where a thrown error would kill your message before it reaches the model. The hook body is fully fenced — a queue or render failure is logged and your message proceeds untouched.
+
+In a headless `opencode run`, the parent turn ends — and the server shuts down — when your single turn completes, so there is nothing to wake. Active wake is an interactive-session affordance; headless callers see the completion via the next-message flush only if the session is still alive.
 
 ## Persistence and restart
 

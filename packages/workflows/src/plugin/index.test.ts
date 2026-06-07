@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { createNotificationQueue, type NotificationQueue } from "@drawers/core";
+import {
+	adaptWakeClient,
+	createNotificationQueue,
+	createWakeNotifier,
+	createWakeOnNotify,
+	type NotificationQueue,
+	type SdkWakeSessionClient,
+	type TaskNotice,
+} from "@drawers/core";
 import type { Hooks } from "@opencode-ai/plugin";
 import { createWorkflowChatMessageHook } from "./digest-hook";
 import type { RunHandle, WorkflowEngine } from "./engine";
@@ -183,5 +191,132 @@ describe("createWorkflowChatMessageHook — live-run digest (Task 6.2.4)", () =>
 		const t2 = partsText(io2.output);
 		expect(t2).toContain("wf_dig00003");
 		expect(t2).not.toContain("wf_term0001");
+	});
+});
+
+// ---- Task 6.3.2: active-wake wiring (toast + wake on the onNotify seam) -----
+//
+// The plugin entry composes onNotify exactly as below: a toast notifier wrapped
+// by createWakeOnNotify, with the wake notifier built from adaptWakeClient over
+// the raw SDK client and the engine's queue. These tests pin that composition's
+// behavior (idle parent → wake prompt; busy parent → no prompt, passive flush
+// intact) without instantiating the fs-backed engine — the wake notifier itself
+// is exhaustively tested in core's wake-notifier.test.ts.
+
+interface RawStatusMap {
+	[sessionID: string]:
+		| { type: "idle" }
+		| { type: "retry"; attempt: number; message: string; next: number }
+		| { type: "busy" };
+}
+
+function makeRawWakeClient(status: RawStatusMap): SdkWakeSessionClient & {
+	prompts: Array<{ id: string; text: string }>;
+} {
+	const prompts: Array<{ id: string; text: string }> = [];
+	return {
+		prompts,
+		session: {
+			status: async () => ({ data: status }),
+			promptAsync: async (opts) => {
+				prompts.push({
+					id: opts.path.id,
+					text: opts.body.parts.map((p) => p.text).join("\n"),
+				});
+				return undefined;
+			},
+		},
+	};
+}
+
+function wfNotice(over: Partial<TaskNotice> = {}): TaskNotice {
+	return {
+		taskId: "wf_abc12345",
+		parentSessionID: "ses_parent",
+		description: "review",
+		status: "completed",
+		hint: 'Call workflow_status(run_id="wf_abc12345") for the result.',
+		...over,
+	};
+}
+
+function settle(): Promise<void> {
+	return (async () => {
+		for (let i = 0; i < 12; i += 1) {
+			await Promise.resolve();
+		}
+	})();
+}
+
+describe("workflows plugin wake wiring (Task 6.3.2)", () => {
+	test("idle parent → onNotify fires toast AND a wake promptAsync naming workflow_status", async () => {
+		// renderHint mirrors the workflows engine (engine.ts: runHint → workflow_status).
+		const queue = createNotificationQueue({
+			renderHint: (task) => `workflow_status run_id=${task.id} for the result`,
+		});
+		const raw = makeRawWakeClient({ ses_parent: { type: "idle" } });
+		const toasted: TaskNotice[] = [];
+		const wake = createWakeNotifier({
+			client: adaptWakeClient(raw),
+			queue,
+			clock: { now: () => 0 },
+		});
+		const onNotify = createWakeOnNotify(
+			(n) => toasted.push(n),
+			() => wake,
+		);
+
+		// The engine pushes the notice into the queue, then calls onNotify.
+		const notice = wfNotice();
+		queue.push({
+			id: notice.taskId,
+			parentSessionID: notice.parentSessionID,
+			description: notice.description,
+			status: notice.status,
+			createdAt: 1,
+			completedAt: 2,
+			// biome-ignore lint/suspicious/noExplicitAny: minimal BgTask-shaped push payload.
+		} as any);
+		onNotify(queue.pending("ses_parent")[0] ?? notice);
+		await settle();
+
+		expect(toasted).toHaveLength(1);
+		expect(raw.prompts).toHaveLength(1);
+		expect(raw.prompts[0]?.id).toBe("ses_parent");
+		expect(raw.prompts[0]?.text).toContain("[task-notification]");
+		expect(raw.prompts[0]?.text).toContain("workflow_status");
+		expect(queue.pending("ses_parent")).toHaveLength(0); // consumed
+	});
+
+	test("busy parent → toast fires, NO wake prompt, notice stays for the flush", async () => {
+		const queue = createNotificationQueue({});
+		const raw = makeRawWakeClient({ ses_parent: { type: "busy" } });
+		const toasted: TaskNotice[] = [];
+		const wake = createWakeNotifier({
+			client: adaptWakeClient(raw),
+			queue,
+			clock: { now: () => 0 },
+		});
+		const onNotify = createWakeOnNotify(
+			(n) => toasted.push(n),
+			() => wake,
+		);
+
+		const notice = wfNotice();
+		queue.push({
+			id: notice.taskId,
+			parentSessionID: notice.parentSessionID,
+			description: notice.description,
+			status: notice.status,
+			createdAt: 1,
+			completedAt: 2,
+			// biome-ignore lint/suspicious/noExplicitAny: minimal BgTask-shaped push payload.
+		} as any);
+		onNotify(queue.pending("ses_parent")[0] ?? notice);
+		await settle();
+
+		expect(toasted).toHaveLength(1);
+		expect(raw.prompts).toHaveLength(0);
+		expect(queue.pending("ses_parent")).toHaveLength(1); // passive flush intact
 	});
 });

@@ -36,6 +36,7 @@ import type {
 	TaskNotice,
 } from "./notify";
 import type { TaskStatus } from "./types";
+import type { WakeNotifier } from "./wake-notifier";
 
 /**
  * The hook output's `parts` element type, derived from the plugin's own `Hooks`
@@ -238,5 +239,42 @@ export function createToastNotifier(
 				err: err instanceof Error ? err.message : String(err),
 			});
 		}
+	};
+}
+
+/**
+ * Compose the engine's `onNotify` seam to fire BOTH the existing toast AND the
+ * active wake (Task 6.3.2) on every terminal notice.
+ *
+ * The toast fires first (synchronous, visual). The wake is fire-and-forget: its
+ * own body is fully fenced and never rejects, but we still `.catch` to honor the
+ * "no ignored errors" rule belt-and-suspenders. The passive flush remains the
+ * fallback for busy/failed wakes — this only ADDS the wake; it changes nothing
+ * about the toast or the queue.
+ *
+ * The wake is resolved through `getWake` rather than passed directly because of a
+ * construction-order cycle: the wake notifier needs the engine's queue, but the
+ * engine needs this `onNotify` at construction time. The entry builds the engine
+ * first, then assigns the wake; the getter closes that loop. `onNotify` is only
+ * ever invoked at runtime (on completions, long after wiring), so the wake is
+ * always present by then.
+ */
+export function createWakeOnNotify(
+	toast: (notice: TaskNotice) => void,
+	getWake: () => WakeNotifier | undefined,
+	logger?: NotificationQueueLogger,
+): (notice: TaskNotice) => void {
+	return (notice) => {
+		toast(notice);
+		const wake = getWake();
+		if (!wake) {
+			return;
+		}
+		void wake.notify(notice).catch((err: unknown) => {
+			logger?.error?.("wake notifier threw", {
+				id: notice.taskId,
+				err: err instanceof Error ? err.message : String(err),
+			});
+		});
 	};
 }
