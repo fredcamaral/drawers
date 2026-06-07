@@ -202,3 +202,84 @@ describe("createWorkflowStatusTool — tail", () => {
 		expect(out).toContain("error: boom happened");
 	});
 });
+
+describe("createWorkflowStatusTool — resume (Task 4.2.2)", () => {
+	test("header shows 'resumed from <id>' when the record was resumed", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_res00010",
+					status: "running",
+					resumedFrom: "wf_prior001",
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_res00010" }, ctx());
+		expect(out).toContain("resumed from wf_prior001");
+	});
+
+	test("terminal run appends 'N cached / M live agent calls' from progress", async () => {
+		const progress: ProgressEvent[] = [
+			{ type: "agent:start", label: "a", phase: "p" },
+			{ type: "agent:end", label: "a", status: "cached" },
+			{ type: "agent:start", label: "b", phase: "p" },
+			{ type: "agent:end", label: "b", status: "cached" },
+			{ type: "agent:start", label: "c", phase: "p" },
+			{ type: "agent:end", label: "c", status: "completed" },
+		];
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_counts001",
+					status: "completed",
+					completedAt: 2_000,
+					resumedFrom: "wf_prior002",
+					returnValue: { ok: true },
+				}),
+				progress,
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_counts001" }, ctx());
+		// 2 cached, 1 live (completed counts as live, not cached).
+		expect(out).toContain("2 cached / 1 live agent calls");
+		expect(out).toContain("resumed from wf_prior002");
+	});
+
+	test("a non-resumed terminal run still reports cached/live counts", async () => {
+		const progress: ProgressEvent[] = [
+			{ type: "agent:start", label: "a", phase: "p" },
+			{ type: "agent:end", label: "a", status: "completed" },
+		];
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_fresh010",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: 1,
+				}),
+				progress,
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_fresh010" }, ctx());
+		expect(out).toContain("0 cached / 1 live agent calls");
+		expect(out).not.toContain("resumed from");
+	});
+
+	test("a running run does NOT append the cached/live tally", async () => {
+		const progress: ProgressEvent[] = [
+			{ type: "agent:start", label: "a", phase: "p" },
+			{ type: "agent:end", label: "a", status: "cached" },
+		];
+		const engine = fakeEngine([
+			{ record: makeRecord({ id: "wf_running01" }), progress },
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_running01" }, ctx());
+		expect(out).not.toContain("agent calls");
+	});
+});

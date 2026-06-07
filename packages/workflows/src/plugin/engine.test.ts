@@ -3,7 +3,9 @@ import type { FsFacade, IdGenerator } from "@drawers/core";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { createStructuredOutputTool } from "../runtime/structured/tool";
 import { compileSchema } from "../runtime/structured/validate";
+import type { JournalEntry } from "../runtime/types";
 import { createWorkflowEngine } from "./engine";
+import { computeCallKey } from "./journal";
 
 /**
  * Engine tests for the workflows plugin (Task 4.1.2). Everything is faked: the
@@ -417,5 +419,513 @@ describe("createWorkflowEngine — stopRun", () => {
 		expect(pending.some((n) => n.taskId === handle.runId)).toBe(true);
 
 		await engine.dispose();
+	});
+});
+
+// ---- Task 4.2.2: resume wiring -------------------------------------------
+
+/**
+ * An auto-completing client: every launched child reaches `completed` the moment
+ * a `session.idle` event is driven through `engine.handleEvent`, AND its single
+ * assistant message text is `reply`. Combined with a MUTABLE clock bumped past
+ * the 5s min-idle grace, completion fires synchronously with no real timers.
+ *
+ * `session.create` hands out incrementing ids so a multi-agent script gets
+ * distinct child sessions (the completion gate + registry track by sessionID).
+ */
+function makeCompletingClient(reply = "AGENT_RESULT") {
+	const sessions: string[] = [];
+	let seq = 0;
+	return {
+		sessions,
+		client: {
+			session: {
+				create: async () => {
+					seq += 1;
+					const id = `ses_child_${seq}`;
+					sessions.push(id);
+					return { data: { id } };
+				},
+				promptAsync: async () => undefined,
+				abort: async () => undefined,
+				messages: async () => ({
+					data: [
+						{
+							info: { role: "assistant" as const },
+							parts: [{ type: "text", text: reply }],
+						},
+					],
+				}),
+				get: async () => ({ data: { id: "ses_child" } }),
+			},
+		},
+	};
+}
+
+/** A clock whose `now` is a mutable box; bump past 5000ms to clear idle grace. */
+function bumpClock(start: number) {
+	const box = { t: start };
+	return {
+		clock: { now: () => box.t },
+		bump: (ms: number) => {
+			box.t += ms;
+		},
+	};
+}
+
+/** Drain the microtask queue: the async parse→eval→acquire→create chain plus
+ * the settle continuations take many turns to propagate before asserting. */
+async function flush(turns = 60): Promise<void> {
+	for (let i = 0; i < turns; i += 1) {
+		await Promise.resolve();
+	}
+}
+
+const JOURNALS = (id: string) => `${BASE}/workflow-journals/${id}.jsonl`;
+
+/** Serialize journal entries to the JSONL file format the journal writes. */
+function jsonl(entries: JournalEntry[]): string {
+	return `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`;
+}
+
+/** Read a journal file's entries from the fake fs (missing → []). */
+function readJournal(files: Map<string, string>, id: string): JournalEntry[] {
+	const raw = files.get(JOURNALS(id));
+	if (raw === undefined) {
+		return [];
+	}
+	return raw
+		.split("\n")
+		.filter((l) => l.length > 0)
+		.map((l) => JSON.parse(l) as JournalEntry);
+}
+
+/**
+ * Drive a single-agent child to completion: launch dispatched the prompt async,
+ * so bump the clock past the grace and emit the child's idle event. Returns once
+ * the run's settle microtasks have drained.
+ */
+async function driveIdle(
+	engine: ReturnType<typeof createWorkflowEngine>,
+	sessionID: string,
+	bump: (ms: number) => void,
+): Promise<void> {
+	bump(6000);
+	await engine.handleEvent({
+		type: "session.idle",
+		properties: { sessionID },
+		// biome-ignore lint/suspicious/noExplicitAny: the gate reads only type+properties.
+	} as any);
+	await flush();
+}
+
+const ONE_AGENT = `${META}const r = await agent("do work");\nreturn r;\n`;
+
+describe("createWorkflowEngine — fresh run journals to disk", () => {
+	test("a fresh run's settled agent result lands in <dataDir>/workflow-journals/<runId>.jsonl", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("HELLO");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_fresh001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.record.returnValue).toBe("HELLO");
+
+		const entries = readJournal(files, "wf_fresh001");
+		expect(entries.length).toBe(1);
+		expect(entries[0]).toMatchObject({
+			index: 0,
+			key: computeCallKey({ prompt: "do work" }),
+			status: "ok",
+			result: "HELLO",
+		});
+
+		await engine.dispose();
+	});
+});
+
+/** Seed a completed prior run: its record + a one-entry journal on disk. */
+function seedPrior(
+	files: Record<string, string>,
+	opts: { id: string; result: unknown; args?: unknown; prompt?: string },
+): Record<string, string> {
+	const prompt = opts.prompt ?? "do work";
+	const record = {
+		id: opts.id,
+		parentSessionID: "ses_parent",
+		status: "completed",
+		description: "demo",
+		createdAt: NOW - 1000,
+		completedAt: NOW - 500,
+		scriptPath: `${BASE}/workflow-scripts/${opts.id}.js`,
+		args: opts.args,
+		returnValue: opts.result,
+	};
+	const entries: JournalEntry[] = [
+		{
+			index: 0,
+			key: computeCallKey({ prompt }),
+			status: "ok",
+			result: opts.result,
+		},
+	];
+	return {
+		...files,
+		[`${BASE}/workflow-runs/${opts.id}.json`]: JSON.stringify(record),
+		[`${BASE}/workflow-scripts/${opts.id}.js`]: ONE_AGENT,
+		[JOURNALS(opts.id)]: jsonl(entries),
+	};
+}
+
+describe("createWorkflowEngine — resume (same instance)", () => {
+	test("same script + same args resume → ZERO launches, identical returnValue, complete new journal", async () => {
+		const seeded = seedPrior({}, { id: "wf_prior001", result: "CACHED" });
+		const { facade, files } = makeFs(seeded);
+		const { clock: mclock } = bumpClock(NOW);
+		let creates = 0;
+		const { client } = makeCompletingClient();
+		const wrapped = {
+			session: {
+				...client.session,
+				create: async () => {
+					creates += 1;
+					return { data: { id: "ses_unused" } };
+				},
+			},
+		};
+		const engine = createWorkflowEngine({
+			client: wrapped,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_new00001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_prior001",
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.record.returnValue).toBe("CACHED");
+		expect(status?.record.resumedFrom).toBe("wf_prior001");
+		expect(creates).toBe(0);
+
+		const prior = readJournal(files, "wf_prior001");
+		const fresh = readJournal(files, "wf_new00001");
+		expect(fresh.length).toBe(prior.length);
+		expect(fresh[0]).toMatchObject({
+			index: 0,
+			key: computeCallKey({ prompt: "do work" }),
+			status: "ok",
+			result: "CACHED",
+		});
+
+		await engine.dispose();
+	});
+
+	test("edited script: earlier calls cached, the edited call and ALL subsequent run live", async () => {
+		const id = "wf_prior003";
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "first" }),
+				status: "ok",
+				result: "c0",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "second" }),
+				status: "ok",
+				result: "c1",
+			},
+		];
+		const priorScript = `${META}await agent("first");\nawait agent("second");\nreturn null;\n`;
+		const editedScript = `${META}await agent("first");\nawait agent("CHANGED");\nreturn "edited";\n`;
+		const seeded: Record<string, string> = {
+			[`${BASE}/workflow-runs/${id}.json`]: JSON.stringify({
+				id,
+				parentSessionID: "ses_parent",
+				status: "completed",
+				description: "demo",
+				createdAt: NOW - 1000,
+				completedAt: NOW - 500,
+				scriptPath: `${BASE}/workflow-scripts/${id}.js`,
+			}),
+			[`${BASE}/workflow-scripts/${id}.js`]: priorScript,
+			[JOURNALS(id)]: jsonl(entries),
+		};
+		const { facade } = makeFs(seeded);
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("LIVE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_new00003"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: id,
+			source: editedScript,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.record.returnValue).toBe("edited");
+		expect(sessions.length).toBe(1);
+
+		await engine.dispose();
+	});
+
+	test("resume of a still-running run is refused with a stop hint", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock } = bumpClock(NOW);
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_live0001", "wf_resume001"),
+		});
+		await engine.ready();
+
+		const live = await engine.startRun({
+			source: HANGING,
+			parentSessionID: "ses_parent",
+		});
+		expect(engine.statusOf(live.runId)?.record.status).toBe("running");
+
+		await expect(
+			engine.startRun({
+				resumeFromRunId: live.runId,
+				parentSessionID: "ses_parent",
+			}),
+		).rejects.toThrow(/still running/);
+
+		await engine.dispose();
+	});
+
+	test("resume with an unknown id errors, listing known run ids", async () => {
+		const seeded = seedPrior({}, { id: "wf_known999", result: "Y" });
+		const { facade } = makeFs(seeded);
+		const { clock: mclock } = bumpClock(NOW);
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+		});
+		await engine.ready();
+
+		await expect(
+			engine.startRun({
+				resumeFromRunId: "wf_nope",
+				parentSessionID: "ses_parent",
+			}),
+		).rejects.toThrow(/wf_known999/);
+
+		await engine.dispose();
+	});
+
+	test("missing prior journal → run goes live with a warn (resume still works)", async () => {
+		const id = "wf_nojour01";
+		const seeded: Record<string, string> = {
+			[`${BASE}/workflow-runs/${id}.json`]: JSON.stringify({
+				id,
+				parentSessionID: "ses_parent",
+				status: "completed",
+				description: "demo",
+				createdAt: NOW - 1000,
+				completedAt: NOW - 500,
+				scriptPath: `${BASE}/workflow-scripts/${id}.js`,
+			}),
+			[`${BASE}/workflow-scripts/${id}.js`]: ONE_AGENT,
+		};
+		const { facade } = makeFs(seeded);
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const warns: string[] = [];
+		const logger = { ...noopLogger, warn: (m: string) => warns.push(m) };
+		const { client, sessions } = makeCompletingClient("LIVERESULT");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger,
+			ids: fixedIds("wf_new00004"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: id,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.record.returnValue).toBe("LIVERESULT");
+		expect(sessions.length).toBe(1);
+		expect(warns.some((w) => w.toLowerCase().includes("journal"))).toBe(true);
+
+		await engine.dispose();
+	});
+
+	test("explicit args override prior args and break the cache at an args-bearing prompt", async () => {
+		const id = "wf_priorarg";
+		const oldPrompt = "use old";
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: oldPrompt }),
+				status: "ok",
+				result: "OLD",
+			},
+		];
+		const script = `${META}const r = await agent("use " + args.x);\nreturn r;\n`;
+		const seeded: Record<string, string> = {
+			[`${BASE}/workflow-runs/${id}.json`]: JSON.stringify({
+				id,
+				parentSessionID: "ses_parent",
+				status: "completed",
+				description: "demo",
+				createdAt: NOW - 1000,
+				completedAt: NOW - 500,
+				scriptPath: `${BASE}/workflow-scripts/${id}.js`,
+				args: { x: "old" },
+			}),
+			[`${BASE}/workflow-scripts/${id}.js`]: script,
+			[JOURNALS(id)]: jsonl(entries),
+		};
+		const { facade } = makeFs(seeded);
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("NEWRESULT");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_new00005"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: id,
+			args: { x: "new" },
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.record.returnValue).toBe("NEWRESULT");
+		expect(status?.record.args).toEqual({ x: "new" });
+		expect(sessions.length).toBe(1);
+
+		await engine.dispose();
+	});
+});
+
+describe("createWorkflowEngine — resume across restart", () => {
+	test("a second engine instance over the SAME fake-fs resumes to an all-cache replay", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("RESTART");
+		const engine1 = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_restart01"),
+		});
+		await engine1.ready();
+		await engine1.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine1, sessions[0] as string, bump);
+		expect(engine1.statusOf("wf_restart01")?.record.status).toBe("completed");
+		expect(readJournal(files, "wf_restart01").length).toBe(1);
+		await engine1.dispose();
+
+		let creates2 = 0;
+		const client2 = {
+			session: {
+				create: async () => {
+					creates2 += 1;
+					return { data: { id: "ses_c2" } };
+				},
+				promptAsync: async () => undefined,
+				abort: async () => undefined,
+				messages: async () => ({ data: [] }),
+				get: async () => ({ data: { id: "ses_c2" } }),
+			},
+		};
+		const engine2 = createWorkflowEngine({
+			client: client2,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: { now: () => NOW },
+			logger: noopLogger,
+			ids: fixedIds("wf_restart02"),
+		});
+		await engine2.ready();
+
+		const handle = await engine2.startRun({
+			resumeFromRunId: "wf_restart01",
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+
+		const status = engine2.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.record.returnValue).toBe("RESTART");
+		expect(status?.record.resumedFrom).toBe("wf_restart01");
+		expect(creates2).toBe(0);
+
+		await engine2.dispose();
 	});
 });

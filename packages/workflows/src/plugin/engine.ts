@@ -49,7 +49,8 @@ import {
 	createSchemaRegistry,
 	type SchemaRegistry,
 } from "../runtime/structured/registry";
-import type { ProgressEvent } from "../runtime/types";
+import type { JournalEntry, ProgressEvent } from "../runtime/types";
+import { createJournal, type Journal, type JournalFs } from "./journal";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
 export interface EngineLogger {
@@ -80,6 +81,8 @@ export interface RunRecord {
 	returnValue?: unknown;
 	error?: string;
 	agentCount?: number;
+	/** The prior runId this run was resumed from (spec §7); absent on fresh runs. */
+	resumedFrom?: string;
 }
 
 /** In-memory handle for a run: live run (absent for recovered records), record, progress. */
@@ -91,9 +94,24 @@ export interface RunHandle {
 
 /** Arguments to launch a run. */
 export interface StartRunArgs {
-	source: string;
+	/**
+	 * The script source. On a fresh run it is required; on a resume
+	 * ({@link resumeFromRunId} set) it MAY be absent — the prior run's persisted
+	 * script is read from disk instead. An explicit source always wins.
+	 */
+	source?: string;
+	/**
+	 * The invocation args. Explicit value wins; on a resume, an absent `args`
+	 * inherits the prior run's persisted args.
+	 */
 	args?: unknown;
 	parentSessionID: string;
+	/**
+	 * Resume from a prior run (spec §7): own runId + own journal, but seeded with
+	 * the prior run's journal entries (longest unchanged prefix replays). Source
+	 * and args default to the prior record's when absent.
+	 */
+	resumeFromRunId?: string;
 }
 
 /** What `startRun` returns synchronously (before the run settles). */
@@ -165,6 +183,32 @@ const RUN_PREFIX = "wf_";
 const SUBDIR_TASKS = "workflow-tasks";
 const SUBDIR_RUNS = "workflow-runs";
 const SUBDIR_SCRIPTS = "workflow-scripts";
+const SUBDIR_JOURNALS = "workflow-journals";
+
+/**
+ * Adapt the engine's {@link FsFacade} to the {@link JournalFs} the journal needs.
+ * `FsFacade` has no `appendFile`, so it is synthesized as read-modify-write over
+ * `readFile`/`writeFile` (ENOENT → start empty). This keeps the in-memory test
+ * fs unchanged — it already exposes `readFile`/`writeFile`. The journal's own
+ * single-serial write chain guarantees no two appends interleave for one file.
+ */
+function journalFsFromFacade(fs: FsFacade): JournalFs {
+	return {
+		mkdir: (path, opts) => fs.mkdir(path, opts),
+		readFile: (path, enc) => fs.readFile(path, enc),
+		appendFile: async (path, data, enc) => {
+			let prior = "";
+			try {
+				prior = await fs.readFile(path, enc);
+			} catch (err) {
+				if ((err as { code?: string }).code !== "ENOENT") {
+					throw err;
+				}
+			}
+			await fs.writeFile(path, prior + data, enc);
+		},
+	};
+}
 
 const defaultClock: Clock = { now: () => Date.now() };
 
@@ -234,6 +278,21 @@ export function createWorkflowEngine(
 
 	const subdir = (name: string) => (base ? join(base, name) : undefined);
 	const scriptsDir = subdir(SUBDIR_SCRIPTS);
+	const journalsDir = subdir(SUBDIR_JOURNALS);
+
+	/** The journal file path for a runId (under the journals subdir). */
+	const journalPath = (id: string) =>
+		journalsDir
+			? join(journalsDir, `${id}.jsonl`)
+			: `${SUBDIR_JOURNALS}/${id}.jsonl`;
+
+	const journalFs = fs ? journalFsFromFacade(fs) : undefined;
+	const journalLogger = logger
+		? {
+				error: (msg: string, meta?: Record<string, unknown>) =>
+					logger.error(msg, meta),
+			}
+		: undefined;
 
 	const storeLogger = logger
 		? {
@@ -320,18 +379,98 @@ export function createWorkflowEngine(
 		noticePush(handle.record);
 	}
 
+	/**
+	 * Resolve the source + args + prior journal entries + `resumedFrom` for a run.
+	 * Fresh run: explicit source required; entries empty. Resume: guards the prior
+	 * run, reads its persisted script/args when the caller omits them, loads its
+	 * journal (missing → empty + warn).
+	 */
+	async function resolveResume(args: StartRunArgs): Promise<{
+		source: string;
+		runArgs: unknown;
+		entries: JournalEntry[];
+		resumedFrom?: string;
+	}> {
+		const priorId = args.resumeFromRunId;
+		if (priorId === undefined) {
+			if (args.source === undefined) {
+				throw new Error("startRun requires `source` for a fresh run");
+			}
+			return { source: args.source, runArgs: args.args, entries: [] };
+		}
+
+		// Guard: the prior run must be known.
+		const prior = runs.get(priorId);
+		if (prior === undefined) {
+			const known = [...runs.keys()];
+			const list = known.length > 0 ? known.join(", ") : "(none)";
+			throw new Error(
+				`unknown resume_from_run_id ${priorId}. Known runs: ${list}`,
+			);
+		}
+		// Guard: a live run with that id must not still be running.
+		if (prior.record.status === "running") {
+			throw new Error(
+				`run ${priorId} is still running — workflow_stop ${priorId} first.`,
+			);
+		}
+
+		// Source: explicit wins; absent → read the prior record's persisted script.
+		let source: string;
+		if (args.source !== undefined) {
+			source = args.source;
+		} else if (fs) {
+			try {
+				source = await fs.readFile(prior.record.scriptPath, "utf-8");
+			} catch (err) {
+				throw new Error(
+					`could not read prior script ${prior.record.scriptPath} for resume: ` +
+						`${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		} else {
+			throw new Error(
+				`cannot read prior script for resume of ${priorId} (no fs configured)`,
+			);
+		}
+
+		// Args: explicit wins; absent → prior record's args.
+		const runArgs = "args" in args ? args.args : prior.record.args;
+
+		// Journal: missing file → empty entries (+ warn) so resume still works.
+		let entries: JournalEntry[] = [];
+		if (journalFs) {
+			const priorJournal = createJournal({
+				path: journalPath(priorId),
+				fs: journalFs,
+				logger: journalLogger,
+			});
+			entries = await priorJournal.load();
+			if (entries.length === 0) {
+				logger?.warn("resume found no prior journal — running live", {
+					priorId,
+					path: journalPath(priorId),
+				});
+			}
+		}
+
+		return { source, runArgs, entries, resumedFrom: priorId };
+	}
+
 	async function startRun(args: StartRunArgs): Promise<StartRunResult> {
+		const resolved = await resolveResume(args);
 		const runId = ids.next(liveRunIds());
-		const name = extractName(args.source);
+		const name = extractName(resolved.source);
 		const scriptPath = scriptsDir
 			? join(scriptsDir, `${runId}.js`)
 			: `${SUBDIR_SCRIPTS}/${runId}.js`;
 
 		// Persist the script source BEFORE execution (the spec's "persisted script
-		// path"). Ensure the directory exists first (in-memory fs no-ops mkdir).
+		// path"). On resume with no explicit source, this re-persists the prior
+		// script under the NEW runId so the new run is fully self-describing.
 		if (fs) {
 			await fs.mkdir(dirname(scriptPath), { recursive: true });
-			await fs.writeFile(scriptPath, args.source, "utf-8");
+			await fs.writeFile(scriptPath, resolved.source, "utf-8");
 		}
 
 		const record: RunRecord = {
@@ -341,28 +480,47 @@ export function createWorkflowEngine(
 			description: name,
 			createdAt: clock.now(),
 			scriptPath,
-			args: args.args,
+			args: resolved.runArgs,
+			...(resolved.resumedFrom !== undefined
+				? { resumedFrom: resolved.resumedFrom }
+				: {}),
 		};
 		const handle: RunHandle = { record, progress: [] };
 		runs.set(runId, handle);
 		persistRecord(record);
 
+		// Every run gets its OWN journal (empty file). onRecord persists each settled
+		// AND each re-recorded cached entry, so the new journal is self-contained.
+		const journal: Journal | undefined = journalFs
+			? createJournal({
+					path: journalPath(runId),
+					fs: journalFs,
+					logger: journalLogger,
+				})
+			: undefined;
+
 		const run = createWorkflowRun({
 			runner,
 			parentSessionID: args.parentSessionID,
 			runId,
-			args: args.args,
+			args: resolved.runArgs,
 			registry,
 			onProgress: (e) => {
 				handle.progress.push(e);
 				logger?.debug("workflow progress", { runId, event: e });
+			},
+			replay: {
+				entries: resolved.entries,
+				onRecord: (e) => {
+					void journal?.record(e);
+				},
 			},
 		});
 		handle.run = run;
 
 		// Fire DETACHED — never await the run. On settle, update the record.
 		void run
-			.run(args.source)
+			.run(resolved.source)
 			.then((result) => {
 				// A stopRun() may have already flipped the record to cancelled; do not
 				// clobber a terminal record with the run's own (also-terminal) result.

@@ -652,7 +652,7 @@ interface SessionRunner {
 
 #### Task 4.2.2: Resume wiring in the plugin
 
-- [ ] Done
+- [x] Done — strict TDD. Cached hits now re-record via onRecord (one-line library change — every run's journal is standalone); restart resume proven (second engine over same dataDir → all-cached, zero launches); `appendFile` synthesized over FsFacade read-modify-write (safe under the journal's serial write chain). **Epic 4.2 exit.**
 
 **Context:** Spec §2.2/§7: `Workflow({ scriptPath, resumeFromRunId })`; same script + same args → 100% cache hit; prior run must be stopped first; resume is same-session... relaxed here: same plugin instance OR post-restart (journal + script + record are all on disk — restart resume is a strict improvement over the spec and falls out of the persistence design; take it). The 4.1.3 `workflow` tool already accepts `resume_from_run_id` as a placeholder.
 

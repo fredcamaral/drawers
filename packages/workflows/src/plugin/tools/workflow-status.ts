@@ -100,12 +100,39 @@ function renderProgress(progress: ProgressEvent[]): string[] {
 	return lines;
 }
 
+/**
+ * Tally the resume cache efficiency from progress: an `agent:end` with status
+ * `cached` was replayed; every other terminal end was a live launch. Counted off
+ * the same events the progress tree renders.
+ */
+function agentCallTally(progress: ProgressEvent[]): {
+	cached: number;
+	live: number;
+} {
+	let cached = 0;
+	let live = 0;
+	for (const e of progress) {
+		if (e.type !== "agent:end") {
+			continue;
+		}
+		if (e.status === "cached") {
+			cached += 1;
+		} else {
+			live += 1;
+		}
+	}
+	return { cached, live };
+}
+
 /** Render the full status text for one run handle. */
 function render(handle: RunHandle): string {
 	const record: RunRecord = handle.record;
 	const terminal = record.status !== "running";
 
 	let header = `${record.id} — ${record.description} — ${record.status}`;
+	if (record.resumedFrom !== undefined) {
+		header += ` — resumed from ${record.resumedFrom}`;
+	}
 	if (terminal && record.completedAt !== undefined) {
 		header += ` (${record.completedAt - record.createdAt}ms)`;
 	}
@@ -121,6 +148,13 @@ function render(handle: RunHandle): string {
 		parts.push("", renderResult(record.returnValue));
 	} else if (record.status === "error") {
 		parts.push("", `error: ${record.error ?? "(no message)"}`);
+	}
+
+	// On a TERMINAL run, summarize the cache efficiency — how many agent() calls
+	// replayed from the journal vs. ran live (spec §7's resume payoff).
+	if (terminal) {
+		const tally = agentCallTally(handle.progress);
+		parts.push("", `${tally.cached} cached / ${tally.live} live agent calls`);
 	}
 
 	return parts.join("\n");

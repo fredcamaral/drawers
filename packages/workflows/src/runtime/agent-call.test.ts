@@ -608,6 +608,48 @@ describe("createAgentPrimitive — cached replay path", () => {
 		expect(starts.length).toBe(2);
 	});
 
+	test("a cached hit re-records the entry via onRecord (journals stay self-contained on resume)", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		];
+		const { agent, runner: r } = harness({
+			runner,
+			replay: { entries, onRecord: (e) => recorded.push(e) },
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(await agent("b")).toBe("cached-b");
+		// Zero launches, yet both cached hits were re-recorded verbatim so the new
+		// run's journal is standalone (no engine-layer bookkeeping needed).
+		expect((r as FakeRunner).launches.length).toBe(0);
+		expect(recorded).toEqual([
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		]);
+	});
+
 	test("cached calls still advance counters.agents and hit the 1000 cap", async () => {
 		const runner = new FakeRunner({ status: "completed" });
 		const entries: JournalEntry[] = [

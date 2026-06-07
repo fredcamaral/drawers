@@ -138,6 +138,9 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				counters.agents += 1;
 				emit({ type: "agent:start", label, phase });
 				emit({ type: "agent:end", label, status: "cached" });
+				// Re-record the cached hit into the NEW journal so a resumed run's
+				// journal is fully self-contained — no engine-layer bookkeeping.
+				replay.onRecord({ index, key, status: "ok", result: cached.result });
 				return cached.result;
 			}
 			// Divergence: this call edited/new (key mismatch or past the journal).

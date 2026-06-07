@@ -182,25 +182,34 @@ export function createWorkflowTool(
 			resume_from_run_id: tool.schema
 				.string()
 				.optional()
-				.describe("Resume a prior run by its run_id (not yet supported)."),
+				.describe(
+					"Resume a prior run by its run_id (spec §7): the longest unchanged " +
+						"prefix of agent() calls replays from cache, the rest runs live. " +
+						"Source/args default to the prior run's when omitted.",
+				),
 		},
 		async execute(args, context: ToolContext) {
-			// Resume is a distinct mode — surface the placeholder before anything else
-			// so a resume request is never silently treated as a fresh launch.
 			const resumeFrom = trimmedOrAbsent(args.resume_from_run_id);
-			if (resumeFrom !== undefined) {
-				return `resume lands in Task 4.2.2 (requested resume_from_run_id=${resumeFrom}).`;
-			}
 
 			const script = trimmedOrAbsent(args.script);
 			const scriptPath = trimmedOrAbsent(args.script_path);
 			const name = trimmedOrAbsent(args.name);
 
 			const present = [script, scriptPath, name].filter((v) => v !== undefined);
-			if (present.length !== 1) {
+			// The source xor only applies when NOT resuming: a resume may carry zero
+			// source params (inherit the prior script) or exactly one (an edited
+			// source). Two-or-more is always an error.
+			if (resumeFrom === undefined) {
+				if (present.length !== 1) {
+					return (
+						"provide exactly one of `script`, `script_path`, or `name` " +
+						`(got ${present.length}).`
+					);
+				}
+			} else if (present.length > 1) {
 				return (
-					"provide exactly one of `script`, `script_path`, or `name` " +
-					`(got ${present.length}).`
+					"on resume, provide at most one source override " +
+					`(\`script\`, \`script_path\`, or \`name\`) — got ${present.length}.`
 				);
 			}
 
@@ -211,8 +220,8 @@ export function createWorkflowTool(
 				return argsResult.error;
 			}
 
-			// --- Resolve the script source --------------------------------------
-			let source: string;
+			// --- Resolve the script source (optional on resume) ------------------
+			let source: string | undefined;
 			if (script !== undefined) {
 				source = script;
 			} else if (name !== undefined) {
@@ -221,24 +230,37 @@ export function createWorkflowTool(
 					return loaded.error;
 				}
 				source = loaded.source;
-			} else {
-				// script_path (the exactly-one check guarantees it is set here).
-				const abs = joinPath(directory, scriptPath as string);
+			} else if (scriptPath !== undefined) {
+				const abs = joinPath(directory, scriptPath);
 				try {
 					source = await fs.readFile(abs, "utf-8");
 				} catch (err) {
 					return `could not read script_path ${scriptPath}: ${errorMessage(err)}`;
 				}
 			}
+			// source stays undefined only on a resume with no override → the engine
+			// reads the prior run's persisted script.
 
-			const result = await engine.startRun({
-				source,
-				args: argsResult.value,
-				parentSessionID: context.sessionID,
-			});
+			let result: Awaited<ReturnType<WorkflowEngine["startRun"]>>;
+			try {
+				result = await engine.startRun({
+					source,
+					args: argsResult.value,
+					parentSessionID: context.sessionID,
+					...(resumeFrom !== undefined ? { resumeFromRunId: resumeFrom } : {}),
+				});
+			} catch (err) {
+				// Resume guards (unknown id / still-running) throw — surface them as
+				// honest tool text rather than a thrown tool error.
+				return errorMessage(err);
+			}
 
+			const launched =
+				resumeFrom !== undefined
+					? `Resumed workflow ${result.runId} (${result.name}), resumed from ${resumeFrom}.`
+					: `Launched workflow ${result.runId} (${result.name}).`;
 			return [
-				`Launched workflow ${result.runId} (${result.name}).`,
+				launched,
 				`Script persisted at ${result.scriptPath}.`,
 				"It runs in the background — do not poll; you will be notified on " +
 					`completion. Use workflow_status run_id=${result.runId} to inspect ` +

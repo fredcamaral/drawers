@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { FsFacade, IdGenerator } from "@drawers/core";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { createWorkflowEngine, type WorkflowEngine } from "../engine";
+import { computeCallKey } from "../journal";
 import { createWorkflowTool } from "./workflow";
 
 /**
@@ -308,17 +309,84 @@ describe("createWorkflowTool — args coercion", () => {
 	});
 });
 
-describe("createWorkflowTool — resume placeholder", () => {
-	test("resume_from_run_id returns the 4.2.2 placeholder, does not launch", async () => {
-		const { engine, facade } = makeEngine({});
+describe("createWorkflowTool — resume", () => {
+	const META_LOCAL = `export const meta = { name: "demo", description: "d" };\n`;
+	const ONE_AGENT = `${META_LOCAL}const r = await agent("do work");\nreturn r;\n`;
+
+	/** Seed a completed prior run (record + script + one-entry journal) on disk. */
+	function seedPrior(id: string, result: unknown): Record<string, string> {
+		const record = {
+			id,
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/${id}.js`,
+			returnValue: result,
+		};
+		const entry = {
+			index: 0,
+			key: computeCallKey({ prompt: "do work" }),
+			status: "ok",
+			result,
+		};
+		return {
+			[`${BASE}/workflow-runs/${id}.json`]: JSON.stringify(record),
+			[`${BASE}/workflow-scripts/${id}.js`]: ONE_AGENT,
+			[`${BASE}/workflow-journals/${id}.jsonl`]: `${JSON.stringify(entry)}\n`,
+		};
+	}
+
+	test("resume without a source uses the prior script and re-persists it under the new runId", async () => {
+		const files = seedPrior("wf_prior001", "CACHED");
+		const { engine, facade } = makeEngine({
+			files,
+			ids: fixedIds("wf_resume001"),
+		});
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+
+		// No source params at all — only resume_from_run_id. The xor check must NOT
+		// fire when resuming.
+		const out = await run(
+			t,
+			{ resume_from_run_id: "wf_prior001" },
+			ctx("ses_parent"),
+		);
+
+		expect(out).toContain("wf_resume001");
+		expect(out.toLowerCase()).toContain("resumed from");
+		expect(out).toContain("wf_prior001");
+
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const status = engine.statusOf("wf_resume001");
+		expect(status?.record.resumedFrom).toBe("wf_prior001");
+		// The prior script was re-persisted verbatim under the NEW runId.
+		const priorSrc = `${BASE}/workflow-scripts/wf_prior001.js`;
+		const newSrc = `${BASE}/workflow-scripts/wf_resume001.js`;
+		expect(engine.statusOf("wf_resume001")?.record.scriptPath).toBe(newSrc);
+		// Same script content under both paths (read via the shared fake fs).
+		expect(await facade.readFile(newSrc, "utf-8")).toBe(
+			await facade.readFile(priorSrc, "utf-8"),
+		);
+
+		await engine.dispose();
+	});
+
+	test("resume of an unknown id surfaces the engine error (known-run listing)", async () => {
+		const files = seedPrior("wf_known001", "X");
+		const { engine, facade } = makeEngine({ files });
+		await engine.ready();
 		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
 		const out = await run(
 			t,
-			{ script: HANGING, resume_from_run_id: "wf_prev0001" },
+			{ resume_from_run_id: "wf_nope" },
 			ctx("ses_parent"),
 		);
-		expect(out).toContain("4.2.2");
-		expect(engine.runs.size).toBe(0);
+		expect(out.toLowerCase()).toContain("unknown");
+		expect(out).toContain("wf_known001");
 		await engine.dispose();
 	});
 });
