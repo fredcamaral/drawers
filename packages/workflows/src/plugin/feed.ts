@@ -48,11 +48,40 @@ export interface RunEndLine {
 }
 
 /**
- * One line in the feed file: an engine-stamped progress event, or one of the two
- * run-lifecycle lines. Every member carries `at` (engine wall-clock), so a tail
- * reader can order by emission time without a separate timestamp column.
+ * A throttled per-agent live-stats line (Task 8.1.3) — FEED-ONLY (never pushed to
+ * `handle.progress`; `workflow_status` reads collector snapshots directly). The
+ * engine emits at most one per session per throttle window when its stats change,
+ * so a TUI viewer tailing the feed sees live token/tool growth without the engine
+ * widening the runtime progress vocabulary. Tokens are the collector's rolled-up
+ * totals; `lastTools` is the ≤3-deep ring of `toolName(inputPreview)` labels.
  */
-export type FeedEvent = StampedProgressEvent | RunStartLine | RunEndLine;
+export interface AgentStatsLine {
+	type: "agent:stats";
+	label: string;
+	sessionID: string;
+	tokens: {
+		input: number;
+		output: number;
+		reasoning: number;
+		cacheRead: number;
+		cacheWrite: number;
+	};
+	toolCalls: number;
+	lastTools: string[];
+	at: number;
+}
+
+/**
+ * One line in the feed file: an engine-stamped progress event, one of the two
+ * run-lifecycle lines, or a throttled per-agent stats line. Every member carries
+ * `at` (engine wall-clock), so a tail reader can order by emission time without a
+ * separate timestamp column.
+ */
+export type FeedEvent =
+	| StampedProgressEvent
+	| RunStartLine
+	| RunEndLine
+	| AgentStatsLine;
 
 /** The minimal fs surface the feed writer uses. Defaults to `node:fs/promises`. */
 export interface FeedFs {

@@ -1761,3 +1761,135 @@ describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
 		await engine.dispose();
 	});
 });
+
+// ---- Task 8.1.3: session stats collector → throttled agent:stats feed lines ---
+
+/** A synthetic `message.updated` for an assistant message with explicit tokens. */
+function msgUpdated(
+	sessionID: string,
+	messageID: string,
+	tokens: {
+		input: number;
+		output: number;
+		reasoning: number;
+		cache: { read: number; write: number };
+	},
+	// biome-ignore lint/suspicious/noExplicitAny: the collector reads a structural slice only.
+): any {
+	return {
+		type: "message.updated",
+		properties: {
+			info: { id: messageID, sessionID, role: "assistant", tokens },
+		},
+	};
+}
+
+/** A synthetic completed `message.part.updated` tool part. */
+function toolPart(
+	sessionID: string,
+	partID: string,
+	tool: string,
+	// biome-ignore lint/suspicious/noExplicitAny: structural slice only.
+): any {
+	return {
+		type: "message.part.updated",
+		properties: {
+			part: {
+				id: partID,
+				sessionID,
+				messageID: "msg_x",
+				type: "tool",
+				callID: `call_${partID}`,
+				tool,
+				state: { status: "completed", input: {} },
+			},
+		},
+	};
+}
+
+describe("createWorkflowEngine — session stats → agent:stats feed (Task 8.1.3)", () => {
+	test("a launched child's token/tool stats emit throttled agent:stats lines, and stop after settle", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_stats001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("do work", { label: "worker" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		// After flush the agent has launched: agent:launched fired through the choke
+		// point, so the child session is REGISTERED with the collector.
+		await flush();
+		const child = sessions[0] as string;
+
+		// First stats change → emits one agent:stats (no prior emission this window).
+		engine.handleEvent(
+			msgUpdated(child, "msg_1", {
+				input: 100,
+				output: 10,
+				reasoning: 0,
+				cache: { read: 0, write: 0 },
+			}),
+		);
+		// A second change WITHIN the 2000ms window must be throttled (no new line).
+		bump(500);
+		engine.handleEvent(toolPart(child, "prt_1", "bash"));
+		// A third change PAST the window emits again.
+		bump(2000);
+		engine.handleEvent(toolPart(child, "prt_2", "read"));
+		await flush();
+
+		const stats = readFeed(files, "wf_stats001").filter(
+			(l) => l.type === "agent:stats",
+		);
+		// Exactly two emissions: window 1 (the token update) and window 2 (past 2s).
+		expect(stats).toHaveLength(2);
+		// Each carries the session↔label binding and the rolled-up snapshot.
+		expect(stats[0]?.sessionID).toBe(child);
+		expect(stats[0]?.label).toBe("worker");
+		expect(stats[0]?.tokens).toEqual({
+			input: 100,
+			output: 10,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+		// The second line reflects the accumulated tool calls (the throttled bash +
+		// the windowed read both counted in the collector by emit time).
+		expect(stats[1]?.toolCalls).toBe(2);
+		expect(stats[1]?.lastTools).toEqual(["bash({})", "read({})"]);
+		// agent:stats is feed-only — it never lands in handle.progress.
+		const progress = engine.statusOf(handle.runId)?.progress ?? [];
+		expect(
+			progress.some((e) => (e as { type: string }).type === "agent:stats"),
+		).toBe(false);
+
+		// Complete the run; the child unregisters at agent:end.
+		bump(6000);
+		await driveIdle(engine, child, bump);
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// A post-settle event for the now-unregistered child emits nothing further.
+		const before = readFeed(files, "wf_stats001").filter(
+			(l) => l.type === "agent:stats",
+		).length;
+		engine.handleEvent(toolPart(child, "prt_3", "grep"));
+		await flush();
+		const after = readFeed(files, "wf_stats001").filter(
+			(l) => l.type === "agent:stats",
+		).length;
+		expect(after).toBe(before);
+
+		await engine.dispose();
+	});
+});

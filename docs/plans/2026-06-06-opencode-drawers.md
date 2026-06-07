@@ -1156,7 +1156,7 @@ interface SessionRunner {
 
 #### Task 8.1.3: Session stats collector — tokens + tool calls from the SDK event bus
 
-- [ ] Done
+- [x] Done
 
 **Context:** the plugin's `event` hook forwards every SDK event to `engine.handleEvent` (`packages/workflows/src/plugin/index.ts:107-108`), which today only forwards to the runner's completion gate (`engine.ts:225-226,760`). `message.updated` events carry the full v1 `AssistantMessage` including `tokens { input, output, reasoning, cache { read, write } }` (`.references/opencode/packages/sdk/js/src/gen/types.gen.ts:112-141`); `message.part.updated` carries `ToolPart { tool, callID, state }` with `state.input` (`types.gen.ts:294-305`). Events fire for ALL sessions including workflow children — the data for live per-agent stats already flows through the engine and is discarded.
 

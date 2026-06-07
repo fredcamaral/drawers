@@ -60,6 +60,10 @@ import { createTokenBudget, type TokenBudget } from "./budget";
 import { createFeedWriter, type FeedFs, type FeedWriter } from "./feed";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
+import {
+	createSessionStatsCollector,
+	type SessionStatsCollector,
+} from "./session-stats";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
 export interface EngineLogger {
@@ -248,6 +252,15 @@ const SUBDIR_RUNS = "workflow-runs";
 const SUBDIR_SCRIPTS = "workflow-scripts";
 const SUBDIR_JOURNALS = "workflow-journals";
 const SUBDIR_FEED = "workflow-feed";
+
+/**
+ * Minimum gap between throttled `agent:stats` feed lines for one session (Task
+ * 8.1.3). `message.updated` fires per streamed token, so an unthrottled emit
+ * would flood the feed; one line per session per window is plenty for a tailing
+ * TUI viewer. The status tool reads collector snapshots directly, so it is never
+ * throttle-bound.
+ */
+const STATS_THROTTLE_MS = 2000;
 
 /**
  * Adapt the engine's {@link FsFacade} to the {@link JournalFs} the journal needs.
@@ -454,6 +467,21 @@ export function createWorkflowEngine(
 	// reachable by stopRun for the cancel `run:end` line; dropped when the run
 	// settles (the writer holds only a serialized promise chain, no live handle).
 	const feeds = new Map<string, FeedWriter>();
+
+	// ONE session-stats collector per engine (Task 8.1.3): handleEvent folds every
+	// SDK event into the matching CHILD session's token/tool stats (unregistered
+	// sessions are dropped at the first map lookup, so non-workflow traffic costs
+	// one Map.has). Registered on the choke-point sighting of `agent:launched`,
+	// unregistered on `agent:end`.
+	const stats: SessionStatsCollector = createSessionStatsCollector({ clock });
+	// Per-session binding for the throttled `agent:stats` feed line: which run's
+	// feed to write to, the agent's display label, and the last emission time so a
+	// stats change emits at most once per STATS_THROTTLE_MS window. Cleared on
+	// `agent:end`.
+	const statsBindings = new Map<
+		string,
+		{ runId: string; label: string; lastEmittedAt: number }
+	>();
 
 	// (4) The terminal-notice queue. markNotified flips + re-persists the record.
 	const queue = createNotificationQueue({
@@ -694,6 +722,23 @@ export function createWorkflowEngine(
 				// Stamp at the ENGINE boundary (Task 6.2.1): the runtime stays clock-free;
 				// the timestamp comes from the engine's injected clock here.
 				const stamped = { ...e, at: clock.now() };
+				// Bind/unbind the session-stats collector at the choke point (Task
+				// 8.1.3): a launched session starts being tracked the instant it exists,
+				// and stops at its end. The stats themselves are harvested from the SDK
+				// event stream (see handleEvent), not from these lifecycle events.
+				if (e.type === "agent:launched") {
+					stats.register(e.sessionID, { runId, label: e.label });
+					statsBindings.set(e.sessionID, {
+						runId,
+						label: e.label,
+						// Seed lastEmittedAt in the past so the first real stats change
+						// emits immediately (no initial throttle penalty).
+						lastEmittedAt: Number.NEGATIVE_INFINITY,
+					});
+				} else if (e.type === "agent:end" && e.sessionID !== undefined) {
+					stats.unregister(e.sessionID);
+					statsBindings.delete(e.sessionID);
+				}
 				handle.progress.push(stamped);
 				// Mirror onto the live feed (Task 8.1.2): one source of truth for the
 				// status tool (handle.progress) and the TUI viewer (the feed file).
@@ -807,6 +852,49 @@ export function createWorkflowEngine(
 		void finalizeFeed(runId, { status: "cancelled" });
 	}
 
+	/**
+	 * Fold one SDK event into per-agent stats (Task 8.1.3), maybe-emit a throttled
+	 * `agent:stats` feed line, THEN forward to the runner's completion gate. The
+	 * stats fold is fenced — a telemetry hiccup never blocks the gate forward, the
+	 * sole load-bearing path. `agent:stats` is feed-only; it is NOT pushed to
+	 * `handle.progress` (the status tool reads collector snapshots directly).
+	 */
+	async function handleEvent(
+		event: Parameters<SessionRunner["handleEvent"]>[0],
+	): Promise<void> {
+		try {
+			const sessionID = stats.handleEvent(event);
+			if (sessionID !== undefined) {
+				const binding = statsBindings.get(sessionID);
+				const now = clock.now();
+				if (
+					binding !== undefined &&
+					now - binding.lastEmittedAt >= STATS_THROTTLE_MS
+				) {
+					const snap = stats.snapshot(sessionID);
+					const feed = feeds.get(binding.runId);
+					if (snap !== undefined && feed !== undefined) {
+						binding.lastEmittedAt = now;
+						feed.append({
+							type: "agent:stats",
+							label: binding.label,
+							sessionID,
+							tokens: snap.tokens,
+							toolCalls: snap.toolCalls,
+							lastTools: snap.lastTools,
+							at: now,
+						});
+					}
+				}
+			}
+		} catch (err) {
+			logger?.error("session stats fold failed", {
+				err: err instanceof Error ? err.message : String(err),
+			});
+		}
+		await runner.handleEvent(event);
+	}
+
 	function statusOf(runId: string): RunHandle | undefined {
 		return runs.get(runId);
 	}
@@ -857,7 +945,7 @@ export function createWorkflowEngine(
 		stopRun,
 		statusOf,
 		liveRunsFor,
-		handleEvent: (event) => runner.handleEvent(event),
+		handleEvent,
 		dispose: async () => {
 			await readyPromise;
 			await runner.dispose();
