@@ -19,8 +19,13 @@ import type { StampedProgressEvent } from "../../runtime/types";
 import type { RunHandle, RunRecord, WorkflowEngine } from "../engine";
 import { humanizeDuration } from "../format";
 
-/** Head-truncation ceiling for the rendered result JSON. */
+/** Head-truncation ceiling for the rendered result JSON (default, no-`full` view). */
 const RESULT_MAX = 2000;
+/**
+ * Hard ceiling on the `full:true` result JSON (Task 7.2.2). Only a pathological
+ * size triggers it; the cut is NEVER silent — a trailer names the on-disk path.
+ */
+const FULL_RESULT_MAX = 200_000;
 /** Group label for agents emitted without a phase. */
 const NO_PHASE = "(no phase)";
 
@@ -63,6 +68,22 @@ function coerceWaitMs(raw: unknown): number {
 	return Math.min(Math.floor(n), WAIT_MS_CAP);
 }
 
+/**
+ * Coerce `full` to a boolean (Task 7.2.2). opencode's raw execute path applies no
+ * Zod coercion, so the arg may arrive as a real boolean, the string `"true"`/
+ * `"false"`, or absent — `true`/`"true"`/`"1"` are truthy, everything else false.
+ */
+function coerceFull(raw: unknown): boolean {
+	if (raw === true) {
+		return true;
+	}
+	if (typeof raw === "string") {
+		const v = raw.trim().toLowerCase();
+		return v === "true" || v === "1";
+	}
+	return false;
+}
+
 /** Resolve after `ms`, never rejecting — the loser of the settle race. */
 function timeout(ms: number): Promise<void> {
 	return new Promise((resolve) => {
@@ -90,13 +111,69 @@ function unknownText(engine: WorkflowEngine, runId: string): string {
 	return `unknown run_id ${runId}. Known runs: ${list}`;
 }
 
-/** Truncate the result JSON at RESULT_MAX, appending a marker when cut. */
-function renderResult(returnValue: unknown): string {
-	const json = JSON.stringify(returnValue) ?? "undefined";
-	if (json.length <= RESULT_MAX) {
+/**
+ * Derive the on-disk run-record path from the record's `scriptPath` (Task 7.2.2).
+ * The engine builds both under the same data dir — `workflow-scripts/<id>.js` and
+ * `workflow-runs/<id>.json` — so the runs path is the script path with the subdir
+ * and extension swapped. Truthful when the swap pattern holds; otherwise falls
+ * back to the generic on-disk description the spec sanctions.
+ */
+function runsPathFor(record: RunRecord): string {
+	const swapped = record.scriptPath
+		.replace("/workflow-scripts/", "/workflow-runs/")
+		.replace(/\.js$/, ".json");
+	if (swapped !== record.scriptPath && swapped.endsWith(`${record.id}.json`)) {
+		return swapped;
+	}
+	// Couldn't derive truthfully — name the shape without lying about the dir.
+	return "the run record on disk (workflow-runs/<id>.json under the drawers data dir)";
+}
+
+/**
+ * Render the completed run's result. Default view: a 2000-char head preview with a
+ * `(truncated)` marker (Task 4.1.3). `full:true` (Task 7.2.2): the COMPLETE JSON,
+ * with a 200k safety ceiling whose cut is NEVER silent — a trailer names the
+ * on-disk path so the full value is always recoverable.
+ */
+function renderResult(record: RunRecord, full: boolean): string {
+	const json = JSON.stringify(record.returnValue) ?? "undefined";
+	if (!full) {
+		if (json.length <= RESULT_MAX) {
+			return `result: ${json}`;
+		}
+		return `result: ${json.slice(0, RESULT_MAX)} … (truncated)`;
+	}
+	if (json.length <= FULL_RESULT_MAX) {
 		return `result: ${json}`;
 	}
-	return `result: ${json.slice(0, RESULT_MAX)} … (truncated)`;
+	// Pathological size: cut at the ceiling but say so explicitly and point at disk.
+	return (
+		`result: ${json.slice(0, FULL_RESULT_MAX)} … (result exceeds 200k chars; ` +
+		`full JSON at ${runsPathFor(record)})`
+	);
+}
+
+/**
+ * Render the persisted per-agent diagnostics block (Task 7.2.1/7.2.2), shown only
+ * under `full:true`. One line per diagnostic: reason, label, index, child session,
+ * and the captured raw text (already capped at capture time). Returns an empty
+ * array when the record carries no diagnostics.
+ */
+function renderDiagnostics(record: RunRecord): string[] {
+	const diags = record.diagnostics;
+	if (diags === undefined || diags.length === 0) {
+		return [];
+	}
+	const lines: string[] = ["", "diagnostics:"];
+	for (const d of diags) {
+		const session =
+			d.childSessionID !== undefined ? ` session=${d.childSessionID}` : "";
+		lines.push(`  [${d.reason}] ${d.label} (#${d.index})${session}`);
+		if (d.rawText !== undefined) {
+			lines.push(`    raw: ${d.rawText}`);
+		}
+	}
+	return lines;
 }
 
 /**
@@ -109,8 +186,11 @@ function renderResult(returnValue: unknown): string {
  */
 function pairStartsToEnds(
 	progress: StampedProgressEvent[],
-): Map<number, { status?: string; elapsedMs?: number }> {
-	const result = new Map<number, { status?: string; elapsedMs?: number }>();
+): Map<number, { status?: string; elapsedMs?: number; note?: string }> {
+	const result = new Map<
+		number,
+		{ status?: string; elapsedMs?: number; note?: string }
+	>();
 	// Per label: a FIFO of open start indices awaiting an end.
 	const open = new Map<string, number[]>();
 	progress.forEach((e, i) => {
@@ -127,6 +207,9 @@ function pairStartsToEnds(
 				result.set(startIdx, {
 					status: e.status,
 					elapsedMs: start !== undefined ? e.at - start.at : undefined,
+					// Task 7.2.1: carry the diagnostic note so the render can show WHY a
+					// call degraded, right under its marker line.
+					...(e.note !== undefined ? { note: e.note } : {}),
 				});
 			}
 		}
@@ -161,6 +244,16 @@ function renderProgress(progress: StampedProgressEvent[]): string[] {
 						? ` (${humanizeDuration(match.elapsedMs)})`
 						: "";
 				lines.push(`  [${marker}] ${e.label}${suffix}`);
+				// Task 7.2.1: the diagnostic note renders on its own line right after the
+				// duration — `⚠ empty output` for an empty result, the typed reason note
+				// (e.g. `null — schema_invalid: …; raw 6.3k chars preserved`) otherwise.
+				if (match?.note !== undefined) {
+					const noteLine =
+						match.note === "empty output"
+							? "    ⚠ empty output"
+							: `    ${match.note}`;
+					lines.push(noteLine);
+				}
 				break;
 			}
 			case "agent:end":
@@ -286,8 +379,9 @@ function liveTitle(handle: RunHandle, nowMs: number): string {
 	return segments.join(" · ");
 }
 
-/** Render the full status text for one run handle. */
-function render(handle: RunHandle): string {
+/** Render the full status text for one run handle. `full` (Task 7.2.2) → the
+ * complete untruncated result + per-agent diagnostics. */
+function render(handle: RunHandle, full: boolean): string {
 	const record: RunRecord = handle.record;
 	const terminal = record.status !== "running";
 
@@ -328,9 +422,17 @@ function render(handle: RunHandle): string {
 	}
 
 	if (record.status === "completed") {
-		parts.push("", renderResult(record.returnValue));
+		parts.push("", renderResult(record, full));
+		// Task 7.2.2: under `full`, append the persisted per-agent diagnostics so the
+		// whole post-mortem is readable through the tool — no shell access required.
+		if (full) {
+			parts.push(...renderDiagnostics(record));
+		}
 	} else if (record.status === "error") {
 		parts.push("", `error: ${record.error ?? "(no message)"}`);
+		if (full) {
+			parts.push(...renderDiagnostics(record));
+		}
 	}
 
 	// On a TERMINAL run, summarize the cache efficiency — how many agent() calls
@@ -362,7 +464,9 @@ export function createWorkflowStatusTool(
 			"this to read progress or the final result on demand. Optionally pass " +
 			"`wait_ms` to BLOCK (up to 120000ms) until the run settles before " +
 			"rendering — useful in a single-turn/headless context where there is no " +
-			"completion notification to re-invoke you.",
+			"completion notification to re-invoke you. Pass `full: true` to get the " +
+			"COMPLETE, untruncated result (plus per-agent diagnostics) instead of the " +
+			"2000-char preview — no shell access to the run files needed.",
 		args: {
 			run_id: tool.schema
 				.string()
@@ -373,6 +477,13 @@ export function createWorkflowStatusTool(
 				.describe(
 					"Block up to this many ms (capped at 120000) for a LIVE run to settle " +
 						"before rendering. Omit or 0 to read the current snapshot immediately.",
+				),
+			full: tool.schema
+				.boolean()
+				.optional()
+				.describe(
+					"Return the COMPLETE returnValue JSON (and per-agent diagnostics) " +
+						"untruncated, instead of the default 2000-char preview.",
 				),
 		},
 		async execute(args, context: ToolContext) {
@@ -418,7 +529,7 @@ export function createWorkflowStatusTool(
 					clearIntervalFn(ticker);
 				}
 			}
-			return render(handle);
+			return render(handle, coerceFull(args.full));
 		},
 	});
 }

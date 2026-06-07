@@ -54,13 +54,19 @@ export function createStructuredOutputTool(registry: SchemaRegistry) {
 			try {
 				parsed = JSON.parse(raw);
 			} catch (err) {
-				return `could not parse result as JSON — fix and call structured_output again: ${
-					err instanceof Error ? err.message : String(err)
-				}`;
+				const detail = err instanceof Error ? err.message : String(err);
+				// Task 7.2.1: a parse failure means the tool WAS called but yielded no
+				// stored value — record it so agent-call resolves schema_invalid (not
+				// schema_no_call) when the turn completes with nothing stored.
+				registry.recordFailure(sessionID, `JSON parse failed: ${detail}`);
+				return `could not parse result as JSON — fix and call structured_output again: ${detail}`;
 			}
 
 			const verdict = schema.validate(parsed);
 			if (!verdict.ok) {
+				// Task 7.2.1: record the rejection so a completed-but-unstored turn is
+				// diagnosed as schema_invalid (tool called, validation failed).
+				registry.recordFailure(sessionID, verdict.errors);
 				return VALIDATION_RETRY_PREFIX + verdict.errors;
 			}
 

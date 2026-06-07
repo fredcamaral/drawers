@@ -22,6 +22,17 @@ export interface SchemaRegistry {
 	 * that value is `undefined`) from "nothing was ever stored".
 	 */
 	resultFor(sessionID: string): { present: boolean; value?: unknown };
+	/**
+	 * Record the LAST schema-validation failure for a session (Task 7.2.1). The
+	 * `structured_output` tool validates BEFORE storing, so a completed turn with
+	 * `resultFor().present === false` is ambiguous: the tool was either never
+	 * called (`schema_no_call`) or called and rejected every time (`schema_invalid`).
+	 * Recording the rejection reason here lets `agent-call` tell the two apart for
+	 * its typed diagnostic instead of guessing.
+	 */
+	recordFailure(sessionID: string, errors: string): void;
+	/** The last recorded validation-failure reason, or undefined if none. */
+	lastFailure(sessionID: string): string | undefined;
 	clear(sessionID: string): void;
 }
 
@@ -30,6 +41,9 @@ export function createSchemaRegistry(): SchemaRegistry {
 	// A stored result lives here; membership in the Map is the `present` flag, so a
 	// stored `undefined` is distinguishable from a never-stored session.
 	const results = new Map<string, unknown>();
+	// The last validation-failure reason per session (Task 7.2.1) — the signal that
+	// disambiguates schema_no_call from schema_invalid in agent-call's diagnostic.
+	const failures = new Map<string, string>();
 
 	return {
 		register(sessionID, schema) {
@@ -47,9 +61,16 @@ export function createSchemaRegistry(): SchemaRegistry {
 			}
 			return { present: false };
 		},
+		recordFailure(sessionID, errors) {
+			failures.set(sessionID, errors);
+		},
+		lastFailure(sessionID) {
+			return failures.get(sessionID);
+		},
 		clear(sessionID) {
 			schemas.delete(sessionID);
 			results.delete(sessionID);
+			failures.delete(sessionID);
 		},
 	};
 }

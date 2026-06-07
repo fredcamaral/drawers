@@ -4,10 +4,13 @@ import type { SchemaRegistry } from "./structured/registry";
 import { compileSchema } from "./structured/validate";
 import {
 	AgentCapError,
+	type AgentDiagnostic,
 	type AgentFn,
 	type AgentOpts,
 	BudgetExhaustedError,
 	type BudgetView,
+	type DiagnosticEmitter,
+	type DiagnosticReason,
 	type JournalEntry,
 	type ProgressEmitter,
 } from "./types";
@@ -39,6 +42,10 @@ const AGENT_LIFETIME_CAP = 1_000;
 const DEFAULT_AWAIT_TIMEOUT_MS = 1_800_000;
 /** Label fallback length when no `opts.label` is given. */
 const LABEL_PREFIX_LEN = 60;
+/** Cap on captured raw final text in a diagnostic (Task 7.2.1). */
+const RAW_TEXT_CAP = 20_000;
+/** Marker appended when raw-text capture is truncated. */
+const RAW_TEXT_CAP_MARKER = "…[capped]";
 
 /** Everything the `agent()` primitive needs from the surrounding runtime. */
 export interface AgentPrimitiveDeps {
@@ -52,6 +59,14 @@ export interface AgentPrimitiveDeps {
 	counters: { agents: number };
 	budget: BudgetView;
 	emit: ProgressEmitter;
+	/**
+	 * Post-mortem diagnostic sink (Task 7.2.1). Invoked when a call degrades to
+	 * `null`/`""` with a typed reason (and, for schema reasons, the captured raw
+	 * final text). Optional and observational — `agent()` still returns bare
+	 * null/"" to the script regardless. The engine collects these onto the run
+	 * handle and persists them on the run record.
+	 */
+	onDiagnostic?: DiagnosticEmitter;
 	/** The active progress phase, when no per-call `opts.phase` is given. */
 	currentPhase: () => string | undefined;
 	/** Live task ids, so abort() (Task 3.2.3) can cancel in-flight work. */
@@ -115,6 +130,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		counters,
 		budget,
 		emit,
+		onDiagnostic,
 		currentPhase,
 		liveTasks,
 		defaults,
@@ -124,6 +140,66 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		callIndex,
 	} = deps;
 	const awaitTimeoutMs = defaults.awaitTimeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS;
+
+	/**
+	 * Capture a child's raw final text for a diagnostic (Task 7.2.1), capped at
+	 * {@link RAW_TEXT_CAP} with a marker. FENCED: a readOutput throw must never mask
+	 * the original null flow — it resolves to `undefined` (no rawText) instead.
+	 */
+	async function captureRawText(taskId: string): Promise<string | undefined> {
+		try {
+			const { summaryText } = await runner.readOutput(taskId);
+			if (summaryText.length <= RAW_TEXT_CAP) {
+				return summaryText;
+			}
+			return summaryText.slice(0, RAW_TEXT_CAP) + RAW_TEXT_CAP_MARKER;
+		} catch {
+			// Capture is best-effort observability; never propagate its failure.
+			return undefined;
+		}
+	}
+
+	/** Build the short human note rendered on the `agent:end` progress event. */
+	function diagnosticNote(reason: DiagnosticReason, rawLen?: number): string {
+		if (reason === "empty_output") {
+			return "empty output";
+		}
+		const raw =
+			rawLen !== undefined ? `; raw ${humanizeChars(rawLen)} preserved` : "";
+		return `null — ${reason}${raw}`;
+	}
+
+	/**
+	 * Classify a settled call into a typed degrade reason (Task 7.2.1), or
+	 * `undefined` when the call succeeded (non-empty result). Reads the registry's
+	 * recorded validation failure to split `schema_no_call` from `schema_invalid` —
+	 * the registry validates BEFORE storing, so an unstored completed structured
+	 * turn is either "never called" (no failure recorded) or "called and rejected"
+	 * (failure recorded). Runs in the try body, BEFORE the finally clears the
+	 * registry, so the failure record is still readable.
+	 */
+	function classifyDegrade(
+		structured: boolean,
+		status: string,
+		result: unknown,
+		sessionId: string | undefined,
+	): DiagnosticReason | undefined {
+		// A non-completed terminal status degrades regardless of structured-ness.
+		if (status !== "completed") {
+			return status === "cancelled" ? "status_cancelled" : "status_error";
+		}
+		if (structured) {
+			// Completed structured turn with a stored value → success.
+			if (result !== null && result !== undefined) {
+				return undefined;
+			}
+			const recorded =
+				sessionId !== undefined ? registry.lastFailure(sessionId) : undefined;
+			return recorded !== undefined ? "schema_invalid" : "schema_no_call";
+		}
+		// Plain completed turn: empty final text is the only degrade.
+		return result === "" ? "empty_output" : undefined;
+	}
 
 	// Index → journaled entry. Concurrent agents record into the journal in
 	// COMPLETION order, not call-index order, so a positional `entries[index]`
@@ -219,6 +295,9 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		let taskId: string | undefined;
 		let sessionId: string | undefined;
 		let status = "error";
+		// Carried into the finally so the single `agent:end` emit can attach the
+		// diagnostic note (Task 7.2.1) — set on any null/empty collapse below.
+		let endNote: string | undefined;
 		try {
 			// 6. Announce the start once the slot is held.
 			emit({ type: "agent:start", label, phase });
@@ -268,6 +347,36 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			} else {
 				result = null;
 			}
+
+			// Task 7.2.1: classify any null/empty collapse into a typed diagnostic,
+			// capture the raw final text for schema reasons, and carry a short note
+			// for `agent:end`. Script-visible semantics are untouched — `result` is
+			// returned as-is (bare null/"").
+			const reason = classifyDegrade(
+				compiled !== undefined,
+				done.status,
+				result,
+				sessionId,
+			);
+			if (reason !== undefined) {
+				// Schema reasons capture the child's raw final text (fenced); a
+				// non-completed status or empty output has no useful capture target.
+				const rawText =
+					(reason === "schema_no_call" || reason === "schema_invalid") &&
+					taskId !== undefined
+						? await captureRawText(taskId)
+						: undefined;
+				endNote = diagnosticNote(reason, rawText?.length);
+				const diagnostic: AgentDiagnostic = {
+					label,
+					index,
+					reason,
+					...(rawText !== undefined ? { rawText } : {}),
+					...(sessionId !== undefined ? { childSessionID: sessionId } : {}),
+				};
+				onDiagnostic?.(diagnostic);
+			}
+
 			// Spec §7: only SETTLED non-null results are journaled — a failed/null
 			// agent must re-run on resume, not replay its failure.
 			if (result !== null && result !== undefined) {
@@ -281,6 +390,15 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				type: "warn",
 				message: `agent '${label}' failed: ${describeError(err)}`,
 			});
+			// Task 7.2.1: a throw before/around completion is `await_failed`. No raw
+			// capture — the child may not have a usable session/transcript.
+			endNote = diagnosticNote("await_failed");
+			onDiagnostic?.({
+				label,
+				index,
+				reason: "await_failed",
+				...(sessionId !== undefined ? { childSessionID: sessionId } : {}),
+			});
 			return null;
 		} finally {
 			// 9. Release the slot and drop the live task on EVERY path.
@@ -292,8 +410,14 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			if (sessionId !== undefined) {
 				registry.clear(sessionId);
 			}
-			// 11. Announce the end with the resolved status.
-			emit({ type: "agent:end", label, status });
+			// 11. Announce the end with the resolved status (and the diagnostic note,
+			// when this call degraded — Task 7.2.1).
+			emit({
+				type: "agent:end",
+				label,
+				status,
+				...(endNote !== undefined ? { note: endNote } : {}),
+			});
 		}
 	};
 
@@ -331,6 +455,14 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		const second = registry.resultFor(sessionId);
 		return second.present ? second.value : null;
 	}
+}
+
+/** Compact char-count for a diagnostic note: `6.3k` over 1000, else the integer. */
+function humanizeChars(n: number): string {
+	if (n >= 1000) {
+		return `${(n / 1000).toFixed(1)}k chars`;
+	}
+	return `${n} chars`;
 }
 
 /** Best-effort human-readable detail for a thrown value. */

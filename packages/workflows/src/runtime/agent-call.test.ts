@@ -17,6 +17,7 @@ import {
 import { SchemaCompileError } from "./structured/validate";
 import {
 	AgentCapError,
+	type AgentDiagnostic,
 	BudgetExhaustedError,
 	type BudgetView,
 	type JournalEntry,
@@ -193,10 +194,12 @@ interface HarnessOverrides {
 	};
 	prefixIntact?: { value: boolean };
 	callIndex?: { value: number };
+	onDiagnostic?: (d: AgentDiagnostic) => void;
 }
 
 function harness(overrides: HarnessOverrides = {}) {
 	const events: ProgressEvent[] = [];
+	const diags: AgentDiagnostic[] = [];
 	const runner = overrides.runner ?? new FakeRunner();
 	const gate =
 		overrides.gate ?? new ConcurrencyManager({ defaultConcurrency: 5 });
@@ -220,10 +223,13 @@ function harness(overrides: HarnessOverrides = {}) {
 		replay: overrides.replay,
 		prefixIntact,
 		callIndex,
+		onDiagnostic:
+			overrides.onDiagnostic ?? ((d: AgentDiagnostic) => diags.push(d)),
 	});
 	return {
 		agent,
 		events,
+		diags,
 		runner,
 		gate,
 		counters,
@@ -372,6 +378,141 @@ describe("createAgentPrimitive — structured output (schema)", () => {
 		await agent("do it", { schema: SCHEMA });
 		expect(registry.lookup("ses_c")).toBeUndefined();
 		expect(registry.resultFor("ses_c").present).toBe(false);
+	});
+});
+
+describe("createAgentPrimitive — diagnostics (Task 7.2.1)", () => {
+	const SCHEMA = {
+		type: "object",
+		properties: { n: { type: "number" } },
+		required: ["n"],
+	} as const;
+
+	test("error status → status_error diagnostic + agent:end note; agent() still null", async () => {
+		const runner = new FakeRunner({ status: "error" });
+		const { agent, diags, events } = harness({ runner });
+		expect(await agent("do it", { label: "L" })).toBeNull();
+		expect(diags).toHaveLength(1);
+		expect(diags[0]).toMatchObject({
+			label: "L",
+			index: 0,
+			reason: "status_error",
+		});
+		const end = events.find((e) => e.type === "agent:end");
+		expect(end?.type === "agent:end" && end.note).toContain("status_error");
+	});
+
+	test("cancelled status → status_cancelled diagnostic", async () => {
+		const runner = new FakeRunner({ status: "cancelled" });
+		const { agent, diags } = harness({ runner });
+		expect(await agent("do it")).toBeNull();
+		expect(diags[0]?.reason).toBe("status_cancelled");
+	});
+
+	test("launch throw → await_failed diagnostic, no childSessionID", async () => {
+		const runner = new FakeRunner({ launchThrows: new Error("spawn failed") });
+		const { agent, diags } = harness({ runner });
+		expect(await agent("do it")).toBeNull();
+		expect(diags[0]?.reason).toBe("await_failed");
+		expect(diags[0]?.childSessionID).toBeUndefined();
+	});
+
+	test("awaitCompletion throw → await_failed diagnostic", async () => {
+		const runner = new FakeRunner({ awaitThrows: new Error("timeout") });
+		const { agent, diags } = harness({ runner });
+		expect(await agent("do it")).toBeNull();
+		expect(diags[0]?.reason).toBe("await_failed");
+	});
+
+	test("completed but empty final text → empty_output diagnostic + note; agent() returns ''", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "" });
+		const { agent, diags, events } = harness({ runner });
+		expect(await agent("do it")).toBe("");
+		expect(diags[0]?.reason).toBe("empty_output");
+		const end = events.find((e) => e.type === "agent:end");
+		expect(end?.type === "agent:end" && end.note).toContain("empty output");
+	});
+
+	test("structured: tool never called → schema_no_call + raw text captured", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_nc",
+			summaryText: "I forgot to call the tool, here is prose instead.",
+		});
+		const { agent, diags } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(diags[0]?.reason).toBe("schema_no_call");
+		expect(diags[0]?.rawText).toContain("prose instead");
+		expect(diags[0]?.childSessionID).toBe("ses_nc");
+	});
+
+	test("structured: tool called but rejected → schema_invalid + raw text captured", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_inv",
+			summaryText: "my final prose",
+			// Simulate the tool having recorded a validation rejection.
+			onLaunched: (sid) => registry.recordFailure(sid, "missing required 'n'"),
+		});
+		const { agent, diags } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(diags[0]?.reason).toBe("schema_invalid");
+		expect(diags[0]?.rawText).toContain("my final prose");
+	});
+
+	test("raw text capture is capped at 20_000 chars with a marker", async () => {
+		const registry = createSchemaRegistry();
+		const huge = "x".repeat(25_000);
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_big",
+			summaryText: huge,
+		});
+		const { agent, diags } = harness({ runner, registry });
+		await agent("do it", { schema: SCHEMA });
+		const raw = diags[0]?.rawText ?? "";
+		expect(raw.length).toBeLessThanOrEqual(20_000 + "…[capped]".length);
+		expect(raw).toContain("…[capped]");
+		expect(raw.startsWith("x".repeat(100))).toBe(true);
+	});
+
+	test("a readOutput throw during capture does not mask the null flow", async () => {
+		const registry = createSchemaRegistry();
+		class ThrowingReadRunner extends FakeRunner {
+			override async readOutput(): Promise<never> {
+				throw new Error("readOutput exploded");
+			}
+		}
+		const runner = new ThrowingReadRunner({
+			status: "completed",
+			sessionID: "ses_thr",
+		});
+		const { agent, diags } = harness({ runner, registry });
+		// The original schema_no_call flow still resolves null; capture is fenced.
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(diags[0]?.reason).toBe("schema_no_call");
+		expect(diags[0]?.rawText).toBeUndefined();
+	});
+
+	test("a completed non-empty plain result emits NO diagnostic", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
+		const { agent, diags } = harness({ runner });
+		expect(await agent("do it")).toBe("ok");
+		expect(diags).toHaveLength(0);
+	});
+
+	test("a successful structured result emits NO diagnostic", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_ok",
+			onLaunched: () => registry.store("ses_ok", { n: 1 }),
+		});
+		const { agent, diags } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toEqual({ n: 1 });
+		expect(diags).toHaveLength(0);
 	});
 });
 

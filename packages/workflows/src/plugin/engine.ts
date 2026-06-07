@@ -51,6 +51,7 @@ import {
 	type SchemaRegistry,
 } from "../runtime/structured/registry";
 import type {
+	AgentDiagnostic,
 	BudgetView,
 	JournalEntry,
 	StampedProgressEvent,
@@ -94,6 +95,13 @@ export interface RunRecord {
 	budgetTotal?: number;
 	/** Output tokens spent at settle, when a budget was set (Task 4.3.1). */
 	budgetSpent?: number;
+	/**
+	 * Typed diagnostics for every `agent()` call that degraded to `null`/`""`
+	 * (Task 7.2.1) — collected from the run's `onDiagnostic` hook and persisted at
+	 * settle so a finished run is post-mortem-debuggable from the record alone.
+	 * Absent when the run had no degraded calls.
+	 */
+	diagnostics?: AgentDiagnostic[];
 }
 
 /** In-memory handle for a run: live run (absent for recovered records), record, progress. */
@@ -606,6 +614,10 @@ export function createWorkflowEngine(
 		// the turn ends; an unflushed journal means a later resume replays nothing).
 		const journalWrites: Promise<void>[] = [];
 
+		// Task 7.2.1: collect each null/empty agent diagnostic; persisted on the
+		// record at settle so a finished run is debuggable without SQLite.
+		const diagnostics: AgentDiagnostic[] = [];
+
 		const run = createWorkflowRun({
 			runner,
 			parentSessionID: args.parentSessionID,
@@ -620,6 +632,11 @@ export function createWorkflowEngine(
 				// the timestamp comes from the engine's injected clock here.
 				handle.progress.push({ ...e, at: clock.now() });
 				logger?.debug("workflow progress", { runId, event: e });
+			},
+			// Task 7.2.1: collect typed diagnostics for null/empty agent calls.
+			onDiagnostic: (d) => {
+				diagnostics.push(d);
+				logger?.debug("workflow diagnostic", { runId, diagnostic: d });
 			},
 			replay: {
 				entries: resolved.entries,
@@ -658,6 +675,9 @@ export function createWorkflowEngine(
 					agentCount: result.agentCount,
 					// Snapshot the budget spend at settle for status display (Task 4.3.1).
 					...(budget !== undefined ? { budgetSpent: budget.spent() } : {}),
+					// Persist diagnostics for any degraded calls (Task 7.2.1); omit the
+					// field entirely on a clean run.
+					...(diagnostics.length > 0 ? { diagnostics } : {}),
 				});
 			})
 			.catch((err: unknown) => {
@@ -668,6 +688,8 @@ export function createWorkflowEngine(
 				settleRecord(handle, {
 					status: "error",
 					error: err instanceof Error ? err.message : String(err),
+					// Carry any diagnostics collected before the throw (Task 7.2.1).
+					...(diagnostics.length > 0 ? { diagnostics } : {}),
 				});
 			});
 

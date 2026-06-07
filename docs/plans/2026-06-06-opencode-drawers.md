@@ -1040,7 +1040,7 @@ interface SessionRunner {
 
 #### Task 7.2.1: Agent-call diagnostics — typed null reasons, raw-text capture, empty warning
 
-- [ ] Done
+- [x] Done
 
 **Context:** `agent()` degrades every failure to bare `null` (`packages/workflows/src/runtime/agent-call.ts:261-284` — structured resolution, non-completed status, runner throw all collapse identically), and an empty `""` final text journals as a normal ok result. The field report (R1, usability #2) shows the cost: 4 nulls forced a 6-minute hypothesis-and-rerun cycle because nothing said WHY. Progress events (`ProgressEvent` in `packages/workflows/src/runtime/types.ts`) carry `agent:end {label, status}` and are rendered by `workflow-status.ts`; run records persist via the engine (`packages/workflows/src/plugin/engine.ts` settle path).
 
@@ -1058,7 +1058,7 @@ interface SessionRunner {
 
 #### Task 7.2.2: Untruncated result retrieval through `workflow_status`
 
-- [ ] Done
+- [x] Done
 
 **Context:** `workflow-status.ts:22-23` caps the rendered result at `RESULT_MAX = 2000` head-truncation (`workflow-status.ts:99`), including with `full: true` — the field report's worst usability finding (#1): the security report was unreadable through the tool and required `jq` against `workflow-runs/<id>.json`.
 

@@ -51,13 +51,74 @@ export interface BudgetView {
 
 /** A progress signal emitted as the runtime drives `agent()` calls. */
 export type ProgressEvent =
-	| { type: "agent:start"; label: string; phase?: string }
-	| { type: "agent:end"; label: string; status: string }
+	| {
+			type: "agent:start";
+			label: string;
+			phase?: string;
+	  }
+	| {
+			type: "agent:end";
+			label: string;
+			status: string;
+			/**
+			 * Optional short human diagnostic line (Task 7.2.1), present only when the
+			 * call degraded to `null`/`""`. `workflow_status` renders it after the
+			 * duration line — e.g. `null — schema_invalid: missing 'verdict'; raw 6.3k
+			 * chars preserved`, or the empty-output warning.
+			 */
+			note?: string;
+	  }
 	| { type: "log"; message: string }
 	| { type: "warn"; message: string };
 
 /** Sink for {@link ProgressEvent}s; renders to `/workflows` and narrator lines. */
 export type ProgressEmitter = (e: ProgressEvent) => void;
+
+/**
+ * The typed reason an `agent()` call degraded to `null`/`""` (Task 7.2.1). One
+ * vocabulary, used in both the progress note and the persisted run record:
+ * - `schema_no_call`: structured call completed but `structured_output` was never
+ *   called (nothing stored, no validation failure recorded).
+ * - `schema_invalid`: `structured_output` WAS called but every call was rejected
+ *   (parse or schema validation), so nothing was stored.
+ * - `status_error` / `status_cancelled`: the child reached a non-completed terminal
+ *   status.
+ * - `await_failed`: `launch()`/`awaitCompletion()` threw (degraded, not detonated).
+ * - `empty_output`: the child completed and produced an empty (`""`) final text.
+ */
+export type DiagnosticReason =
+	| "schema_no_call"
+	| "schema_invalid"
+	| "status_error"
+	| "status_cancelled"
+	| "await_failed"
+	| "empty_output";
+
+/**
+ * A post-mortem diagnostic for a single failed/empty `agent()` call (Task 7.2.1).
+ * Collected by the engine via the {@link DiagnosticEmitter} hook and persisted on
+ * the run record so a finished run is debuggable WITHOUT SQLite — answering "why
+ * was this null?" from the record alone. `agent()` itself still returns bare
+ * `null`/`""` to the script: this is observational, never load-bearing.
+ */
+export interface AgentDiagnostic {
+	/** Display label of the call (same as the progress label). */
+	label: string;
+	/** The deterministic call ordinal (matches the journal `index`). */
+	index: number;
+	reason: DiagnosticReason;
+	/**
+	 * The child's raw final text, captured for the schema reasons so a validation
+	 * failure is inspectable. Capped at 20_000 chars with a `…[capped]` marker;
+	 * absent when no capture applies or the capture itself failed (fenced).
+	 */
+	rawText?: string;
+	/** The child's sessionID, when one was assigned (absent on a pre-launch throw). */
+	childSessionID?: string;
+}
+
+/** Sink for {@link AgentDiagnostic}s; the engine collects them onto the run handle. */
+export type DiagnosticEmitter = (d: AgentDiagnostic) => void;
 
 /**
  * A {@link ProgressEvent} stamped with the wall-clock time it was observed (Task

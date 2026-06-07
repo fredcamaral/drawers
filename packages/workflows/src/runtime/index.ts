@@ -30,6 +30,7 @@ import type {
 	AgentFn,
 	AgentOpts,
 	BudgetView,
+	DiagnosticEmitter,
 	JournalEntry,
 	ProgressEmitter,
 	ProgressEvent,
@@ -77,6 +78,12 @@ export interface WorkflowRunDeps {
 	budget?: BudgetView;
 	/** External progress sink; fenced so a throw cannot kill the run. */
 	onProgress?: ProgressEmitter;
+	/**
+	 * External diagnostic sink (Task 7.2.1): each null/empty `agent()` collapse
+	 * reports a typed {@link AgentDiagnostic}. Fenced like `onProgress`. The engine
+	 * collects these onto the run handle and persists them on the run record.
+	 */
+	onDiagnostic?: DiagnosticEmitter;
 	defaults?: { agent?: string; awaitTimeoutMs?: number };
 	/**
 	 * Deterministic-resume seam (spec §7). Present on a resume: `entries` is the
@@ -206,6 +213,16 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		}
 	};
 
+	// Task 7.2.1: the diagnostic sink, fenced like `emit`. A throwing listener must
+	// not kill the run — diagnostics are observational post-mortem signal.
+	const emitDiagnostic: DiagnosticEmitter = (d) => {
+		try {
+			deps.onDiagnostic?.(d);
+		} catch {
+			// Swallow listener failures — diagnostics are observational.
+		}
+	};
+
 	const budget = deps.budget ?? defaultBudget();
 
 	// One schema/result registry, shared by the agent primitive and the global
@@ -224,6 +241,7 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		counters,
 		budget,
 		emit,
+		onDiagnostic: emitDiagnostic,
 		currentPhase: () => currentPhaseBox.value,
 		liveTasks,
 		defaults: {
@@ -267,6 +285,9 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 				registry,
 				shared: sharedBoxes,
 				...(onProgress !== undefined ? { onProgress } : {}),
+				// Task 7.2.1: a child's agent diagnostics flow to the SAME engine sink
+				// as the parent's, so a sub-workflow's null/empty is post-mortem-visible.
+				onDiagnostic: emitDiagnostic,
 				// No resolver → child workflow() throws NestingError (depth 1).
 				// No replay → the boundary entry in the PARENT journal covers the child.
 			});

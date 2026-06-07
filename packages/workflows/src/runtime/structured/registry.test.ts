@@ -37,6 +37,52 @@ describe("createSchemaRegistry — register/lookup/clear lifecycle", () => {
 	});
 });
 
+describe("createSchemaRegistry — last validation failure (Task 7.2.1)", () => {
+	test("no failure recorded → lastFailure undefined", () => {
+		const reg = createSchemaRegistry();
+		expect(reg.lastFailure("ses_1")).toBeUndefined();
+	});
+
+	test("recordFailure then lastFailure returns the reason string", () => {
+		const reg = createSchemaRegistry();
+		reg.recordFailure("ses_1", "missing required 'verdict'");
+		expect(reg.lastFailure("ses_1")).toBe("missing required 'verdict'");
+	});
+
+	test("last failure wins (overwrite across retries)", () => {
+		const reg = createSchemaRegistry();
+		reg.recordFailure("ses_1", "first error");
+		reg.recordFailure("ses_1", "second error");
+		expect(reg.lastFailure("ses_1")).toBe("second error");
+	});
+
+	test("a successful store does NOT clear an earlier failure (they are independent records)", () => {
+		// The agent primitive only reads lastFailure when resultFor.present is false,
+		// so store and failure need not interlock — but clear() drops both.
+		const reg = createSchemaRegistry();
+		reg.recordFailure("ses_1", "boom");
+		reg.store("ses_1", { ok: 1 });
+		expect(reg.resultFor("ses_1").present).toBe(true);
+		expect(reg.lastFailure("ses_1")).toBe("boom");
+	});
+
+	test("clear drops the recorded failure", () => {
+		const reg = createSchemaRegistry();
+		reg.recordFailure("ses_1", "boom");
+		reg.clear("ses_1");
+		expect(reg.lastFailure("ses_1")).toBeUndefined();
+	});
+
+	test("failures are per-session isolated", () => {
+		const reg = createSchemaRegistry();
+		reg.recordFailure("ses_a", "a-err");
+		reg.recordFailure("ses_b", "b-err");
+		reg.clear("ses_a");
+		expect(reg.lastFailure("ses_a")).toBeUndefined();
+		expect(reg.lastFailure("ses_b")).toBe("b-err");
+	});
+});
+
 describe("createSchemaRegistry — resultFor present-flag semantics", () => {
 	test("never stored → present:false, no value", () => {
 		const reg = createSchemaRegistry();
