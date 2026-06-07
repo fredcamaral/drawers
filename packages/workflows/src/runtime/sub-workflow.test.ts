@@ -19,7 +19,6 @@ const AGENT_CAP = 1_000;
 
 interface Boxes {
 	counters: { agents: number };
-	prefixIntact: { value: boolean };
 	callIndex: { value: number };
 	emitted: ProgressEvent[];
 }
@@ -27,7 +26,6 @@ interface Boxes {
 function makeBoxes(): Boxes {
 	return {
 		counters: { agents: 0 },
-		prefixIntact: { value: true },
 		callIndex: { value: 0 },
 		emitted: [],
 	};
@@ -50,7 +48,6 @@ function makeWorkflow(opts: FactoryOpts): WorkflowFn {
 			opts.runChild ??
 			(async () => ({ status: "completed", returnValue: "child-result" })),
 		counters: boxes.counters,
-		prefixIntact: boxes.prefixIntact,
 		callIndex: boxes.callIndex,
 		emit: (e) => boxes.emitted.push(e),
 		currentPhase: () => undefined,
@@ -183,7 +180,10 @@ describe("workflow() — synthetic journal boundary (replay)", () => {
 		).toBe(true);
 	});
 
-	test("a child-source edit breaks the prefix at the boundary → child runs live", async () => {
+	test("a child-source edit → no matching boundary key → child runs live", async () => {
+		// Task 7.3.1: the boundary key lands in the SAME byKey queue map as agent()
+		// keys, no special-casing. An edited child source produces a different key,
+		// which has no queued entry → the child runs live.
 		const boxes = makeBoxes();
 		const recorded: JournalEntry[] = [];
 		let childRan = false;
@@ -211,11 +211,49 @@ describe("workflow() — synthetic journal boundary (replay)", () => {
 		const out = await workflow("helper");
 		expect(out).toBe("LIVE");
 		expect(childRan).toBe(true);
-		// The prefix latch flipped false forever.
-		expect(boxes.prefixIntact.value).toBe(false);
 		// The live result is recorded under the NEW boundary key.
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.result).toBe("LIVE");
+	});
+
+	test("position independence: a boundary key still replays after an unrelated edit before it", async () => {
+		// Field finding R4 applied to workflow(): editing one boundary must not void a
+		// later unchanged boundary. The first call's edited source misses; the second
+		// call's UNCHANGED source still finds its queued entry and replays cached.
+		const boxes = makeBoxes();
+		const SRC = "helper source";
+		const ARGS = { x: 1 };
+		const matchKey = computeWorkflowKey(SRC, ARGS);
+		let childRuns = 0;
+		const resolved = ["EDITED first source", SRC];
+		const workflow = makeWorkflow({
+			boxes,
+			resolveSubWorkflow: async () => resolved.shift() as string,
+			runChild: async () => {
+				childRuns += 1;
+				return { status: "completed", returnValue: "LIVE" };
+			},
+			replay: {
+				entries: [
+					{
+						index: 0,
+						key: computeWorkflowKey("first OLD source", undefined),
+						status: "ok",
+						result: "STALE",
+					},
+					{ index: 1, key: matchKey, status: "ok", result: "CACHED" },
+				],
+				onRecord: () => {},
+			},
+		});
+
+		// First boundary: edited source, no matching key → runs live.
+		expect(await workflow("first")).toBe("LIVE");
+		// Second boundary: unchanged → its key still has a queued entry → cached,
+		// even though an earlier boundary diverged (the old prefix latch would have
+		// re-run it).
+		expect(await workflow("helper", ARGS)).toBe("CACHED");
+		expect(childRuns).toBe(1);
 	});
 
 	test("live completed child → onRecord captures the boundary entry", async () => {
@@ -263,7 +301,6 @@ describe("workflow() — progress labelling", () => {
 				return { status: "completed", returnValue: 1 };
 			},
 			counters: boxes.counters,
-			prefixIntact: boxes.prefixIntact,
 			callIndex: boxes.callIndex,
 			emit: (e) => {
 				forwarded = e;

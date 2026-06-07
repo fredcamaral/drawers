@@ -24,7 +24,7 @@
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
 | 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Complete / 5.2 Epic-level |
 | 6 | CC parity: structured results survive slow real-world turns (completion-gate watermark), absolute `script_path` works, live in-session workflow observability, active parent wake | 6.1, 6.2, 6.3 | Complete |
-| 7 | Mid-turn completion eliminated (turn-liveness gate: session status + message `time.completed`); structured/empty failures carry diagnostics and full results are retrievable; resume replays journaled items per-item (key+occurrence) instead of prefix | 7.1, 7.2, 7.3 | Detailed |
+| 7 | Mid-turn completion eliminated (turn-liveness gate: session status + message `time.completed`); structured/empty failures carry diagnostics and full results are retrievable; resume replays journaled items per-item (key+occurrence) instead of prefix | 7.1, 7.2, 7.3 | Complete |
 
 ## Design decisions (binding across phases)
 
@@ -1081,7 +1081,7 @@ interface SessionRunner {
 
 #### Task 7.3.1: Key+occurrence journal replay
 
-- [ ] Done
+- [x] Done
 
 **Context:** replay matching lives in `packages/workflows/src/runtime/agent-call.ts:128-181`: a `byIndex` map plus a run-level `prefixIntact` latch — the first key mismatch at any index voids ALL later replays (`prefixIntact.value = false` is forever). Field finding R4: editing item 0's prompt re-executed an unchanged, expensive item 1 (`security-reviewer`, identical key `1d2e8321…`, 4m17s re-run, different answer). `sub-workflow.ts` consumes the same replay seam with `workflow:`-prefixed boundary keys (`packages/workflows/src/runtime/keys.ts`); the latch type is threaded from `compose.ts`/`evaluate.ts` (find `prefixIntact` construction).
 

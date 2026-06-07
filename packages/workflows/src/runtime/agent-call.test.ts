@@ -192,7 +192,6 @@ interface HarnessOverrides {
 		entries: JournalEntry[];
 		onRecord: (e: JournalEntry) => void;
 	};
-	prefixIntact?: { value: boolean };
 	callIndex?: { value: number };
 	onDiagnostic?: (d: AgentDiagnostic) => void;
 }
@@ -206,7 +205,6 @@ function harness(overrides: HarnessOverrides = {}) {
 	const counters = overrides.counters ?? { agents: 0 };
 	const liveTasks = overrides.liveTasks ?? new Set<string>();
 	const registry = overrides.registry ?? createSchemaRegistry();
-	const prefixIntact = overrides.prefixIntact ?? { value: true };
 	const callIndex = overrides.callIndex ?? { value: 0 };
 	const agent = createAgentPrimitive({
 		runner,
@@ -221,7 +219,6 @@ function harness(overrides: HarnessOverrides = {}) {
 		defaults: overrides.defaults ?? { agent: "build" },
 		registry,
 		replay: overrides.replay,
-		prefixIntact,
 		callIndex,
 		onDiagnostic:
 			overrides.onDiagnostic ?? ((d: AgentDiagnostic) => diags.push(d)),
@@ -235,7 +232,6 @@ function harness(overrides: HarnessOverrides = {}) {
 		counters,
 		liveTasks,
 		registry,
-		prefixIntact,
 		callIndex,
 	};
 }
@@ -713,8 +709,11 @@ describe("createAgentPrimitive — live path records non-null results", () => {
 	});
 });
 
-describe("createAgentPrimitive — cached replay path", () => {
-	test("full-prefix replay returns cached results with ZERO launches and status cached", async () => {
+describe("createAgentPrimitive — cached replay path (key + occurrence, Task 7.3.1)", () => {
+	// Task 7.3.1 / field finding R4: replay matches per-key occurrence queues, not a
+	// positional `prefixIntact` latch. A key mismatch at one call no longer voids
+	// later unchanged items — each call independently shifts ITS key's queue.
+	test("every matching key replays cached with ZERO launches and status cached", async () => {
 		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
 		const entries: JournalEntry[] = [
 			{
@@ -749,38 +748,101 @@ describe("createAgentPrimitive — cached replay path", () => {
 		expect(starts.length).toBe(2);
 	});
 
-	test("entries recorded OUT OF INDEX ORDER (concurrent journal) still replay cached", async () => {
-		// Live-harness regression: concurrent agents (pipeline/parallel) record into
-		// the journal in COMPLETION order, not call-index order — so entries[0] may
-		// carry index 1. Replay MUST look up by the `index` field, not array position,
-		// or the very first replayed call mismatches and the whole prefix breaks live.
+	test("R4: editing item 0's key runs item 0 LIVE while item 1 still replays cached", async () => {
+		// THE field finding (report §4.3): editing parallel() item 0's prompt must
+		// not re-execute an unchanged, expensive item 1. Under the old prefix latch,
+		// item 0's mismatch flipped `prefixIntact=false` forever → item 1 re-ran
+		// (identical key, 4m17s, different answer). Per-key matching keeps item 1 cached.
 		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
 		const entries: JournalEntry[] = [
-			// index 1 first (it settled first under concurrency), then index 0.
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "item0-OLD" }),
+				status: "ok",
+				result: "cached-0",
+			},
 			{
 				index: 1,
-				key: computeCallKey({ prompt: "b" }),
+				key: computeCallKey({ prompt: "item1" }),
 				status: "ok",
-				result: "cached-b",
+				result: "cached-1-expensive",
 			},
+		];
+		const { agent, events } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		// Item 0's prompt was edited → no journaled key matches → runs LIVE.
+		expect(await agent("item0-EDITED")).toBe("LIVE");
+		// Item 1 is UNCHANGED → its key still has a queued entry → replays cached,
+		// even though an earlier call diverged. This is the whole point of 7.3.1.
+		expect(await agent("item1")).toBe("cached-1-expensive");
+		expect((runner as FakeRunner).launches.length).toBe(1);
+		const ends = events.filter((e) => e.type === "agent:end");
+		expect(ends.map((e) => (e.type === "agent:end" ? e.status : ""))).toEqual([
+			"completed", // item 0 ran live
+			"cached", // item 1 replayed
+		]);
+	});
+
+	test("position independence: reordered identical-key calls still replay", async () => {
+		// The journal recorded keys in one order; the resumed script issues them in a
+		// DIFFERENT order. Per-key queues match on key identity, not call index, so
+		// each call still finds its cached result.
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
 			{
 				index: 0,
 				key: computeCallKey({ prompt: "a" }),
 				status: "ok",
 				result: "cached-a",
 			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
 		];
 		const { agent, runner: r } = harness({
 			runner,
 			replay: { entries, onRecord: () => {} },
 		});
-		// Calls happen in index order; each must find ITS entry regardless of position.
-		expect(await agent("a")).toBe("cached-a");
+		// Issue them in REVERSE order vs the journal — both still replay.
 		expect(await agent("b")).toBe("cached-b");
+		expect(await agent("a")).toBe("cached-a");
 		expect((r as FakeRunner).launches.length).toBe(0);
 	});
 
-	test("a cached hit re-records the entry via onRecord (journals stay self-contained on resume)", async () => {
+	test("N byte-identical journaled calls → N replays, the N+1th runs live (occurrence)", async () => {
+		// CC's adversarial-verify spawns N byte-identical refuters. Key-only matching
+		// would wrongly dedupe them to one; occurrence queues replay each of the N
+		// recorded results exactly once, then the N+1th (no queue left) runs live.
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const key = computeCallKey({ prompt: "dup" });
+		const entries: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "dup-0" },
+			{ index: 1, key, status: "ok", result: "dup-1" },
+			{ index: 2, key, status: "ok", result: "dup-2" },
+		];
+		const { agent, runner: r } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		// Three identical calls drain the queue in recorded order.
+		expect(await agent("dup")).toBe("dup-0");
+		expect(await agent("dup")).toBe("dup-1");
+		expect(await agent("dup")).toBe("dup-2");
+		// The 4th identical call has an empty queue → runs LIVE.
+		expect(await agent("dup")).toBe("LIVE");
+		expect((r as FakeRunner).launches.length).toBe(1);
+	});
+
+	test("a cached hit re-records under the CURRENT call index (journals stay self-contained)", async () => {
+		// The new journal records each replay with the CURRENT callIndex ordinal, not
+		// the prior journal's index — so a resumed run's journal indexes are dense and
+		// match this run's call order. Here calls run in reverse, so index 0 carries
+		// the entry the prior journal stored at index 1.
 		const recorded: JournalEntry[] = [];
 		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
 		const entries: JournalEntry[] = [
@@ -801,23 +863,21 @@ describe("createAgentPrimitive — cached replay path", () => {
 			runner,
 			replay: { entries, onRecord: (e) => recorded.push(e) },
 		});
-		expect(await agent("a")).toBe("cached-a");
 		expect(await agent("b")).toBe("cached-b");
-		// Zero launches, yet both cached hits were re-recorded verbatim so the new
-		// run's journal is standalone (no engine-layer bookkeeping needed).
+		expect(await agent("a")).toBe("cached-a");
 		expect((r as FakeRunner).launches.length).toBe(0);
 		expect(recorded).toEqual([
 			{
 				index: 0,
-				key: computeCallKey({ prompt: "a" }),
-				status: "ok",
-				result: "cached-a",
-			},
-			{
-				index: 1,
 				key: computeCallKey({ prompt: "b" }),
 				status: "ok",
 				result: "cached-b",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
 			},
 		]);
 	});
@@ -826,7 +886,7 @@ describe("createAgentPrimitive — cached replay path", () => {
 		const runner = new FakeRunner({ status: "completed" });
 		const entries: JournalEntry[] = [
 			{
-				index: 1000,
+				index: 0,
 				key: computeCallKey({ prompt: "x" }),
 				status: "ok",
 				result: "cached",
@@ -842,7 +902,9 @@ describe("createAgentPrimitive — cached replay path", () => {
 		await expect(agent("x")).rejects.toBeInstanceOf(AgentCapError);
 	});
 
-	test("divergence: key mismatch flips prefixIntact and runs live from there", async () => {
+	test("an absent (previously-null) key runs live — failure-targeted retry", async () => {
+		// Previously-null items were never journaled, so their key is absent from the
+		// queue map → they run live on resume. Failure-targeted retry, by construction.
 		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
 		const entries: JournalEntry[] = [
 			{
@@ -850,73 +912,14 @@ describe("createAgentPrimitive — cached replay path", () => {
 				key: computeCallKey({ prompt: "a" }),
 				status: "ok",
 				result: "cached-a",
-			},
-			{
-				index: 1,
-				key: computeCallKey({ prompt: "EDITED" }),
-				status: "ok",
-				result: "cached-b",
-			},
-		];
-		const prefixIntact = { value: true };
-		const { agent, prefixIntact: pi } = harness({
-			runner,
-			prefixIntact,
-			replay: { entries, onRecord: () => {} },
-		});
-		// First call matches → cached.
-		expect(await agent("a")).toBe("cached-a");
-		expect(pi.value).toBe(true);
-		// Second call's prompt was edited → key mismatch → runs LIVE.
-		expect(await agent("b")).toBe("LIVE");
-		expect(pi.value).toBe(false);
-		expect((runner as FakeRunner).launches.length).toBe(1);
-	});
-
-	test("a later coincidentally-matching key still runs live once prefix is broken", async () => {
-		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
-		const entries: JournalEntry[] = [
-			{
-				index: 0,
-				key: computeCallKey({ prompt: "EDITED" }), // call 0 will mismatch
-				status: "ok",
-				result: "cached-0",
-			},
-			{
-				index: 1,
-				key: computeCallKey({ prompt: "b" }), // call 1 WOULD match coincidentally
-				status: "ok",
-				result: "cached-1",
 			},
 		];
 		const { agent } = harness({
 			runner,
 			replay: { entries, onRecord: () => {} },
 		});
-		// Call 0 diverges immediately (prompt "a" != journaled "EDITED").
-		expect(await agent("a")).toBe("LIVE");
-		// Call 1's key matches entries[1], but the prefix is already broken → LIVE.
-		expect(await agent("b")).toBe("LIVE");
-		expect((runner as FakeRunner).launches.length).toBe(2);
-	});
-
-	test("index past entries.length runs live (no entry for that index)", async () => {
-		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
-		const entries: JournalEntry[] = [
-			{
-				index: 0,
-				key: computeCallKey({ prompt: "a" }),
-				status: "ok",
-				result: "cached-a",
-			},
-		];
-		const { agent, prefixIntact } = harness({
-			runner,
-			replay: { entries, onRecord: () => {} },
-		});
-		expect(await agent("a")).toBe("cached-a"); // index 0 cached
-		expect(await agent("b")).toBe("LIVE"); // index 1 >= length → live
-		expect(prefixIntact.value).toBe(false);
+		expect(await agent("a")).toBe("cached-a"); // key present → cached
+		expect(await agent("never-journaled")).toBe("LIVE"); // absent key → live
 		expect((runner as FakeRunner).launches.length).toBe(1);
 	});
 });

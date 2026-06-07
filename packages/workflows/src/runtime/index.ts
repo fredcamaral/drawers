@@ -86,9 +86,10 @@ export interface WorkflowRunDeps {
 	onDiagnostic?: DiagnosticEmitter;
 	defaults?: { agent?: string; awaitTimeoutMs?: number };
 	/**
-	 * Deterministic-resume seam (spec §7). Present on a resume: `entries` is the
-	 * prior run's journal (replayed for the longest unchanged prefix), `onRecord`
-	 * captures each settled non-null live result for the new journal.
+	 * Deterministic-resume seam (spec §7, Task 7.3.1). Present on a resume:
+	 * `entries` is the prior run's journal (replayed per-key + occurrence,
+	 * position-independent), `onRecord` captures each settled non-null live result
+	 * for the new journal.
 	 */
 	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
 	/**
@@ -187,11 +188,11 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 
 	const currentPhaseBox: { value?: string } = {};
 	const progress: ProgressEvent[] = [];
-	// Resume seam (§7): the deterministic call ordinal and the "prefix still
-	// intact" latch are run-level, shared by every agent() invocation. A child run
-	// (replay undefined) never consults them, so it keeps its own.
+	// Resume seam (§7, Task 7.3.1): the deterministic call ordinal is run-level,
+	// shared by every agent()/workflow() invocation as the journal ordering anchor.
+	// Replay matching itself is per-key+occurrence (no run-level latch), so there is
+	// no `prefixIntact` to thread. A child run (replay undefined) keeps its own index.
 	const callIndex = { value: 0 };
-	const prefixIntact = { value: true };
 
 	// The shared boxes this run exposes to a child it spawns via workflow().
 	const sharedBoxes: SharedRunBoxes = {
@@ -250,7 +251,6 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		},
 		registry,
 		replay: deps.replay,
-		prefixIntact,
 		callIndex,
 	});
 
@@ -297,7 +297,6 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 				: { status: "error", error: result.error };
 		},
 		counters,
-		prefixIntact,
 		callIndex,
 		emit,
 		currentPhase: () => currentPhaseBox.value,

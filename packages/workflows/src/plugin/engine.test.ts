@@ -1184,6 +1184,75 @@ describe("createWorkflowEngine — resume (same instance)", () => {
 		await engine.dispose();
 	});
 
+	test("R4: editing parallel item 0 reruns ONLY item 0; unchanged item 1 replays cached", async () => {
+		// Field finding R4 (report §4.3) end-to-end: a parallel() set where item 0's
+		// prompt is edited on resume must replay the UNCHANGED, expensive item 1 from
+		// the journal — not re-execute it. The old prefix latch re-ran item 1 (4m17s,
+		// different answer); per-key occurrence matching keeps it cached. Asserted via
+		// exactly ONE live child session (item 0 only).
+		const id = "wf_priorR4";
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "item0-OLD" }),
+				status: "ok",
+				result: "stale-0",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "item1-expensive" }),
+				status: "ok",
+				result: "CACHED-EXPENSIVE",
+			},
+		];
+		const priorScript = `${META}const r = await parallel([\n() => agent("item0-OLD"),\n() => agent("item1-expensive"),\n]);\nreturn r;\n`;
+		const editedScript = `${META}const r = await parallel([\n() => agent("item0-EDITED"),\n() => agent("item1-expensive"),\n]);\nreturn r;\n`;
+		const seeded: Record<string, string> = {
+			[`${BASE}/workflow-runs/${id}.json`]: JSON.stringify({
+				id,
+				parentSessionID: "ses_parent",
+				status: "completed",
+				description: "demo",
+				createdAt: NOW - 1000,
+				completedAt: NOW - 500,
+				scriptPath: `${BASE}/workflow-scripts/${id}.js`,
+			}),
+			[`${BASE}/workflow-scripts/${id}.js`]: priorScript,
+			[JOURNALS(id)]: jsonl(entries),
+		};
+		const { facade } = makeFs(seeded);
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("LIVE-0");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_newR4"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: id,
+			source: editedScript,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		// Only item 0 launches a live child; item 1 replays from the journal.
+		await driveIdle(engine, sessions[0] as string, bump);
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		// Item 0 ran live → "LIVE-0"; item 1 replayed its frozen journaled result.
+		expect(status?.record.returnValue).toEqual(["LIVE-0", "CACHED-EXPENSIVE"]);
+		// The expensive item was NEVER re-executed: exactly one live session.
+		expect(sessions.length).toBe(1);
+
+		await engine.dispose();
+	});
+
 	test("resume of a still-running run is refused with a stop hint", async () => {
 		const { facade } = makeFs();
 		const { clock: mclock } = bumpClock(NOW);

@@ -79,21 +79,21 @@ export interface AgentPrimitiveDeps {
 	 */
 	registry: SchemaRegistry;
 	/**
-	 * Deterministic-resume seam (spec §7). When present, the longest unchanged
-	 * prefix of `(prompt, opts)` pairs replays from `entries` instead of launching;
-	 * every settled non-null live result is reported via `onRecord` for the journal.
+	 * Deterministic-resume seam (spec §7, Task 7.3.1). When present, each call
+	 * replays from `entries` by KEY + OCCURRENCE: every `agent()` (and the
+	 * `workflow()` boundary) shifts a per-key queue built from the prior journal —
+	 * a hit replays the frozen result, a miss/empty queue runs live. Matching is
+	 * position-independent: editing one item no longer voids later unchanged items
+	 * (field finding R4). Every settled non-null live result is reported via
+	 * `onRecord` for the new journal.
 	 */
 	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
 	/**
-	 * Run-level "the replayed prefix is still intact" latch. Starts true; flips
-	 * false FOREVER on the first divergence (key mismatch or index past the
-	 * journal), so a later coincidentally-matching key still runs live.
-	 */
-	prefixIntact: { value: boolean };
-	/**
 	 * Run-level deterministic call ordinal. Counts EVERY `agent()` invocation in
-	 * order — cached or live — so a replay indexes the journal at the same points
-	 * the original did. Advances in lockstep with `counters.agents`.
+	 * order — cached or live — so the new journal's `index` field and the progress
+	 * ordering anchor stay dense and in call order. Advances in lockstep with
+	 * `counters.agents`. NOTE (Task 7.3.1): the index is no longer a replay MATCH
+	 * key — matching is by key+occurrence — it is purely the ordering anchor.
 	 */
 	callIndex: { value: number };
 }
@@ -136,7 +136,6 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		defaults,
 		registry,
 		replay,
-		prefixIntact,
 		callIndex,
 	} = deps;
 	const awaitTimeoutMs = defaults.awaitTimeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS;
@@ -201,14 +200,29 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		return result === "" ? "empty_output" : undefined;
 	}
 
-	// Index → journaled entry. Concurrent agents record into the journal in
-	// COMPLETION order, not call-index order, so a positional `entries[index]`
-	// lookup mismatches the first concurrently-recorded call and voids the whole
-	// replay prefix. Map by the `index` field so lookup is order-independent.
-	const byIndex = new Map<number, JournalEntry>();
+	// Task 7.3.1 / field finding R4: replay matches by KEY + OCCURRENCE, not by
+	// position. Build a per-key FIFO queue from the prior journal; each call shifts
+	// its key's queue (hit → replay, miss/empty → live). This makes replay
+	// position-independent — editing parallel() item 0's prompt no longer flips a
+	// run-level latch that re-executed an unchanged item 1 (report §4.3: identical
+	// key 1d2e8321…, 4m17s re-run, materially different answer).
+	//
+	// Entries are queued in journal-FILE order, which is COMPLETION order under
+	// concurrency. That is fine: occurrence order only needs to be deterministic
+	// per key, and N byte-identical calls have interchangeable cached results by
+	// definition — so the order within a key's queue cannot change an answer. The
+	// `workflow()` boundary's `workflow:`-prefixed keys land in this same map, no
+	// special-casing. N identical keys → N replays; the N+1th finds an empty queue
+	// and runs live (preserves CC's adversarial-verify N-byte-identical refuters).
+	const byKey = new Map<string, JournalEntry[]>();
 	if (replay !== undefined) {
 		for (const entry of replay.entries) {
-			byIndex.set(entry.index, entry);
+			const queue = byKey.get(entry.key);
+			if (queue === undefined) {
+				byKey.set(entry.key, [entry]);
+			} else {
+				queue.push(entry);
+			}
 		}
 	}
 
@@ -233,27 +247,25 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			agentType: opts.agentType,
 		});
 
-		// 0b. Replay (spec §7): while the prefix is intact and this index has a
-		// matching journaled key, return the cached result WITHOUT launching. The
-		// cap STILL applies (a replay must hit it where the original did), so check
-		// and increment counters exactly as the live path does — before resolving.
-		if (replay !== undefined && prefixIntact.value) {
-			const cached = byIndex.get(index);
-			if (cached !== undefined && cached.key === key) {
-				if (counters.agents >= AGENT_LIFETIME_CAP) {
-					throw new AgentCapError();
-				}
-				counters.agents += 1;
-				emit({ type: "agent:start", label, phase });
-				emit({ type: "agent:end", label, status: "cached" });
-				// Re-record the cached hit into the NEW journal so a resumed run's
-				// journal is fully self-contained — no engine-layer bookkeeping.
-				replay.onRecord({ index, key, status: "ok", result: cached.result });
-				return cached.result;
+		// 0b. Replay (spec §7, Task 7.3.1): shift this call's key queue. A hit returns
+		// the frozen journaled result WITHOUT launching — independent of position, so
+		// an earlier edited item never voids this one (field finding R4). A miss/empty
+		// queue falls through to the live path. The cap STILL applies (a replay must
+		// hit it where the original did), so check and increment counters exactly as
+		// the live path does — before resolving.
+		const cached = byKey.get(key)?.shift();
+		if (cached !== undefined) {
+			if (counters.agents >= AGENT_LIFETIME_CAP) {
+				throw new AgentCapError();
 			}
-			// Divergence: this call edited/new (key mismatch or past the journal).
-			// The prefix is broken FOREVER — a later coincidental match still runs live.
-			prefixIntact.value = false;
+			counters.agents += 1;
+			emit({ type: "agent:start", label, phase });
+			emit({ type: "agent:end", label, status: "cached" });
+			// Re-record the cached hit into the NEW journal under the CURRENT call
+			// index so a resumed run's journal is fully self-contained and densely
+			// ordered — no engine-layer bookkeeping.
+			replay?.onRecord({ index, key, status: "ok", result: cached.result });
+			return cached.result;
 		}
 
 		// 1. Lifetime cap — increment BEFORE acquire so queued calls count too.

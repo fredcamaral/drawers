@@ -2,9 +2,12 @@
  * Run journal — the append-only record that powers deterministic resume (§7).
  *
  * Every `agent()` call whose result settles non-null is appended as one JSONL
- * line. On resume the runtime loads the journal and replays the longest unchanged
- * prefix of `(prompt, opts)` pairs (matched by {@link computeCallKey}) instead of
- * launching children; the first edited/new call and everything after runs live.
+ * line. On resume the runtime loads the journal and replays by KEY + OCCURRENCE
+ * (Task 7.3.1): each call (and each `workflow()` boundary) shifts a per-key queue
+ * built from the prior journal — a matching key replays its frozen result, a
+ * miss/empty queue runs live. Matching is position-independent, so editing one
+ * item replays unchanged siblings for free (field finding R4). N byte-identical
+ * calls → N replays; the N+1th runs live (occurrence semantics).
  *
  * Writes serialize through a single promise-chain queue (mirroring core's
  * persistence write-queue idiom) so concurrent `record()` calls never interleave

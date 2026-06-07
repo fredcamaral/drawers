@@ -154,8 +154,10 @@ export interface StartRunArgs {
 	parentSessionID: string;
 	/**
 	 * Resume from a prior run (spec §7): own runId + own journal, but seeded with
-	 * the prior run's journal entries (longest unchanged prefix replays). Source
-	 * and args default to the prior record's when absent.
+	 * the prior run's journal entries (replayed by key + occurrence — Task 7.3.1:
+	 * each matching call key replays its frozen result, position-independent, so an
+	 * edited item does not void unchanged siblings). Source and args default to the
+	 * prior record's when absent.
 	 */
 	resumeFromRunId?: string;
 	/**

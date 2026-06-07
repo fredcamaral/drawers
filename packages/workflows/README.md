@@ -1,6 +1,6 @@
 # opencode-drawer-workflows
 
-Deterministic multi-agent orchestration scripts for [OpenCode](https://opencode.ai). You write a plain-JavaScript script that fans out to many sub-agents — in pipelines, in parallel, in phases — and the plugin runs it in the background. The launch returns immediately with a run id; the parent session is never blocked. When the run settles, an idle parent session is woken to read the result automatically; a busy parent gets a toast and a notice folded into its next message. Runs are journaled, so a crashed or edited run resumes by replaying the longest unchanged prefix of agent calls instead of re-spending tokens on work that already settled.
+Deterministic multi-agent orchestration scripts for [OpenCode](https://opencode.ai). You write a plain-JavaScript script that fans out to many sub-agents — in pipelines, in parallel, in phases — and the plugin runs it in the background. The launch returns immediately with a run id; the parent session is never blocked. When the run settles, an idle parent session is woken to read the result automatically; a busy parent gets a toast and a notice folded into its next message. Runs are journaled, so a crashed or edited run resumes by replaying each unchanged agent call from the journal — matched per-item by key, independent of position — instead of re-spending tokens on work that already settled.
 
 This README is both the package landing page and the complete authoring manual. Everything needed to write a correct workflow script is here; you do not need to read the source.
 
@@ -70,7 +70,7 @@ The tool is **opt-in** by design: a workflow can spawn dozens of agents and cons
 | `script_path` | string | one-of | Path to a script file, resolved relative to the project directory. |
 | `name` | string | one-of | Name of a saved workflow at `.opencode/workflows/<name>.js` (or `.mjs`). |
 | `args` | string | no | JSON-encoded value exposed to the script as `args`. A raw object is also accepted. Empty/whitespace → absent. Unparseable JSON string → error. |
-| `resume_from_run_id` | string | no | Resume a prior run by its `run_id`. The longest unchanged prefix of `agent()` calls replays from cache; the rest runs live. Source/args default to the prior run's when omitted. |
+| `resume_from_run_id` | string | no | Resume a prior run by its `run_id`. Each `agent()` call matching a journaled call key replays from cache (per-item, position-independent); changed/new/failed calls run live. A replay returns the frozen result — a re-run may differ. Source/args default to the prior run's when omitted. |
 | `budget_tokens` | number | no | Output-token ceiling for the whole workflow (sum of child agents' output + reasoning tokens). When exhausted, further `agent()` calls are refused. Omit for no ceiling. A non-positive or non-finite value is treated as absent (no ceiling). |
 
 **Coercion note.** OpenCode's raw execute path does not apply schema coercion, so `args` and `budget_tokens` are coerced defensively: `args` accepts a real object, a JSON string, or absent; `budget_tokens` accepts a number, a numeric string, or absent, and any garbage (`NaN`, `""`, `<= 0`) becomes "no budget" rather than silently disabling caps or crashing.
@@ -321,15 +321,17 @@ return findings;
 
 ### Resume
 
-Resume replays the longest unchanged prefix of `agent()` calls from a journal, then runs the rest live. Pass `resume_from_run_id` to the `workflow` tool. The resumed run gets its **own new run id and its own journal**, seeded from the prior run's journal.
+Resume replays each unchanged `agent()` call from a journal and runs the rest live, matched **per-item by key and occurrence** — independent of position. Pass `resume_from_run_id` to the `workflow` tool. The resumed run gets its **own new run id and its own journal**, seeded from the prior run's journal.
 
 What replays vs. re-runs:
 
-- **Replays (from cache, no relaunch):** every `agent()` call whose `(prompt, opts)` key matches the journaled key at the same call index, **while the prefix is still intact**. A replayed call is rendered as `cached` in the progress tree and still counts against the lifetime cap (a resume hits the cap where the original did).
-- **Re-runs live:** the first call whose key diverges (an edited prompt/opts, a new call, or a position past the end of the journal) — and **everything after it**. Once the prefix diverges, it is broken *forever* for that run; a later coincidentally-matching key still runs live.
-- **Always re-runs:** a failed/`null` agent. Only **settled, non-null** results are journaled, so a failure never replays its failure — it gets a fresh attempt on resume.
+- **Replays (from cache, no relaunch):** every `agent()` call whose `(prompt, opts)` key matches a journaled call, regardless of where it sits in the script. Matching is position-independent: editing one item (or reordering items) does **not** void unchanged items — an edited `parallel()` item 0 still replays an unchanged, expensive item 1 for free. A replayed call is rendered as `cached` in the progress tree and still counts against the lifetime cap (a resume hits the cap where the original did).
+- **Occurrence semantics:** N byte-identical journaled calls replay their N journaled results, then the N+1th identical call runs live. (This is what keeps CC's adversarial-verify pattern — N byte-identical refuters — correct; key-only matching would wrongly collapse them to one.)
+- **Re-runs live:** any call whose key has no remaining journaled match — an edited prompt/opts, a new call, or an extra occurrence beyond what was journaled.
+- **Always re-runs:** a failed/`null` agent. Only **settled, non-null** results are journaled, so a failure was never journaled and re-runs on resume (failure-targeted retry, by construction).
+- **Non-determinism contract:** a replay returns the **frozen** journaled result. A call that re-runs live may legitimately return a *different* answer — agents are non-deterministic. Resume buys you "don't pay twice for unchanged work", not "identical output forever".
 
-The replay key is a sha256 of `(prompt, label, phase, schema, model, agentType)`. Field order and schema key order do not matter (canonicalized); changing the prompt, model, or *presence* of a schema changes the key and breaks the prefix from that call onward.
+The replay key is a sha256 of `(prompt, label, phase, schema, model, agentType)`. Field order and schema key order do not matter (canonicalized); changing the prompt, model, or *presence* of a schema changes the key, so that call re-runs live (other calls are unaffected).
 
 `resume_from_run_id` defaults source and args to the prior run's persisted values when you omit them; you may pass an edited source as a single override. Resume **survives OpenCode restarts** because the journal is on disk (one JSONL file per run); a journal append is drained before the run settles, so a single-turn `opencode run` that exits the instant the turn ends still leaves a durable journal for a later resume.
 

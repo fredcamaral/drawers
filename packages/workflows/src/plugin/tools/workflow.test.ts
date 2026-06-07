@@ -158,8 +158,11 @@ describe("createWorkflowTool — description is the authoring contract", () => {
 		// Caps.
 		expect(d).toContain("1000");
 		expect(d).toContain("4096");
-		// Resume + saved workflows.
-		expect(d).toContain("unchanged prefix");
+		// Resume + saved workflows (Task 7.3.1: per-item key+occurrence matching,
+		// position-independent, with the R5 non-determinism contract line).
+		expect(d).toContain("key + occurrence");
+		expect(d).toContain("independent of position");
+		expect(d).toContain("agents are non-deterministic");
 		expect(d).toContain(".opencode/workflows/");
 		// Plain JS, not TypeScript.
 		expect(d).toContain("not TypeScript");

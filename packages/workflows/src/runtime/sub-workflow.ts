@@ -15,9 +15,11 @@
  *     surfaces as the resolver's rejection (a catchable script error).
  *   - SYNTHETIC JOURNAL BOUNDARY: one {@link computeWorkflowKey} over the resolved
  *     source + args consumes ONE callIndex slot, exactly like `agent()`. On a
- *     replay with the prefix intact and a matching key, the journaled child result
- *     resolves WITHOUT running the child at all; otherwise the prefix breaks and
- *     the child runs live, its result recorded under the new boundary key.
+ *     replay, the boundary key shifts its per-key occurrence queue (Task 7.3.1) —
+ *     a hit resolves the journaled child result WITHOUT running the child at all;
+ *     a miss/empty queue runs the child live, its result recorded under the new
+ *     boundary key. Matching is position-independent, so editing one boundary does
+ *     not void a later unchanged one (field finding R4).
  *   - Live child: completed → return its `returnValue`; error → THROW
  *     `Error(child.error)` (catchable, unlike `agent()`'s null).
  *   - The boundary counts against the SHARED lifetime cap (the child's own agents
@@ -66,9 +68,7 @@ export interface SubWorkflowDeps {
 	) => Promise<ChildRunResult>;
 	/** Lifetime agent counter shared with the parent (the boundary counts as one). */
 	counters: { agents: number };
-	/** Run-level "the replayed prefix is still intact" latch (shared with agent()). */
-	prefixIntact: { value: boolean };
-	/** Run-level deterministic call ordinal (shared with agent()). */
+	/** Run-level deterministic call ordinal (shared with agent(), the ordering anchor). */
 	callIndex: { value: number };
 	/** Parent progress sink (already fenced upstream). */
 	emit: ProgressEmitter;
@@ -109,23 +109,24 @@ function prefixedEmitter(name: string, emit: ProgressEmitter): ProgressEmitter {
 }
 
 export function createSubWorkflowPrimitive(deps: SubWorkflowDeps): WorkflowFn {
-	const {
-		resolveSubWorkflow,
-		runChild,
-		counters,
-		prefixIntact,
-		callIndex,
-		emit,
-		replay,
-	} = deps;
+	const { resolveSubWorkflow, runChild, counters, callIndex, emit, replay } =
+		deps;
 
-	// Index → journaled entry (same order-independence fix as agent-call.ts):
-	// concurrent boundaries/agents record in completion order, so look up by the
-	// `index` field, not array position.
-	const byIndex = new Map<number, JournalEntry>();
+	// Task 7.3.1: per-key occurrence queues, identical to agent-call.ts. The
+	// boundary's `workflow:`-prefixed keys share the SAME byKey namespace as agent
+	// keys (the prefix keeps them collision-free), so resume replay is uniform and
+	// position-independent — editing one boundary no longer voids later unchanged
+	// ones (field finding R4). Entries queue in journal-file (completion) order;
+	// for byte-identical boundaries the cached child results are interchangeable.
+	const byKey = new Map<string, JournalEntry[]>();
 	if (replay !== undefined) {
 		for (const entry of replay.entries) {
-			byIndex.set(entry.index, entry);
+			const queue = byKey.get(entry.key);
+			if (queue === undefined) {
+				byKey.set(entry.key, [entry]);
+			} else {
+				queue.push(entry);
+			}
 		}
 	}
 
@@ -148,23 +149,22 @@ export function createSubWorkflowPrimitive(deps: SubWorkflowDeps): WorkflowFn {
 		const source = await resolveSubWorkflow(nameOrRef);
 		const key = computeWorkflowKey(source, args);
 
-		// 2. Replay (spec §7/§8): while the prefix is intact and this index has a
-		// matching journaled boundary key, resolve the cached child result WITHOUT
-		// running the child. The shared cap still applies where the original hit it.
-		if (replay !== undefined && prefixIntact.value) {
-			const cached = byIndex.get(index);
-			if (cached !== undefined && cached.key === key) {
-				if (counters.agents >= AGENT_LIFETIME_CAP) {
-					throw new AgentCapError();
-				}
-				counters.agents += 1;
-				emit({ type: "log", message: `workflow ${name}: cached` });
-				// Re-record into the NEW journal so a resumed run is self-contained.
-				replay.onRecord({ index, key, status: "ok", result: cached.result });
-				return cached.result;
+		// 2. Replay (spec §7/§8, Task 7.3.1): shift this boundary's key queue. A hit
+		// resolves the cached child result WITHOUT running the child — independent of
+		// position, so an earlier edited boundary never voids this unchanged one
+		// (field finding R4). A miss/empty queue runs the child live. The shared cap
+		// still applies where the original hit it.
+		const cached = byKey.get(key)?.shift();
+		if (cached !== undefined) {
+			if (counters.agents >= AGENT_LIFETIME_CAP) {
+				throw new AgentCapError();
 			}
-			// Divergence: edited child source or new boundary. Prefix broken FOREVER.
-			prefixIntact.value = false;
+			counters.agents += 1;
+			emit({ type: "log", message: `workflow ${name}: cached` });
+			// Re-record into the NEW journal (current index) so a resumed run is
+			// self-contained and densely ordered.
+			replay?.onRecord({ index, key, status: "ok", result: cached.result });
+			return cached.result;
 		}
 
 		// 3. Shared lifetime cap — count the boundary BEFORE running the child.

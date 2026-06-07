@@ -246,7 +246,7 @@ Lifetime cap of 1000 agent() calls per run (cached replays count); 4096 items ma
 
 ## Resume and saved workflows
 
-Every successful agent() result is journaled. Relaunch with resume_from_run_id and the longest unchanged prefix of agent() calls replays from cache (instant, zero tokens); the first changed call and everything after runs live. Same script + same args → full cache hit; failures are never cached (they re-run). Survives opencode restarts. Saved workflows live at .opencode/workflows/<name>.js (or .mjs) in the project and are invoked by name.
+Every successful agent() result is journaled. Relaunch with resume_from_run_id and every agent() call whose (prompt, opts) key matches a journaled call replays from cache (instant, zero tokens), matched per-item by key + occurrence — independent of position, so editing one item still replays unchanged items (including expensive siblings) for free; only changed, new, and previously-failed calls run live. N byte-identical calls replay their N journaled results, then the N+1th runs live. Replay returns the FROZEN journaled result; a call that re-runs live may legitimately return a different answer — agents are non-deterministic. Same script + same args → full cache hit; failures are never cached (they re-run). Survives opencode restarts. Saved workflows live at .opencode/workflows/<name>.js (or .mjs) in the project and are invoked by name.
 
 ## Minimal example
 
@@ -297,8 +297,10 @@ export function createWorkflowTool(
 				.string()
 				.optional()
 				.describe(
-					"Resume a prior run by its run_id (spec §7): the longest unchanged " +
-						"prefix of agent() calls replays from cache, the rest runs live. " +
+					"Resume a prior run by its run_id (spec §7): every agent() call " +
+						"matching a journaled call key replays from cache (per-item, " +
+						"position-independent); changed/new/failed calls run live. A " +
+						"re-run may differ — replay returns the frozen result. " +
 						"Source/args default to the prior run's when omitted.",
 				),
 			budget_tokens: tool.schema
