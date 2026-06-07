@@ -28,6 +28,7 @@ import type {
 	EngineClient,
 	SessionCreateBody,
 	SessionPromptAsyncBody,
+	SessionStatusMap,
 } from "./session-runner";
 import type { WakeClient, WakeSessionStatusMap } from "./wake-notifier";
 
@@ -58,6 +59,8 @@ export interface SdkSessionClient {
 		abort(opts: { path: { id: string } }): Promise<unknown>;
 		messages(opts: { path: { id: string } }): Promise<SdkResult<GateMessage[]>>;
 		get(opts: { path: { id: string } }): Promise<unknown>;
+		/** Global turn-liveness status map (audit row f) — Task 7.1.1 completion veto. */
+		status(): Promise<SdkResult<SessionStatusMap>>;
 	};
 }
 
@@ -102,6 +105,10 @@ export function adaptSdkClient(client: SdkSessionClient): EngineClient {
 				return { data: res.data ?? undefined };
 			},
 			get: async (opts) => client.session.get({ path: opts.path }),
+			status: async () => {
+				const res = await client.session.status();
+				return { data: res.data ?? undefined };
+			},
 		},
 	};
 }

@@ -65,6 +65,7 @@ function makeClient() {
 			abort: async () => undefined,
 			messages: async () => ({ data: [] }),
 			get: async () => ({ data: { id: "ses_child" } }),
+			status: async () => ({ data: {} }),
 		},
 	};
 }

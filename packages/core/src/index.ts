@@ -36,6 +36,8 @@ export type {
 	PersistFn,
 	SessionRunnerConfig,
 	SessionRunnerDeps,
+	SessionStatus,
+	SessionStatusMap,
 } from "./session-runner";
 export { createSessionRunner } from "./session-runner";
 export type {

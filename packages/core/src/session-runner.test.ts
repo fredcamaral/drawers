@@ -79,6 +79,10 @@ function makeClient() {
 			get() {
 				return Promise.resolve({ data: { id: "ses" } });
 			},
+			status() {
+				// Empty map: every session absent = idle-equivalent (no liveness veto).
+				return Promise.resolve({ data: {} });
+			},
 		},
 	};
 
@@ -494,6 +498,9 @@ describe("createSessionRunner — onSessionCreated hook", () => {
 				get() {
 					return Promise.resolve({ data: { id: "ses" } });
 				},
+				status() {
+					return Promise.resolve({ data: {} });
+				},
 			},
 		};
 		return {
@@ -732,7 +739,10 @@ interface PartEntry {
 	state?: { status: string; output?: string; error?: string };
 }
 interface MessageEntry {
-	info: { role: "user" | "assistant"; time: { created: number } };
+	info: {
+		role: "user" | "assistant";
+		time: { created: number; completed?: number };
+	};
 	parts: PartEntry[];
 }
 
@@ -779,6 +789,11 @@ function makeLifecycleClient() {
 					return Promise.reject(new Error("session gone"));
 				}
 				return Promise.resolve({ data: { id: opts.path.id } });
+			},
+			status() {
+				// Empty map: every session absent = idle-equivalent (no liveness veto),
+				// so completion turns on output validity + message `time.completed`.
+				return Promise.resolve({ data: {} });
 			},
 		},
 	};
@@ -973,7 +988,7 @@ describe("createSessionRunner — resume", () => {
 		h.setNextCreateId("ses_x");
 		h.setMessages("ses_x", [
 			{
-				info: { role: "assistant", time: { created: 1000 } },
+				info: { role: "assistant", time: { created: 1000, completed: 1000 } },
 				parts: [{ type: "text", text: "turn1" }],
 			},
 		]);
@@ -1014,7 +1029,7 @@ describe("createSessionRunner — resume", () => {
 		// --- second lifecycle completes via idle ---
 		h.setMessages("ses_x", [
 			{
-				info: { role: "assistant", time: { created: 9000 } },
+				info: { role: "assistant", time: { created: 9000, completed: 9000 } },
 				parts: [{ type: "text", text: "turn2" }],
 			},
 		]);
@@ -1071,7 +1086,7 @@ describe("createSessionRunner — resume", () => {
 		h.setNextCreateId("ses_z");
 		h.setMessages("ses_z", [
 			{
-				info: { role: "assistant", time: { created: 1000 } },
+				info: { role: "assistant", time: { created: 1000, completed: 1000 } },
 				parts: [{ type: "text", text: "old" }],
 			},
 		]);
@@ -1286,7 +1301,7 @@ describe("createSessionRunner — slot accounting baseline", () => {
 		h.setNextCreateId("ses_2");
 		h.setMessages("ses_2", [
 			{
-				info: { role: "assistant", time: { created: 2000 } },
+				info: { role: "assistant", time: { created: 2000, completed: 2000 } },
 				parts: [{ type: "text", text: "ok" }],
 			},
 		]);
@@ -1305,7 +1320,7 @@ describe("createSessionRunner — slot accounting baseline", () => {
 		expect(concurrency.runningCount(model)).toBe(1);
 		h.setMessages("ses_2", [
 			{
-				info: { role: "assistant", time: { created: 50000 } },
+				info: { role: "assistant", time: { created: 50000, completed: 50000 } },
 				parts: [{ type: "text", text: "ok again" }],
 			},
 		]);
@@ -1347,7 +1362,7 @@ describe("createSessionRunner — restart recovery", () => {
 
 		h.setMessages("ses_alive", [
 			{
-				info: { role: "assistant", time: { created: 1500 } },
+				info: { role: "assistant", time: { created: 1500, completed: 1500 } },
 				parts: [{ type: "text", text: "done" }],
 			},
 		]);

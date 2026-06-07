@@ -63,15 +63,29 @@ function makeClock(start = 1000): Clock & { set: (t: number) => void } {
 }
 
 interface MessageEntry {
-	info: { role: "user" | "assistant"; time: { created: number } };
+	info: {
+		role: "user" | "assistant";
+		time: { created: number; completed?: number };
+	};
 	parts: Array<{ type: string; text?: string }>;
 }
 
-/** Build a single-assistant-message transcript whose text was created at `created`. */
-function assistantText(text: string, created: number): MessageEntry[] {
+/**
+ * Build a single-assistant-message transcript whose text was created at `created`.
+ * Pass `completed` to stamp the message as a finished turn (Task 7.1.1); omit it to
+ * leave the turn mid-flight (no `time.completed`).
+ */
+function assistantText(
+	text: string,
+	created: number,
+	completed?: number,
+): MessageEntry[] {
 	return [
 		{
-			info: { role: "assistant", time: { created } },
+			info: {
+				role: "assistant",
+				time: completed === undefined ? { created } : { created, completed },
+			},
 			parts: [{ type: "text", text }],
 		},
 	];
@@ -88,13 +102,22 @@ function statusOf(task: BgTask): TaskStatus {
 	return task.status;
 }
 
+type FakeStatus = "busy" | "retry" | "idle" | undefined;
+
 /**
- * Scripted SDK surface for the gate: messages/get/abort. Each is overridable
- * per session id so tests script validation, existence, and abort behavior.
+ * Scripted SDK surface for the gate: messages/get/abort/status. Each is
+ * overridable per session id so tests script validation, existence, abort, and
+ * turn-liveness (Task 7.1.1) behavior.
+ *
+ * `fetchStatus` defaults to `undefined` (absent from the global status map =
+ * idle-equivalent, no veto) so pre-7.1.1 tests keep their meaning; a test sets a
+ * `busy`/`retry` status or makes the read throw to exercise the veto.
  */
 function makeSdk() {
 	const messagesBySession = new Map<string, MessageEntry[]>();
 	const getFails = new Set<string>();
+	const statusBySession = new Map<string, FakeStatus>();
+	const statusThrows = new Set<string>();
 	const abortCalls: string[] = [];
 	let abortRejects = false;
 
@@ -104,6 +127,10 @@ function makeSdk() {
 			messagesBySession.set(id, msgs),
 		setGetFails: (id: string, fails: boolean) =>
 			fails ? getFails.add(id) : getFails.delete(id),
+		setStatus: (id: string, status: FakeStatus) =>
+			statusBySession.set(id, status),
+		setStatusThrows: (id: string, throws: boolean) =>
+			throws ? statusThrows.add(id) : statusThrows.delete(id),
 		setAbortRejects: (v: boolean) => (abortRejects = v),
 		client: {
 			messages: async (id: string) => messagesBySession.get(id) ?? [],
@@ -115,14 +142,19 @@ function makeSdk() {
 				abortCalls.push(id);
 				if (abortRejects) throw new Error("abort failed");
 			},
+			fetchStatus: async (id: string): Promise<FakeStatus> => {
+				if (statusThrows.has(id)) throw new Error("status read failed");
+				return statusBySession.get(id);
+			},
 		},
 	};
 }
 
-const VALID_OUTPUT: MessageEntry[] = assistantText("done", 1000);
+// Valid AND completed: a finished turn (non-empty text + `time.completed`).
+const VALID_OUTPUT: MessageEntry[] = assistantText("done", 1000, 1000);
 const EMPTY_OUTPUT: MessageEntry[] = [
 	{
-		info: { role: "assistant", time: { created: 1000 } },
+		info: { role: "assistant", time: { created: 1000, completed: 1000 } },
 		parts: [{ type: "text", text: "" }],
 	},
 ];
@@ -179,6 +211,7 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
 		},
 		abortSession: (id) => sdk.client.abort(id),
 		fetchMessages: (id) => sdk.client.messages(id),
+		fetchStatus: (id) => sdk.client.fetchStatus(id),
 		sessionExists: async (id) => {
 			await sdk.client.get(id);
 		},
@@ -631,7 +664,7 @@ describe("turn watermark — stale previous-turn output must not complete a resu
 
 		// --- turn 1: launch dispatch, valid output created at the dispatch moment. ---
 		h.gate.markTurnDispatched(h.task); // launch stamps the watermark too
-		h.sdk.setMessages("ses_child", assistantText("turn1 result", 1000));
+		h.sdk.setMessages("ses_child", assistantText("turn1 result", 1000, 5000));
 		h.clock.set(1000 + 6000); // session quiet, grace elapsed
 		h.timers.tick();
 		await flush();
@@ -656,7 +689,7 @@ describe("turn watermark — stale previous-turn output must not complete a resu
 		expect(h.completes).toHaveLength(1); // still only turn 1's completion
 
 		// --- the resumed turn finally produces its OWN output (created after dispatch). ---
-		h.sdk.setMessages("ses_child", assistantText("turn2 result", 26500));
+		h.sdk.setMessages("ses_child", assistantText("turn2 result", 26500, 31000));
 		h.clock.set(20000 + 12000);
 		h.timers.tick();
 		await flush();
@@ -684,5 +717,130 @@ describe("turn watermark — stale previous-turn output must not complete a resu
 		await flush();
 		expect(h.task.status).toBe("running");
 		expect(h.completes).toHaveLength(0);
+	});
+});
+
+// ===========================================================================
+// TURN LIVENESS (Task 7.1.1): quiet-time is NOT proof a turn ended. Completion
+// additionally requires the turn to be provably NOT live — `session.status()`
+// not busy/retry AND the newest post-watermark assistant message has
+// `time.completed`. Two authoritative signals; either one live → veto.
+// ===========================================================================
+
+describe("turn liveness — session status veto (Task 7.1.1)", () => {
+	test("quiet + grace + valid output but status busy → no completion; flips idle → next tick completes", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", VALID_OUTPUT);
+		h.sdk.setStatus("ses_child", "busy"); // turn is live despite the quiet window
+		h.gate.start();
+
+		h.clock.set(1000 + 6000); // quiet, grace elapsed, valid output present
+		h.timers.tick();
+		await flush();
+		// THE BUG: pre-7.1.1 this completes mid-turn. The status veto must block it.
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(0);
+
+		// the turn ends: status goes idle. The next poll tick may now complete.
+		h.sdk.setStatus("ses_child", "idle");
+		h.clock.set(1000 + 12000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(1);
+	});
+
+	test("status retry → no completion (mid-turn API backoff is still a live turn)", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", VALID_OUTPUT);
+		h.sdk.setStatus("ses_child", "retry");
+		h.gate.start();
+
+		h.clock.set(1000 + 6000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(0);
+	});
+
+	test("status read throws → no completion (conservative); later idle read → completes", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", VALID_OUTPUT);
+		h.sdk.setStatusThrows("ses_child", true); // a FAILED read blocks completion
+		h.gate.start();
+
+		h.clock.set(1000 + 6000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(0);
+
+		// a later successful read (idle/absent) lets the next tick complete.
+		h.sdk.setStatusThrows("ses_child", false);
+		h.clock.set(1000 + 12000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(1);
+	});
+});
+
+describe("turn liveness — message-completion veto (Task 7.1.1)", () => {
+	test("newest post-watermark assistant message lacks time.completed → no completion; gains completed → completes", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		// valid text, but NO `time.completed`: the turn is mid-flight.
+		h.sdk.setMessages("ses_child", assistantText("partial", 1000));
+		h.sdk.setStatus("ses_child", "idle"); // status alone would allow completion
+		h.gate.start();
+
+		h.clock.set(1000 + 6000);
+		h.timers.tick();
+		await flush();
+		// THE BUG: pre-7.1.1 this completes off an in-flight message. Must not.
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(0);
+
+		// the SAME message now gains its completion stamp → finished turn → completes.
+		h.sdk.setMessages(
+			"ses_child",
+			assistantText("partial then done", 1000, 5500),
+		);
+		h.clock.set(1000 + 12000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(1);
+	});
+
+	test("status absent (undefined) + completed newest message → completes (fast-turn regression guard)", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", VALID_OUTPUT); // completed turn
+		// no setStatus → fetchStatus returns undefined (absent = idle-equivalent).
+		h.gate.start();
+
+		h.clock.set(1000 + 6000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(1);
+	});
+
+	test("stale timeout still force-cancels a session that stays busy forever (liveness bypassed by design)", async () => {
+		const h = makeHarness({
+			pollMs: 5000,
+			staleTimeoutMs: 45 * 60 * 1000,
+			minIdleMs: 5000,
+		});
+		h.sdk.setMessages("ses_child", VALID_OUTPUT);
+		h.sdk.setStatus("ses_child", "busy"); // permanently live → would never complete
+		h.gate.start();
+
+		h.clock.set(1000 + 46 * 60 * 1000); // past the stale window
+		h.timers.tick();
+		await flush();
+		// stale force-cancel bypasses the liveness veto: a hung busy session must die.
+		expect(statusOf(h.task)).toBe("cancelled");
+		expect(h.task.error).toMatch(/do not create a replacement/i);
+		expect(h.sdk.abortCalls).toEqual(["ses_child"]);
 	});
 });

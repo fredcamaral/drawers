@@ -76,8 +76,28 @@ export interface EngineClient {
 		// Completion-gate surfaces (audit rows c/e).
 		messages(opts: { path: { id: string } }): Promise<{ data?: GateMessage[] }>;
 		get(opts: { path: { id: string } }): Promise<unknown>;
+		/**
+		 * Global turn-liveness status map (audit row f), for the completion gate's
+		 * liveness veto (Task 7.1.1). Returns `{ [sessionID]: SessionStatus }`; the
+		 * runner narrows the owning session's entry to busy/retry/idle/undefined.
+		 * Same SDK call the wake notifier uses, adapted in sdk-adapter.ts.
+		 */
+		status(): Promise<{ data?: SessionStatusMap }>;
 	};
 }
+
+/**
+ * One session's turn-liveness status in the global status map (audit row f). The
+ * variants the gate cares about: `busy`/`retry` (live), `idle` (not working). An
+ * absent entry is idle-equivalent (same semantics the wake notifier uses).
+ */
+export type SessionStatus =
+	| { type: "idle" }
+	| { type: "retry"; attempt: number; message: string; next: number }
+	| { type: "busy" };
+
+/** The global `session.status` response: a map keyed by session id (audit row f). */
+export type SessionStatusMap = Record<string, SessionStatus>;
 
 export type PersistFn = (task: BgTask) => Promise<void>;
 
@@ -225,6 +245,15 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		fetchMessages: async (sessionID) => {
 			const res = await client.session.messages({ path: { id: sessionID } });
 			return res.data ?? [];
+		},
+		// Turn-liveness read (Task 7.1.1): the GLOBAL status map narrowed to THIS
+		// session's entry. busy/retry → live; idle → not working; absent → idle-
+		// equivalent (returns undefined). A throw here propagates to the gate, which
+		// treats a failed read as a completion veto (conservative). Reuses the same
+		// `session.status()` map the wake notifier reads (audit row f).
+		fetchStatus: async (sessionID) => {
+			const res = await client.session.status();
+			return res.data?.[sessionID]?.type;
 		},
 		sessionExists: async (sessionID) => {
 			await client.session.get({ path: { id: sessionID } });

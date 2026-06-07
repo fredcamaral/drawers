@@ -57,13 +57,19 @@ export interface GatePart {
 /**
  * A message as returned by `session.messages` (audit row c), narrowed.
  *
- * `info.time.created` is the message-creation epoch ms. It is typed on BOTH
- * `UserMessage` (`time: { created }`) and `AssistantMessage`
- * (`time: { created; completed? }`) in the SDK `types.gen.d.ts`, so the turn
- * watermark (Task 6.1.1) can compare against it without any `as any`.
+ * `info.time.created` is the message-creation epoch ms. `info.time.completed` is
+ * the turn-completion epoch ms — present ONLY on `AssistantMessage` and ONLY once
+ * its turn has finished. Both are typed in the SDK `types.gen.d.ts`
+ * (`UserMessage.time: { created }`, `AssistantMessage.time: { created; completed? }`),
+ * so the turn watermark (Task 6.1.1) and the turn-liveness veto (Task 7.1.1) can
+ * read them without any `as any`. A post-watermark assistant message that LACKS
+ * `completed` is mid-flight → the turn is still live (Task 7.1.1).
  */
 export interface GateMessage {
-	info: { role: "user" | "assistant"; time: { created: number } };
+	info: {
+		role: "user" | "assistant";
+		time: { created: number; completed?: number };
+	};
 	parts: GatePart[];
 }
 
@@ -94,6 +100,21 @@ export interface CompletionGateDeps {
 	abortSession(sessionID: string): Promise<void>;
 	/** Fetch a session's messages for output validation (audit row c). */
 	fetchMessages(sessionID: string): Promise<GateMessage[]>;
+	/**
+	 * Read a session's turn-liveness status (Task 7.1.1, audit row f). Resolves to
+	 * the session's entry in the global `session.status` map narrowed to one of:
+	 *   - `"busy"` / `"retry"` → the turn is LIVE (working or mid-retry-backoff),
+	 *   - `"idle"` → not working,
+	 *   - `undefined` → ABSENT from the map = idle-equivalent (the same semantics
+	 *     the wake notifier uses: a reachable-but-not-busy parent).
+	 * A `busy`/`retry` verdict — or a read that THROWS — vetoes completion: quiet
+	 * time alone is NOT proof a turn ended (silent windows >5s are normal mid-turn
+	 * on first-token latency / API retry backoff). A throw blocks conservatively —
+	 * better to wait for the next poll tick than risk a mid-turn completion.
+	 */
+	fetchStatus(
+		sessionID: string,
+	): Promise<"busy" | "retry" | "idle" | undefined>;
 	/** Resolve if the session exists; reject/throw if gone (audit row e). */
 	sessionExists(sessionID: string): Promise<void>;
 	clock: Clock;
@@ -133,11 +154,12 @@ export interface CompletionGate {
 	handleEvent(event: Event): Promise<void>;
 	awaitCompletion(taskId: string, timeoutMs?: number): Promise<BgTask>;
 	/**
-	 * Reset per-turn completion bookkeeping for a task being resumed: drops the
-	 * cached output validation for its session (a positive from the PREVIOUS turn
-	 * must not validate the new turn), clears get-miss and defer-timer state, and
-	 * restarts the idle/stale activity clock at `now`. Call AFTER the task is back
-	 * to `running` with a fresh `startedAt`, before the new prompt is dispatched.
+	 * Reset per-turn completion bookkeeping for a task being resumed: clears
+	 * get-miss and defer-timer state and restarts the idle/stale activity clock at
+	 * `now`. Call AFTER the task is back to `running` with a fresh `startedAt`,
+	 * before the new prompt is dispatched. (Task 7.1.1 removed the per-session
+	 * validity cache, so there is no longer any cached positive to evict here — the
+	 * turn watermark alone fences stale previous-turn output.)
 	 */
 	resetForResume(task: BgTask): void;
 	/**
@@ -146,8 +168,7 @@ export interface CompletionGate {
 	 * messages created at/after this watermark, so a resumed turn (Task 6.1.1)
 	 * is never completed by the PREVIOUS turn's output still in the transcript.
 	 * Call at every dispatch — launch's first prompt AND resume's re-prompt —
-	 * AFTER {@link CompletionGate.resetForResume} on the resume path. Also evicts
-	 * any cached positive for the session so a turn-N cache can't satisfy turn N+1.
+	 * AFTER {@link CompletionGate.resetForResume} on the resume path.
 	 */
 	markTurnDispatched(task: BgTask): void;
 	/** Begin the safety poll. Idempotent. */
@@ -210,6 +231,42 @@ function hasValidOutput(messages: GateMessage[], watermark: number): boolean {
 	return false;
 }
 
+/**
+ * The turn is mid-flight (LIVE) iff the NEWEST post-watermark assistant message
+ * lacks `time.completed` (Task 7.1.1). `completed` is stamped only when a turn
+ * finishes, so its absence on the latest in-turn assistant message means the model
+ * is still producing — even if some text/tool part already exists (the in-flight
+ * message had `time.created` but no `time.completed` yet in the field forensics).
+ *
+ * "Newest" is by `time.created` among assistant messages created at/after the
+ * watermark; messages from earlier turns are ignored (same fence as
+ * {@link hasValidOutput}). With NO post-watermark assistant message, there is no
+ * in-flight message to veto on — return false (this turn's liveness is decided by
+ * the status veto / validity check instead, and `assessTurn` only consults this
+ * once validity already holds, i.e. such a message exists).
+ */
+function messageTurnIsLive(
+	messages: GateMessage[],
+	watermark: number,
+): boolean {
+	let newest: GateMessage | undefined;
+	for (const m of messages) {
+		if (m.info.role !== "assistant") {
+			continue;
+		}
+		if (m.info.time.created < watermark) {
+			continue; // stale: from a turn dispatched before this one
+		}
+		if (!newest || m.info.time.created >= newest.info.time.created) {
+			newest = m;
+		}
+	}
+	if (!newest) {
+		return false;
+	}
+	return newest.info.time.completed === undefined;
+}
+
 export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	const {
 		getTask,
@@ -217,6 +274,7 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		freeSlot,
 		abortSession,
 		fetchMessages,
+		fetchStatus,
 		sessionExists,
 		clock,
 		persist,
@@ -235,8 +293,6 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	const waiters = new Map<string, Set<Waiter>>();
 	/** Last-activity timestamp per task id, for quiet/stale detection. */
 	const lastActivity = new Map<string, number>();
-	/** Sessions whose output has been validated once (no need to refetch). */
-	const validatedSessions = new Set<string>();
 	/** Consecutive `session.get` miss counts per task id. */
 	const getMisses = new Map<string, number>();
 	/**
@@ -337,9 +393,6 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 			dt.clear();
 			deferTimers.delete(task.id);
 		}
-		if (task.sessionID) {
-			validatedSessions.delete(task.sessionID);
-		}
 		try {
 			await persist(task);
 		} catch (err) {
@@ -370,34 +423,66 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	}
 
 	/**
-	 * Validate THIS-TURN output for a tracked running session; cache positive
-	 * results. Only assistant messages created at/after the task's turn watermark
-	 * count (Task 6.1.1) — stale previous-turn output can't satisfy a resumed turn.
-	 * The cache is per-session and is evicted on resume, so a turn-N positive never
-	 * leaks into turn N+1.
+	 * Assess a tracked running session's turn before completion (Task 7.1.1). The
+	 * single choke point both completion paths (deferred-idle fire + poll quiet
+	 * branch) run AFTER grace and BEFORE `tryComplete`. A turn may complete iff it
+	 * is `{ valid: true, live: false }`.
+	 *
+	 * Two authoritative liveness signals, status checked FIRST (cheapest, and a
+	 * `busy` verdict short-circuits the message fetch entirely):
+	 *  1. STATUS VETO — `fetchStatus` returns `busy`/`retry` → live; a read that
+	 *     THROWS also blocks (conservative: wait for the next poll tick rather than
+	 *     risk a mid-turn completion). Quiet time alone is NOT proof of turn end:
+	 *     silent windows >5s are normal mid-turn (first-token latency on large
+	 *     prompts; API ECONNRESET retry backoff).
+	 *  2. MESSAGE VETO — the newest post-watermark assistant message lacks
+	 *     `time.completed` → the turn is mid-flight ({@link messageTurnIsLive}).
+	 *
+	 * Validity (post-watermark output exists, {@link hasValidOutput}) and the message
+	 * liveness signal share ONE `fetchMessages` call — never fetched twice. Only
+	 * assistant messages created at/after the task's turn watermark count (Task
+	 * 6.1.1), so stale previous-turn output neither validates nor de-livens a
+	 * resumed turn. NOTHING is cached: validity could be cached (output existence is
+	 * monotonic per turn) but liveness is point-in-time and must be re-read on every
+	 * attempt — and since liveness needs the fetch anyway, a validity cache would
+	 * save only the in-memory scan, not the fetch, so it was removed rather than
+	 * kept as dead structure (Task 7.1.1).
 	 */
-	async function outputIsValid(
+	async function assessTurn(
 		task: BgTask,
 		sessionID: string,
-	): Promise<boolean> {
-		if (validatedSessions.has(sessionID)) {
-			return true;
+	): Promise<{ valid: boolean; live: boolean }> {
+		// (1) Status veto FIRST — cheapest, and a live verdict makes the message
+		//     fetch unnecessary (short-circuit). A THROW is a FAILED read → block.
+		try {
+			const status = await fetchStatus(sessionID);
+			if (status === "busy" || status === "retry") {
+				return { valid: false, live: true };
+			}
+		} catch (err) {
+			logger?.debug?.("fetchStatus failed during assessment — blocking", {
+				sessionID,
+				err: errorText(err),
+			});
+			return { valid: false, live: true };
 		}
+
+		// (2) One message fetch serves BOTH validity and message-liveness.
 		let messages: GateMessage[];
 		try {
 			messages = await fetchMessages(sessionID);
 		} catch (err) {
-			logger?.debug?.("fetchMessages failed during validation", {
+			logger?.debug?.("fetchMessages failed during assessment", {
 				sessionID,
 				err: errorText(err),
 			});
-			return false;
+			return { valid: false, live: false };
 		}
-		if (hasValidOutput(messages, watermarkOf(task))) {
-			validatedSessions.add(sessionID);
-			return true;
-		}
-		return false;
+		const watermark = watermarkOf(task);
+		return {
+			valid: hasValidOutput(messages, watermark),
+			live: messageTurnIsLive(messages, watermark),
+		};
 	}
 
 	/** Find the tracked running/pending task owning a session id. */
@@ -468,15 +553,18 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		sessionID: string,
 	): Promise<void> {
 		// Re-read status: between scheduling and here it may have flipped.
-		const live = getTask(task.id);
-		if (live?.status !== "running") {
+		const liveTask = getTask(task.id);
+		if (liveTask?.status !== "running") {
 			return;
 		}
-		if (await outputIsValid(live, sessionID)) {
+		// One liveness+validity assessment after grace, before the flip (Task 7.1.1).
+		const { valid, live } = await assessTurn(liveTask, sessionID);
+		if (valid && !live) {
 			tryComplete(task.id, "completed");
 		}
-		// invalid → do not complete; the model may still be mid-flight. Safety
-		// nets (poll / stale) will catch a truly-finished session later.
+		// invalid OR still-live → do not complete; the model may still be mid-flight
+		// (quiet time is not proof of turn end). Safety nets (poll / stale) will
+		// catch a truly-finished session later.
 	}
 
 	async function handleEvent(event: Event): Promise<void> {
@@ -569,9 +657,14 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 			return;
 		}
 
-		// Session exists and is quiet: the fallback for a missed idle event.
-		if (graceElapsed(task) && (await outputIsValid(task, sessionID))) {
-			tryComplete(task.id, "completed");
+		// Session exists and is quiet: the fallback for a missed idle event. Run the
+		// SAME liveness+validity assessment the idle path uses (Task 7.1.1) — quiet
+		// time alone is not enough; the turn must be provably not live.
+		if (graceElapsed(task)) {
+			const { valid, live } = await assessTurn(task, sessionID);
+			if (valid && !live) {
+				tryComplete(task.id, "completed");
+			}
 		}
 	}
 
@@ -617,9 +710,6 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	}
 
 	function resetForResume(task: BgTask): void {
-		if (task.sessionID) {
-			validatedSessions.delete(task.sessionID);
-		}
 		getMisses.delete(task.id);
 		const dt = deferTimers.get(task.id);
 		if (dt) {
@@ -633,14 +723,10 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 
 	function markTurnDispatched(task: BgTask): void {
 		// Watermark = dispatch moment. Output created before this is a prior turn's
-		// and must not validate this turn (Task 6.1.1). Also evict any cached
-		// positive: a turn-N validation must not satisfy turn N+1 (resume re-uses
-		// the same session id). resetForResume already evicts on the resume path;
-		// stamping here keeps the invariant uniform across launch and resume.
+		// and must not validate this turn (Task 6.1.1). The watermark alone fences
+		// stale output now that nothing is cached (Task 7.1.1 removed the per-session
+		// validity cache), so this is the single bookkeeping write at dispatch.
 		turnWatermark.set(task.id, clock.now());
-		if (task.sessionID) {
-			validatedSessions.delete(task.sessionID);
-		}
 	}
 
 	async function dispose(): Promise<void> {

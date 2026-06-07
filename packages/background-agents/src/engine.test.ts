@@ -61,6 +61,9 @@ function makeClient(opts: { sessionAlive?: boolean } = {}) {
 				}
 				return { data: { id: "ses_x" } };
 			},
+			// Empty status map: every session absent = idle-equivalent (no liveness
+			// veto), so these tests' completion behavior is unchanged (Task 7.1.1).
+			status: async () => ({ data: {} }),
 		},
 	};
 }

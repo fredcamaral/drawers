@@ -24,6 +24,7 @@ function inertClient(): EngineClient {
 			abort: () => Promise.resolve(undefined),
 			messages: () => Promise.resolve({ data: [] }),
 			get: () => Promise.resolve({ data: { id: "ses_inert" } }),
+			status: () => Promise.resolve({ data: {} }),
 		},
 	};
 }

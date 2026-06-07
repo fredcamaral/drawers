@@ -78,7 +78,10 @@ interface PartEntry {
 	state?: { status: string; output?: string; error?: string };
 }
 interface MessageEntry {
-	info: { role: "user" | "assistant"; time: { created: number } };
+	info: {
+		role: "user" | "assistant";
+		time: { created: number; completed?: number };
+	};
 	parts: PartEntry[];
 }
 
@@ -154,6 +157,13 @@ function makeScriptedClient() {
 			get() {
 				return Promise.resolve({ data: { id: "ses" } });
 			},
+			// Empty status map: every session absent = idle-equivalent (no status
+			// veto). These conformance cases drive completion via idle + grace and
+			// stamp `time.completed` on their transcripts (Task 7.1.1), so the
+			// message-liveness signal — not the status one — gates completion here.
+			status() {
+				return Promise.resolve({ data: {} });
+			},
 		},
 	};
 
@@ -180,7 +190,13 @@ function makeScriptedClient() {
 function done(text: string): MessageEntry[] {
 	return [
 		{
-			info: { role: "assistant", time: { created: FAKE_CREATED } },
+			info: {
+				role: "assistant",
+				// `completed` stamped: a finished turn (not mid-flight). Task 7.1.1's
+				// message-liveness veto requires the newest post-watermark assistant
+				// message to carry `time.completed` before the gate may complete.
+				time: { created: FAKE_CREATED, completed: FAKE_CREATED },
+			},
 			parts: [{ type: "text", text }],
 		},
 	];

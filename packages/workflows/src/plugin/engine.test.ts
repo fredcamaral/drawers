@@ -88,6 +88,8 @@ function makeClient() {
 			abort: async () => undefined,
 			messages: async () => ({ data: [] }),
 			get: async () => ({ data: { id: "ses_child" } }),
+			// Empty status map: absent = idle-equivalent, no liveness veto (Task 7.1.1).
+			status: async () => ({ data: {} }),
 		},
 	};
 }
@@ -801,12 +803,17 @@ function makeCompletingClient(reply = "AGENT_RESULT") {
 				messages: async () => ({
 					data: [
 						{
-							info: { role: "assistant" as const, time: { created: NOW } },
+							info: {
+								role: "assistant" as const,
+								time: { created: NOW, completed: NOW },
+							},
 							parts: [{ type: "text", text: reply }],
 						},
 					],
 				}),
 				get: async () => ({ data: { id: "ses_child" } }),
+				// Absent status = idle-equivalent; completed message = finished turn.
+				status: async () => ({ data: {} }),
 			},
 		},
 	};
@@ -1244,13 +1251,15 @@ function makeBudgetClient(tokens: { output: number; reasoning: number }) {
 							info: {
 								role: "assistant" as const,
 								tokens,
-								time: { created: NOW },
+								time: { created: NOW, completed: NOW },
 							},
 							parts: [{ type: "text", text: "REPLY" }],
 						},
 					],
 				}),
 				get: async () => ({ data: { id: "ses_child" } }),
+				// Absent status = idle-equivalent; completed message = finished turn.
+				status: async () => ({ data: {} }),
 			},
 		},
 	};
@@ -1389,6 +1398,7 @@ describe("createWorkflowEngine — resume across restart", () => {
 				abort: async () => undefined,
 				messages: async () => ({ data: [] }),
 				get: async () => ({ data: { id: "ses_c2" } }),
+				status: async () => ({ data: {} }),
 			},
 		};
 		const engine2 = createWorkflowEngine({
