@@ -24,7 +24,7 @@
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
 | 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Complete / 5.2 Epic-level |
 | 6 | CC parity: structured results survive slow real-world turns (completion-gate watermark), absolute `script_path` works, live in-session workflow observability, active parent wake | 6.1, 6.2, 6.3 | Complete |
-| 7 | Mid-turn completion eliminated (turn-liveness gate: session status + message `time.completed`); structured/empty failures carry diagnostics and full results are retrievable; resume replays journaled items per-item (key+occurrence) instead of prefix | 7.1, 7.2, 7.3 | 7.1 Detailed |
+| 7 | Mid-turn completion eliminated (turn-liveness gate: session status + message `time.completed`); structured/empty failures carry diagnostics and full results are retrievable; resume replays journaled items per-item (key+occurrence) instead of prefix | 7.1, 7.2, 7.3 | Detailed |
 
 ## Design decisions (binding across phases)
 
@@ -1038,12 +1038,63 @@ interface SessionRunner {
 **Dependencies:** Epic 7.1 (most nulls/empties die with the root cause; this epic handles the residue honestly).
 **Done when:** a forced schema-mismatch run shows `null (schema: <reason>; raw N chars preserved)` in status and the raw text is retrievable; `workflow_status full:true` returns the complete `returnValue` untruncated. Report findings R1, R2; usability #1, #2, #3.
 
+#### Task 7.2.1: Agent-call diagnostics — typed null reasons, raw-text capture, empty warning
+
+- [ ] Done
+
+**Context:** `agent()` degrades every failure to bare `null` (`packages/workflows/src/runtime/agent-call.ts:261-284` — structured resolution, non-completed status, runner throw all collapse identically), and an empty `""` final text journals as a normal ok result. The field report (R1, usability #2) shows the cost: 4 nulls forced a 6-minute hypothesis-and-rerun cycle because nothing said WHY. Progress events (`ProgressEvent` in `packages/workflows/src/runtime/types.ts`) carry `agent:end {label, status}` and are rendered by `workflow-status.ts`; run records persist via the engine (`packages/workflows/src/plugin/engine.ts` settle path).
+
+**Implementation vision:** Three layers, one source of truth. (a) In `agent-call.ts`, when a call resolves `null` or `""`, build a typed diagnostic: `{ label, index, reason, rawText?, childSessionID? }` where `reason` is one of `schema_no_call` (completed but no `structured_output` stored after nudge), `schema_invalid` (tool called, validation failed — registry already distinguishes via `resultFor.present`), `status_error` / `status_cancelled` (non-completed terminal), `await_failed` (runner throw), `empty_output` (completed, final text empty). For the schema reasons, capture the child's raw final text via `runner.readOutput(taskId)` `summaryText`, capped at 20_000 chars with a `…[capped]` marker; never let the capture failure mask the original flow (fence it). (b) Extend `agent:end` progress events with optional `note?: string` (short human line, e.g. `null — schema_invalid: missing required 'verdict'; raw 6.3k chars preserved`); `workflow-status.ts` renders it after the duration, and renders `⚠ empty output` for `empty_output`. (c) Persist: add `diagnostics?: AgentDiagnostic[]` to the run record (`RunRecord`), collected by the engine from a new optional `onDiagnostic` hook threaded next to `onProgress`/`onRecord`, written at settle — so a finished run is post-mortem-debuggable without SQLite. Keep CC parity untouched: `agent()` still RETURNS bare null/"" to the script; nulls stay un-journaled (that is the failure-targeted retry path).
+
+**Files:**
+- Modify: `packages/workflows/src/runtime/agent-call.ts`, `packages/workflows/src/runtime/types.ts`
+- Modify: `packages/workflows/src/plugin/engine.ts` (hook + RunRecord field + persist)
+- Modify: `packages/workflows/src/plugin/tools/workflow-status.ts` (note + warning render)
+- Test: `packages/workflows/src/runtime/agent-call.test.ts`, `packages/workflows/src/plugin/engine.test.ts`, `packages/workflows/src/plugin/tools/workflow-status.test.ts`
+
+**Verification:** RED-first unit tests: each `reason` variant produces the right diagnostic; raw capture caps at 20k; diagnostics persist in the run record; status render shows the note line and the empty warning; `agent()` return values unchanged (null/""). Full suite + typecheck + lint.
+
+**Done when:** every null/empty result is explainable from the persisted run record alone; script-visible semantics byte-identical.
+
+#### Task 7.2.2: Untruncated result retrieval through `workflow_status`
+
+- [ ] Done
+
+**Context:** `workflow-status.ts:22-23` caps the rendered result at `RESULT_MAX = 2000` head-truncation (`workflow-status.ts:99`), including with `full: true` — the field report's worst usability finding (#1): the security report was unreadable through the tool and required `jq` against `workflow-runs/<id>.json`.
+
+**Implementation vision:** `full: true` renders the COMPLETE `returnValue` JSON (and per-agent diagnostics from 7.2.1) for both live-settled and terminal-persisted runs; keep the 2000-char head preview for the default (no-`full`) view. Add a safety ceiling only against pathological sizes: 200_000 chars, with an explicit `… (result exceeds 200k chars; full JSON at <runs-path>/<id>.json)` trailer naming the on-disk path — never a silent cut. The tool description gains one line stating `full: true` returns the untruncated result.
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/tools/workflow-status.ts`
+- Test: `packages/workflows/src/plugin/tools/workflow-status.test.ts`
+
+**Verification:** RED-first: a >2000-char returnValue renders complete under `full: true` (live and terminal paths) and previews at 2000 without it; the 200k trailer names the path. Full suite.
+
+**Done when:** a user can read their entire workflow result through the tool; no shell required.
+
 ### Epic 7.3: Per-item journal replay (key + occurrence)
 
 **Goal:** resume replays every journaled item whose call key matches, independent of position — editing item 0's prompt no longer re-runs an unchanged expensive item 1 (report finding R4: identical key `1d2e8321…` re-executed for 4m17s and produced a different answer).
 **Scope:** `packages/workflows/src/plugin/engine.ts` (replay matching), `packages/workflows/src/runtime/keys.ts` (occurrence counting), journal docs.
 **Dependencies:** none (independent of 7.1/7.2).
 **Done when:** resume with an edited early `parallel()` item replays unchanged siblings from journal (zero re-execution) while re-running edited items and previously-null items (nulls stay unjournaled — that is the failure-targeted retry path); duplicate identical calls keep correct semantics via nth-occurrence matching (the CC adversarial-verify pattern spawns N byte-identical refuters — key alone would wrongly dedupe them); agent non-determinism on cache MISS documented in the tool description (finding R5). **Declared deviation from CC:** CC documents longest-unchanged-prefix replay; key+occurrence matching strictly dominates for `parallel()` sets and is what the field report requests — flagged, not silent.
+
+#### Task 7.3.1: Key+occurrence journal replay
+
+- [ ] Done
+
+**Context:** replay matching lives in `packages/workflows/src/runtime/agent-call.ts:128-181`: a `byIndex` map plus a run-level `prefixIntact` latch — the first key mismatch at any index voids ALL later replays (`prefixIntact.value = false` is forever). Field finding R4: editing item 0's prompt re-executed an unchanged, expensive item 1 (`security-reviewer`, identical key `1d2e8321…`, 4m17s re-run, different answer). `sub-workflow.ts` consumes the same replay seam with `workflow:`-prefixed boundary keys (`packages/workflows/src/runtime/keys.ts`); the latch type is threaded from `compose.ts`/`evaluate.ts` (find `prefixIntact` construction).
+
+**Implementation vision:** Replace positional-prefix matching with per-key occurrence queues: build `byKey: Map<string, JournalEntry[]>` from the prior journal (entries pushed in journal-file order; entries are recorded in COMPLETION order, which is fine — occurrence order only needs to be deterministic per key, and for byte-identical duplicate calls the cached results are interchangeable by definition). At each call: `shift()` the queue for this call's key — hit → replay (emit `cached`, re-record into the new journal with the CURRENT call index, count the lifetime cap exactly as today); miss/empty → run live. Delete the `prefixIntact` latch and its threading entirely (dead with per-item matching); keep the deterministic `callIndex` ordinal (still the journal `index` field and the progress ordering anchor). Apply the same mechanism to the `workflow()` boundary in `sub-workflow.ts` — its `workflow:`-prefixed keys land in the same `byKey` map, no special-casing. Docs: update the spec-§7 comment trail (`agent-call.ts`, `engine.ts:149`, `journal.ts` if it narrates prefix), the `workflow` tool description's resume sentence (`packages/workflows/src/plugin/tools/workflow.ts` — replace "longest unchanged prefix" wording with per-item key matching), add the R5 non-determinism contract line (replay returns the frozen journaled result; a re-run may legitimately differ — agents are non-deterministic), and fix both READMEs' resume sections.
+
+**Files:**
+- Modify: `packages/workflows/src/runtime/agent-call.ts`, `packages/workflows/src/runtime/sub-workflow.ts`, threading sites (`compose.ts`/`evaluate.ts`)
+- Modify: `packages/workflows/src/plugin/tools/workflow.ts` (description), `packages/workflows/src/plugin/engine.ts` (comment), `packages/*/README.md`
+- Test: `packages/workflows/src/runtime/agent-call.test.ts`, `packages/workflows/src/runtime/sub-workflow.test.ts`, `packages/workflows/src/plugin/engine.test.ts` (resume e2e)
+
+**Verification:** RED-first: (1) edited item 0 + unchanged items 1..3 → item 0 live, 1..3 cached (the R4 scenario, asserted via `agent:end` statuses); (2) N byte-identical calls journaled → N replays, N+1th runs live (occurrence semantics); (3) previously-null item absent from journal → runs live; (4) reordered identical-key calls still replay (position independence); (5) sub-workflow boundary replays by key. Existing prefix tests rewritten to the new semantics — deleting a now-false test is correct, silently weakening one is not. Full suite + typecheck + lint.
+
+**Done when:** the R4 scenario replays the unchanged sibling for free; no `prefixIntact` remains; docs/tool descriptions tell the new truth.
 
 ---
 
