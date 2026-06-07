@@ -519,15 +519,17 @@ The viewer rides the **same package** as the server plugin — no separate insta
 The `"./tui"` plugin API is newer and less settled than the server plugin API, and its published types lag the runtime (`PluginModule.tui?: never` pins `tui` *out* on the server module even though the runtime accepts it). This surface is built and tested against:
 
 - **opencode `1.16.2`** (`@opencode-ai/plugin@1.16.2`, which provides the `/tui` type entry).
-- **opentui `0.3.2`** for all three peers — `@opentui/core`, `@opentui/keymap`, `@opentui/solid` — pinned to the exact versions the pinned opencode ships.
+- **opentui `0.3.2`** for all three peers — `@opentui/core`, `@opentui/keymap`, `@opentui/solid` — the version opencode `1.16.2` bundles (so the typecheck types match the runtime).
 
-The viewer module types its default export as `TuiPluginModule` (from `@opencode-ai/plugin/tui`), which sidesteps the type lag. Treat breakage on an opencode/opentui bump as expected maintenance: re-pin the versions, re-run `bun run typecheck` (it includes `tsconfig.tui.json`), and re-walk the manual steps below.
+> ⚠️ **The single-instance rule: solid/opentui usage lives ONLY in `.tsx` files, never `.ts`.** Solid JSX is *compiled*, and the host rewrites a plugin's `solid-js`/`@opentui/*` imports to its OWN already-loaded runtime instance — but its Solid transform only runs on files matching `/\.(js|ts)x$/` (`.tsx`/`.jsx`). A `.ts` file that imports solid/opentui at runtime is NOT rewritten, so it resolves to this package's *nested* copy = a **second** solid/opentui instance. Mounting host JSX built from a second instance fails the host renderer's `node instanceof TextRenderable` checks and throws `Orphan text error: "" must have a <text> as a parent` at navigate time. This is exactly what crashed the viewer when the entry was a `.ts` that called `createComponent`/`lazy` from the nested `solid-js`. The fix (mirroring opencode's own external `cwd-status.tsx`): the entry is `index.tsx` and registers with inline JSX render callbacks (`<WorkflowsRoute … />`) so the host transform owns component creation; the JSX-free path/sentinel helpers live in `paths.ts`. A `bun test` guard (`paths.test.ts`) asserts no `.ts` under `src/tui` imports solid/opentui. (A *published* install has no nested copy — the peer resolves to the host's opentui — so this is the same single-instance guarantee by a different route.)
+
+The viewer module types its default export as `TuiPluginModule` (from `@opencode-ai/plugin/tui`), which sidesteps the type lag. Treat breakage on an opencode/opentui bump as expected maintenance: re-pin opentui to the new host version, re-run `bun run typecheck` (it includes `tsconfig.tui.json`), and re-walk the manual steps below.
 
 ### Live walkthrough (manual validation)
 
 The pure reduction/summary logic is unit-tested under `bun test`, but live rendering against a real opentui runtime is out of automated CI scope. Validate it manually:
 
-1. **Install both surfaces.** Point your `opencode.json` at `opencode-drawer-workflows` (or the dev `file://` form) and launch OpenCode's TUI against the pinned opencode `1.16.2`.
+1. **Install both surfaces.** Point your `opencode.json` at `opencode-drawer-workflows` (or the dev `file://` form) and launch OpenCode's TUI against opencode `1.16.2` (the `./tui` entry is `index.tsx` so the host transform owns component creation — see the single-instance rule above).
 2. **Launch a multi-phase workflow.** Run a script with at least two phases and a handful of agents (the canonical review workflow in [Example 3](#example-3--the-canonical-review-workflow-pipeline--adversarial-verify-with-a-sub-workflow) works well). The `workflow` tool returns a `run_id` immediately.
 3. **Watch the sidebar summarize it.** Within ~1s the `sidebar_content` slot shows a line like `… <run-id>  3/5 agents · 1m 12s` (3 of 5 agents finished), the count climbing as agents settle.
 4. **Open the route.** Run `/workflows` from the command palette (or click the sidebar line). The full-screen Phases | Agents | Detail view opens on that run.

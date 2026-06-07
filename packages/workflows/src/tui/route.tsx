@@ -35,7 +35,7 @@ import {
 	shortModel,
 	statusMarker,
 } from "./format";
-import { writeCancelSentinel } from "./index";
+import { writeCancelSentinel } from "./paths";
 import {
 	type AgentView,
 	createRunStateReducer,

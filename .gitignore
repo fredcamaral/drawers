@@ -16,3 +16,6 @@ dist/
 # OS / editor noise
 .DS_Store
 .claude/scheduled_tasks.lock
+
+# opencode local working dir (plugin deps, persisted workflow scripts) — generated
+.opencode/

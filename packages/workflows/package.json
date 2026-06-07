@@ -5,7 +5,7 @@
 	"exports": {
 		".": "./src/plugin/index.ts",
 		"./lib": "./src/index.ts",
-		"./tui": "./src/tui/index.ts"
+		"./tui": "./src/tui/index.tsx"
 	},
 	"dependencies": {
 		"@drawers/core": "workspace:*",
