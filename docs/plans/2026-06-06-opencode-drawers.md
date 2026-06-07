@@ -809,7 +809,7 @@ interface SessionRunner {
 
 #### Task 6.1.1: Completion-gate turn watermark
 
-- [ ] Done
+- [x] Done — `39f5cc7`. Watermark = timestamp (`AssistantMessage.time.created` is typed in SDK 1.16.2); stamped at the single `dispatchPrompt` site; `validatedSessions` evicted on stamp; RED captured (poll AND idle paths flipped `completed` off stale output). `GateMessage.info` gained required `time.created` — test fixtures in 3 downstream files updated (type-sync only).
 
 **Context:** `packages/core/src/completion.ts` — the gate completes a task via (a) `session.idle` + min-idle grace and (b) a 5s safety poll whose quiet-session branch calls `outputIsValid(sessionID)` (`completion.ts:334-353`). `outputIsValid` fetches messages and accepts ANY assistant output (`hasValidOutput`), and caches positives in `validatedSessions`. After `resume()` (`session-runner.ts:530-575`, used by the structured-output nudge at `agent-call.ts:320-332`), the previous turn's output instantly validates → premature completion during any silent gap. The gate already exposes a resume-reset seam (`completion.ts:132` — "restarts the idle/stale activity clock"); `session-runner.resume` calls it after flipping the task to running.
 
@@ -826,7 +826,7 @@ interface SessionRunner {
 
 #### Task 6.1.2: Absolute script_path resolution
 
-- [ ] Done
+- [x] Done — `d08cbc7`. Leading-`/` passthrough; relative join unchanged; RED captured.
 
 **Context:** `packages/workflows/src/plugin/resolve-source.ts:80` — `joinPath(directory, nameOrRef.scriptPath)` strips a leading `/`, so an absolute path is silently rooted at the project dir and fails to read. The `workflow` tool's own output hands the model the persisted ABSOLUTE script path for iteration, so this breaks our documented resume/iterate loop.
 
@@ -842,7 +842,7 @@ interface SessionRunner {
 
 #### Task 6.1.3: Smoke scenario D — structured output e2e
 
-- [ ] Done
+- [x] Done — `254805d`. D asserts the persisted returnValue is the validated object. Scope addition (approved in-flight): Scenario C's stdout regex was a pre-existing deterministic blocker (model paraphrases tool output — three distinct false-failure modes observed); C now asserts persisted state only (task-file count + returnValue deep-equal). Full A→D green in a single run.
 
 **Context:** `packages/workflows/test-harness/run-smoke.ts` covers pipeline/parallel/phase/sub-workflow/stop/resume but NEVER passes `schema` — the gap that let the registry/gate bug ship. The schema happy path is cheap to verify live (haiku answers the structured suffix within the grace window; see the 2026-06-07 repro).
 
