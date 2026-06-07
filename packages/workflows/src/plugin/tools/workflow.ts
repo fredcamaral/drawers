@@ -153,6 +153,61 @@ async function loadSavedWorkflow(
 	};
 }
 
+/**
+ * The tool description doubles as the authoring manual: the orchestrating model
+ * writes the scripts, so the contract must live where the model reads it. This
+ * is the same trade Claude Code's Workflow tool makes — a fat description taxes
+ * every turn of every session, in exchange for correct scripts on the first try.
+ * The full reference (with worked examples) is the package README.
+ */
+const WORKFLOW_DESCRIPTION = `Run a workflow: an orchestration script that fans out to MANY agents and can consume large token volumes. ONLY use this when the user has opted into orchestration (the \`ultracode\` keyword, a standing ultracode toggle, an explicit request for multi-agent orchestration, a skill that invokes it, or a request to run a named/saved workflow); otherwise use single agent calls, or describe the workflow and its rough cost and ask. Returns immediately with a run_id — the run executes in the background and you are notified on completion; do not poll (workflow_status with wait_ms is the blocking option for single-turn contexts).
+
+## Script format
+
+Plain JavaScript, not TypeScript — type annotations fail to parse. The script must begin with a meta export that is a pure literal (no variables, calls, spreads, or template interpolation):
+
+  export const meta = {
+    name: 'review-changes',                       // required
+    description: 'Review changed files',          // required
+    phases: [{ title: 'Review' }, { title: 'Verify' }],  // optional; titles must match phase() calls
+  }
+
+The body below the meta runs in an async context: use top-level await freely; a top-level return value becomes the workflow result.
+
+## Script API (the only globals available)
+
+- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType. isolation:'worktree' is recognized but NOT yet supported (the agent runs without isolation).
+- pipeline(items, stage1, stage2, ...) → Promise<any[]> — run each item through all stages with NO barrier between stages: item A can be in stage 3 while item B is in stage 1. DEFAULT to this for multi-stage work. Each stage receives (prevResult, originalItem, index). A throwing stage drops that item to null.
+- parallel(thunks) → Promise<any[]> — run thunks (() => Promise) concurrently with a BARRIER: awaits all before returning; a failed thunk yields null, the call never rejects. Use ONLY when a later step genuinely needs ALL results together (dedup, cross-item comparison, early-exit on count).
+- phase(title) — start a progress group for subsequent agent() calls.
+- log(message) — emit a narrator line to the user.
+- args — the tool-call args value, verbatim.
+- budget — { total: number|null, spent(): number, remaining(): number }. Hard ceiling: once spent() reaches total, further agent() calls throw. Guard loops: while (budget.total && budget.remaining() > 50_000) { ... }.
+- workflow(nameOrRef, args?) — run another workflow inline (a saved name or { scriptPath }) and return its result. One level deep only; a child workflow error THROWS (unlike agent()'s null) — catch to handle.
+
+## Determinism (violations throw)
+
+Date.now(), Math.random(), and argless new Date() are banned — they would poison the resume cache. Pass timestamps in via args; vary prompts/labels by index instead of randomness. No setTimeout/setInterval/queueMicrotask, no process/require/fetch. console.log routes to log(). new Date(ms), Date.parse, and Date.UTC work.
+
+## Caps and failure semantics
+
+Lifetime cap of 1000 agent() calls per run (cached replays count); 4096 items max per pipeline/parallel call; concurrent agents capped at min(16, cores − 2) — excess queue. agent() failures degrade to null; cap/budget violations throw and stop the run.
+
+## Resume and saved workflows
+
+Every successful agent() result is journaled. Relaunch with resume_from_run_id and the longest unchanged prefix of agent() calls replays from cache (instant, zero tokens); the first changed call and everything after runs live. Same script + same args → full cache hit; failures are never cached (they re-run). Survives opencode restarts. Saved workflows live at .opencode/workflows/<name>.js (or .mjs) in the project and are invoked by name.
+
+## Minimal example
+
+  export const meta = { name: 'review', description: 'Review files, verify findings', phases: [{ title: 'Review' }, { title: 'Verify' }] }
+  const FINDINGS = { type: 'object', properties: { issues: { type: 'array', items: { type: 'string' } } }, required: ['issues'] }
+  const results = await pipeline(
+    args.files,
+    (f) => agent('Review ' + f + ' for bugs. Return issues.', { phase: 'Review', schema: FINDINGS }),
+    (r, f) => r && parallel(r.issues.map((i) => () => agent('Verify in ' + f + ': ' + i, { phase: 'Verify' }))),
+  )
+  return { verified: results.flat().filter(Boolean) }`;
+
 export function createWorkflowTool(
 	engine: WorkflowEngine,
 	deps: WorkflowToolDeps,
@@ -162,15 +217,7 @@ export function createWorkflowTool(
 	const wfDir = joinPath(directory, WORKFLOWS_SUBDIR);
 
 	return tool({
-		description:
-			"Run a workflow: an orchestration script that can fan out to MANY agents " +
-			"and consume large token volumes. ONLY use this when the user has opted " +
-			"into orchestration (the `ultracode` keyword, a standing ultracode toggle, " +
-			"an explicit request for multi-agent orchestration, a skill that invokes " +
-			"it, or a request to run a named/saved workflow); otherwise use single " +
-			"Agent calls or describe the workflow and its rough cost and ask. Returns " +
-			"immediately with a run_id — it runs in the background and notifies you on " +
-			"completion; do not poll.",
+		description: WORKFLOW_DESCRIPTION,
 		args: {
 			script: tool.schema
 				.string()

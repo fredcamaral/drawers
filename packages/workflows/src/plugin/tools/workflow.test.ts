@@ -131,6 +131,40 @@ async function run(
 	return outputText((await t.execute(args, c)) as string | { output: string });
 }
 
+describe("createWorkflowTool — description is the authoring contract", () => {
+	test("description carries every load-bearing authoring fact", () => {
+		const { engine, facade } = makeEngine({});
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const d = (t as unknown as { description: string }).description;
+
+		// Opt-in gate and no-poll guidance must survive the expansion.
+		expect(d).toContain("ultracode");
+		expect(d).toContain("do not poll");
+		// Meta block contract.
+		expect(d).toContain("export const meta");
+		expect(d).toContain("pure literal");
+		// The eight globals and their core semantics.
+		expect(d).toContain("agent(");
+		expect(d).toContain("pipeline(");
+		expect(d).toContain("parallel(");
+		expect(d).toContain("phase(");
+		expect(d).toContain("budget");
+		expect(d).toContain("workflow(");
+		expect(d).toContain("filter(Boolean)");
+		// Determinism bans.
+		expect(d).toContain("Math.random()");
+		expect(d).toContain("Date.now()");
+		// Caps.
+		expect(d).toContain("1000");
+		expect(d).toContain("4096");
+		// Resume + saved workflows.
+		expect(d).toContain("unchanged prefix");
+		expect(d).toContain(".opencode/workflows/");
+		// Plain JS, not TypeScript.
+		expect(d).toContain("not TypeScript");
+	});
+});
+
 describe("createWorkflowTool — source selection (xor)", () => {
 	test("zero sources → error naming the rule", async () => {
 		const { engine, facade } = makeEngine({});
