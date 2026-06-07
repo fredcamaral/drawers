@@ -67,6 +67,7 @@ import { createSourceResolver } from "./resolve-source";
 import {
 	createSessionStatsCollector,
 	type SessionStatsCollector,
+	type SessionStatsSnapshot,
 	type SessionTokenSnapshot,
 } from "./session-stats";
 
@@ -275,6 +276,14 @@ export interface WorkflowEngine {
 	stopRun(runId: string): void;
 	/** Snapshot of a run handle (record + progress), or undefined when unknown. */
 	statusOf(runId: string): RunHandle | undefined;
+	/**
+	 * Live per-session stats for a tracked CHILD session (Task 8.1.5). The
+	 * collector tracks a session only between its `agent:launched` and `agent:end`,
+	 * so this returns numbers ONLY for in-flight agents and `undefined` otherwise.
+	 * `workflow_status` reads it to fill the running rows of the CC-style tree (a
+	 * settled agent's final stats live on `RunRecord.agents` / the enriched end).
+	 */
+	statsSnapshot(sessionID: string): SessionStatsSnapshot | undefined;
 	/**
 	 * Live (status `running`) run handles owned by a parent session (Task 6.2.4).
 	 * The chat.message digest hook reads this to prepend a one-line digest per live
@@ -1051,6 +1060,10 @@ export function createWorkflowEngine(
 		return runs.get(runId);
 	}
 
+	function statsSnapshot(sessionID: string): SessionStatsSnapshot | undefined {
+		return stats.snapshot(sessionID);
+	}
+
 	function liveRunsFor(parentSessionID: string): RunHandle[] {
 		const out: RunHandle[] = [];
 		for (const handle of runs.values()) {
@@ -1096,6 +1109,7 @@ export function createWorkflowEngine(
 		},
 		stopRun,
 		statusOf,
+		statsSnapshot,
 		liveRunsFor,
 		handleEvent,
 		dispose: async () => {

@@ -1190,7 +1190,7 @@ interface SessionRunner {
 
 #### Task 8.1.5: `workflow_status` CC-style rendering
 
-- [ ] Done
+- [x] Done
 
 **Context:** `workflow-status.ts` reconstructs agent state by pairing `agent:start`/`agent:end` (`packages/workflows/src/plugin/tools/workflow-status.ts:14,94`) and renders a flat list; it has no phases tree, no per-agent stats. After 8.1.4, `handle.progress` (live) and `RunRecord.agents` (settled) both carry model/tokens/toolCalls/durationMs; the collector exposes `snapshot()` for in-flight agents. CC's reference layout (the parity target): phases sidebar with `✓ Impl 5/5`-style counters, agent rows `✓ impl:kadm-leaf  opus-4.8  112.7k tok · 51 tools · 7m 8s`.
 

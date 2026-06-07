@@ -1,8 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolContext } from "@opencode-ai/plugin";
 import type { ProgressEvent, StampedProgressEvent } from "../../runtime/types";
-import type { RunHandle, RunRecord, WorkflowEngine } from "../engine";
-import { createWorkflowStatusTool } from "./workflow-status";
+import type {
+	AgentSummary,
+	RunHandle,
+	RunRecord,
+	WorkflowEngine,
+} from "../engine";
+import type { EnrichedProgressEvent } from "../feed";
+import type { SessionStatsSnapshot } from "../session-stats";
+import {
+	createWorkflowStatusTool,
+	formatDuration,
+	formatTokens,
+} from "./workflow-status";
 
 /** Stamp a flat list of events at successive `at` offsets (Task 6.2.1 helper). */
 function stamp(events: ProgressEvent[], ats: number[]): StampedProgressEvent[] {
@@ -191,8 +202,8 @@ describe("createWorkflowStatusTool — wait_ms (single-turn settle affordance)",
 	});
 });
 
-describe("createWorkflowStatusTool — flat chronological progress render", () => {
-	test("phase headers inserted on phase change; markers per agent status", async () => {
+describe("createWorkflowStatusTool — CC-style phase-grouped progress render", () => {
+	test("phase groups with done/total counters; markers per agent status; narrator below", async () => {
 		const progress = stamp(
 			[
 				{ type: "agent:start", label: "scout", phase: "discover" },
@@ -213,25 +224,26 @@ describe("createWorkflowStatusTool — flat chronological progress render", () =
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_prog0001" }, ctx());
 
-		// Phase headers, first-appearance order.
-		expect(out).toContain("discover");
-		expect(out).toContain("build");
-		expect(out).toContain("(no phase)");
+		// Phase group headers with done/total counters, first-appearance order.
+		expect(out).toMatch(/discover\s+1\/1/);
+		// build has 2 occurrences (cached + error); both terminal → 2/2, marked ✗.
+		expect(out).toMatch(/✗ build\s+2\/2/);
+		// stray has no phase → the unnamed group, still running → 0/1, marked …
+		expect(out).toMatch(/… \(no phase\)\s+0\/1/);
 
-		// Markers.
-		expect(out).toContain("[done] scout");
-		expect(out).toContain("[cached] impl-a");
-		expect(out).toContain("[failed] impl-b");
-		// start without end → running.
-		expect(out).toContain("[running] stray");
+		// Agent rows with CC-style markers (✓ done/cached, ✗ failed, … running).
+		expect(out).toContain("✓ scout");
+		expect(out).toContain("✓ impl-a");
+		expect(out).toContain("✗ impl-b");
+		expect(out).toContain("… stray");
 
-		// Narrator + warn lines.
+		// Narrator + warn lines (below the tree).
 		expect(out).toContain("log: found 3 targets");
 		expect(out).toContain("warn: budget tight");
 
-		// Chronological: build header appears after discover.
+		// First-appearance order: discover group before build group.
 		expect(out.indexOf("discover")).toBeLessThan(out.indexOf("build"));
-		// scout (done) appears before impl-a (build).
+		// scout (discover) appears before impl-a (build).
 		expect(out.indexOf("scout")).toBeLessThan(out.indexOf("impl-a"));
 	});
 });
@@ -639,27 +651,33 @@ describe("createWorkflowStatusTool — live elapsed + counts (Task 6.2.1)", () =
 		expect(out).toContain("wf_live0001 — demo workflow — running (4.2s)");
 	});
 
-	test("per-agent elapsed renders on a done marker (end.at − start.at)", async () => {
-		const progress = stamp(
-			[
-				{ type: "agent:start", label: "scout", phase: "discover" },
-				{ type: "agent:end", label: "scout", status: "completed" },
-			],
-			[1_100, 1_900],
-		);
+	test("per-agent duration renders from the enriched durationMs on a done row", async () => {
+		// Task 8.1.4/8.1.5: duration is the engine-stamped durationMs on the
+		// enriched agent:end, not an in-tool start/end pairing.
+		const progress: EnrichedProgressEvent[] = [
+			{ type: "agent:start", label: "scout", phase: "discover", at: 1_100 },
+			{
+				type: "agent:end",
+				label: "scout",
+				status: "completed",
+				at: 9_100,
+				durationMs: 8_000,
+			} as EnrichedProgressEvent,
+		];
 		const handle: RunHandle = {
 			record: makeRecord({ id: "wf_live0002", createdAt: 1_000 }),
 			progress,
-			now: () => 2_000,
+			now: () => 10_000,
 		};
 		const engine = fakeEngine([handle]);
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_live0002" }, ctx());
-		// 1900 − 1100 = 800ms on the done line.
-		expect(out).toContain("[done] scout (800ms)");
+		// 8000ms → CC-style "8s" on the scout row.
+		expect(out).toContain("✓ scout");
+		expect(out).toContain("8s");
 	});
 
-	test("a still-running agent shows no per-agent elapsed (no end to pair)", async () => {
+	test("a still-running agent shows no per-agent duration (no end yet)", async () => {
 		const progress = stamp(
 			[{ type: "agent:start", label: "busy", phase: "p" }],
 			[1_100],
@@ -672,8 +690,9 @@ describe("createWorkflowStatusTool — live elapsed + counts (Task 6.2.1)", () =
 		const engine = fakeEngine([handle]);
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_live0003" }, ctx());
-		expect(out).toContain("[running] busy");
-		expect(out).not.toContain("[running] busy (");
+		expect(out).toContain("… busy");
+		// No duration / stats segment on a running row with no live snapshot.
+		expect(out).not.toContain("busy  ");
 	});
 
 	test("a LIVE run shows a counts line: running / done / failed / cached", async () => {
@@ -701,28 +720,39 @@ describe("createWorkflowStatusTool — live elapsed + counts (Task 6.2.1)", () =
 		expect(out).toContain("1 running / 1 done / 1 failed / 1 cached");
 	});
 
-	test("repeated labels pair chronologically (first-unmatched-start)", async () => {
-		const progress = stamp(
-			[
-				{ type: "agent:start", label: "dup", phase: "p" },
-				{ type: "agent:end", label: "dup", status: "completed" },
-				{ type: "agent:start", label: "dup", phase: "p" },
-				{ type: "agent:end", label: "dup", status: "completed" },
-			],
-			[1_000, 1_300, 1_500, 2_100],
-		);
+	test("repeated labels pair their enriched durationMs FIFO (first-unmatched-start)", async () => {
+		// Two occurrences of the same label, each ended with its own enriched
+		// durationMs; the FIFO pairing attributes each duration to its own row.
+		const progress: EnrichedProgressEvent[] = [
+			{ type: "agent:start", label: "dup", phase: "p", at: 1_000 },
+			{
+				type: "agent:end",
+				label: "dup",
+				status: "completed",
+				at: 6_000,
+				durationMs: 5_000,
+			} as EnrichedProgressEvent,
+			{ type: "agent:start", label: "dup", phase: "p", at: 7_000 },
+			{
+				type: "agent:end",
+				label: "dup",
+				status: "completed",
+				at: 16_000,
+				durationMs: 9_000,
+			} as EnrichedProgressEvent,
+		];
 		const handle: RunHandle = {
 			record: makeRecord({ id: "wf_live0005", createdAt: 1_000 }),
 			progress,
-			now: () => 3_000,
+			now: () => 20_000,
 		};
 		const engine = fakeEngine([handle]);
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_live0005" }, ctx());
-		// First pair: 1300−1000=300ms; second: 2100−1500=600ms — in chronological order.
-		expect(out).toContain("[done] dup (300ms)");
-		expect(out).toContain("[done] dup (600ms)");
-		expect(out.indexOf("(300ms)")).toBeLessThan(out.indexOf("(600ms)"));
+		// First occurrence 5000ms → "5s", second 9000ms → "9s", in row order.
+		expect(out).toContain("5s");
+		expect(out).toContain("9s");
+		expect(out.indexOf("5s")).toBeLessThan(out.indexOf("9s"));
 	});
 
 	test("a recovered run (no now view) renders as today — no elapsed header, no counts line", async () => {
@@ -963,5 +993,313 @@ describe("createWorkflowStatusTool — running tally suppression", () => {
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_running01" }, ctx());
 		expect(out).not.toContain("agent calls");
+	});
+});
+
+// ───────────────────────────── Task 8.1.5 ─────────────────────────────
+
+describe("formatTokens (Task 8.1.5)", () => {
+	test("renders the CC-style human token count", () => {
+		expect(formatTokens(999)).toBe("999");
+		expect(formatTokens(112_700)).toBe("112.7k");
+		expect(formatTokens(1_234_567)).toBe("1.2M");
+		// Band edges + the zero case a fresh agent shows.
+		expect(formatTokens(0)).toBe("0");
+		expect(formatTokens(1000)).toBe("1.0k");
+		expect(formatTokens(1_000_000)).toBe("1.0M");
+	});
+});
+
+describe("formatDuration (Task 8.1.5)", () => {
+	test("renders the CC-style spaced duration", () => {
+		expect(formatDuration(428_000)).toBe("7m 8s");
+		// Sub-minute → bare seconds; sub-hour with no leftover seconds drops `0s`.
+		expect(formatDuration(8_000)).toBe("8s");
+		expect(formatDuration(120_000)).toBe("2m");
+		// Hour band: hours + minutes + seconds, spaced.
+		expect(formatDuration(3_661_000)).toBe("1h 1m 1s");
+	});
+});
+
+/** Build a LIVE enriched progress stream (start/launched/end triples). */
+function enriched(events: EnrichedProgressEvent[]): EnrichedProgressEvent[] {
+	return events;
+}
+
+/** A fake engine whose statsSnapshot serves live numbers for running agents. */
+function fakeEngineWithStats(
+	handles: RunHandle[],
+	snaps: Record<string, SessionStatsSnapshot>,
+): WorkflowEngine {
+	const runs = new Map<string, RunHandle>();
+	for (const h of handles) {
+		runs.set(h.record.id, h);
+	}
+	return {
+		runs,
+		statusOf: (id: string) => runs.get(id),
+		statsSnapshot: (sessionID: string) => snaps[sessionID],
+	} as unknown as WorkflowEngine;
+}
+
+describe("createWorkflowStatusTool — CC-style agent tree, LIVE run (Task 8.1.5)", () => {
+	test("groups agents by phase with a done/total counter and per-agent stat rows", async () => {
+		const progress = enriched([
+			{ type: "agent:start", label: "impl:a", phase: "Implement", at: 1_000 },
+			{
+				type: "agent:launched",
+				label: "impl:a",
+				phase: "Implement",
+				sessionID: "ses_a",
+				model: "anthropic/claude-opus-4-8",
+				agentType: "build",
+				at: 1_010,
+			},
+			{
+				type: "agent:end",
+				label: "impl:a",
+				status: "completed",
+				sessionID: "ses_a",
+				at: 429_010,
+				durationMs: 428_000,
+				tokens: {
+					input: 100_000,
+					output: 12_700,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 51,
+				model: "anthropic/claude-opus-4-8",
+			} as EnrichedProgressEvent,
+			{ type: "agent:start", label: "impl:b", phase: "Implement", at: 430_000 },
+		]);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_tree0001", createdAt: 1_000 }),
+			progress,
+			now: () => 500_000,
+		};
+		const engine = fakeEngineWithStats([handle], {
+			// impl:b is still running with a live snapshot.
+			ses_b: {
+				tokens: {
+					input: 5_000,
+					output: 1_000,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 3,
+				lastTools: [],
+				updatedAt: 450_000,
+			},
+		});
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_tree0001" }, ctx());
+
+		// Phase header with a done/total counter (1 of 2 done).
+		expect(out).toMatch(/Implement\s+1\/2/);
+		// Completed row: marker, label, short model, tokens·tools·duration.
+		expect(out).toContain("impl:a");
+		expect(out).toContain("opus-4-8");
+		expect(out).not.toContain("anthropic/"); // provider prefix stripped
+		expect(out).toContain("112.7k tok"); // 100000 + 12700 = 112700
+		expect(out).toContain("51 tools");
+		expect(out).toContain("7m 8s"); // 428000ms
+	});
+
+	test("a running agent pulls live token/tool numbers from the engine snapshot", async () => {
+		const progress = enriched([
+			{ type: "agent:start", label: "live:b", phase: "Build", at: 1_000 },
+			{
+				type: "agent:launched",
+				label: "live:b",
+				phase: "Build",
+				sessionID: "ses_b",
+				model: "openai/gpt-x",
+				at: 1_010,
+			},
+		]);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_tree0002", createdAt: 1_000 }),
+			progress,
+			now: () => 60_000,
+		};
+		const engine = fakeEngineWithStats([handle], {
+			ses_b: {
+				tokens: {
+					input: 40_000,
+					output: 2_000,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 7,
+				lastTools: ["bash(ls)"],
+				updatedAt: 50_000,
+			},
+		});
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_tree0002" }, ctx());
+		// 40000 + 2000 = 42000 → "42.0k"; live tool count from the snapshot.
+		expect(out).toContain("42.0k tok");
+		expect(out).toContain("7 tools");
+		expect(out).toContain("live:b");
+	});
+
+	test("a cached agent renders `cached` in place of stats", async () => {
+		const progress = enriched([
+			{ type: "agent:start", label: "cheap", phase: "Replay", at: 1_000 },
+			{
+				type: "agent:end",
+				label: "cheap",
+				status: "cached",
+				at: 1_001,
+			},
+		]);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_tree0003", createdAt: 1_000 }),
+			progress,
+			now: () => 5_000,
+		};
+		const engine = fakeEngineWithStats([handle], {});
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_tree0003" }, ctx());
+		expect(out).toContain("cheap");
+		expect(out).toContain("cached");
+		// No spurious token/tool stats on a cached row.
+		expect(out).not.toContain("tok");
+	});
+
+	test("a degrade note still renders under the agent's row", async () => {
+		const progress = enriched([
+			{ type: "agent:start", label: "reviewer", phase: "Review", at: 1_000 },
+			{
+				type: "agent:launched",
+				label: "reviewer",
+				phase: "Review",
+				sessionID: "ses_r",
+				at: 1_010,
+			},
+			{
+				type: "agent:end",
+				label: "reviewer",
+				status: "error",
+				sessionID: "ses_r",
+				at: 2_000,
+				durationMs: 990,
+				note: "null — schema_invalid: missing 'verdict'; raw 6.3k chars preserved",
+			} as EnrichedProgressEvent,
+		]);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_tree0004", createdAt: 1_000 }),
+			progress,
+			now: () => 5_000,
+		};
+		const engine = fakeEngineWithStats([handle], {});
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_tree0004" }, ctx());
+		expect(out).toContain("schema_invalid");
+		const lines = out.split("\n");
+		const rowIdx = lines.findIndex((l) => l.includes("reviewer"));
+		expect(lines[rowIdx + 1]).toContain("schema_invalid");
+	});
+
+	test("agents with no phase fall under a single unnamed group", async () => {
+		const progress = enriched([
+			{ type: "agent:start", label: "loner", at: 1_000 },
+			{ type: "agent:end", label: "loner", status: "completed", at: 2_000 },
+		]);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_tree0005", createdAt: 1_000 }),
+			progress,
+			now: () => 5_000,
+		};
+		const engine = fakeEngineWithStats([handle], {});
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_tree0005" }, ctx());
+		expect(out).toContain("(no phase)");
+		expect(out).toContain("loner");
+	});
+});
+
+describe("createWorkflowStatusTool — CC-style agent tree, SETTLED run (Task 8.1.5)", () => {
+	test("renders purely from RunRecord.agents after restart (no progress events)", async () => {
+		const agents: AgentSummary[] = [
+			{
+				label: "impl:kadm-leaf",
+				phase: "Implement",
+				sessionID: "ses_1",
+				model: "anthropic/claude-opus-4-8",
+				agentType: "build",
+				status: "completed",
+				tokens: {
+					input: 100_000,
+					output: 12_700,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 51,
+				durationMs: 428_000,
+			},
+			{
+				label: "impl:other",
+				phase: "Implement",
+				status: "cached",
+			},
+		];
+		const engine = fakeEngineWithStats(
+			[
+				{
+					record: makeRecord({
+						id: "wf_set00001",
+						status: "completed",
+						completedAt: 500_000,
+						returnValue: { ok: true },
+						agents,
+					}),
+					// Recovered record: progress is empty, render must come from `agents`.
+					progress: [],
+				},
+			],
+			{},
+		);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_set00001" }, ctx());
+		// Both occurrences are terminal (completed + cached) → 2 of 2 done.
+		expect(out).toMatch(/Implement\s+2\/2/);
+		expect(out).toContain("impl:kadm-leaf");
+		expect(out).toContain("opus-4-8");
+		expect(out).toContain("112.7k tok");
+		expect(out).toContain("51 tools");
+		expect(out).toContain("7m 8s");
+		// The cached sibling renders `cached`, no stats.
+		expect(out).toContain("impl:other");
+		expect(out).toContain("cached");
+		// The result preview survives below the tree.
+		expect(out).toContain("result:");
+		expect(out).toContain('"ok":true');
+	});
+
+	test("a settled record carrying no agents still renders header + result (no tree)", async () => {
+		const engine = fakeEngineWithStats(
+			[
+				{
+					record: makeRecord({
+						id: "wf_set00002",
+						status: "completed",
+						completedAt: 2_000,
+						returnValue: { ok: 1 },
+					}),
+					progress: [],
+				},
+			],
+			{},
+		);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_set00002" }, ctx());
+		expect(out).toContain("completed");
+		expect(out).toContain("result:");
 	});
 });
