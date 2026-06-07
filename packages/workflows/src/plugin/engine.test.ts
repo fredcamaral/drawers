@@ -898,6 +898,23 @@ function readJournal(files: Map<string, string>, id: string): JournalEntry[] {
 		.map((l) => JSON.parse(l) as JournalEntry);
 }
 
+const FEED = (id: string) => `${BASE}/workflow-feed/${id}.jsonl`;
+
+/** Read a feed file's parsed lines from the fake fs (missing → []) (Task 8.1.2). */
+function readFeed(
+	files: Map<string, string>,
+	id: string,
+): Array<Record<string, unknown>> {
+	const raw = files.get(FEED(id));
+	if (raw === undefined) {
+		return [];
+	}
+	return raw
+		.split("\n")
+		.filter((l) => l.length > 0)
+		.map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
 /**
  * Drive a single-agent child to completion: launch dispatched the prompt async,
  * so bump the clock past the grace and emit the child's idle event. Returns once
@@ -1614,5 +1631,133 @@ describe("createWorkflowEngine — resume across restart", () => {
 		expect(creates2).toBe(0);
 
 		await engine2.dispose();
+	});
+});
+
+describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
+	// A completed run must leave a parseable JSONL feed bracketed by run:start /
+	// run:end, with every engine-stamped progress event in between mirroring
+	// handle.progress (same enriched stream, one source of truth). Driven via the
+	// all-cache resume path: a seeded journal replays as cached against the inert
+	// client, so the run completes deterministically with agent:start/agent:end
+	// progress events and no live child needed.
+	test("a completed run leaves run:start … events … run:end matching handle.progress", async () => {
+		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
+		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_prior001",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_prior001.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_prior001.js`]: SCRIPT,
+			[JOURNALS("wf_prior001")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_prior001.json`]: JSON.stringify(priorRecord),
+		});
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_feed0001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_prior001",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		const lines = readFeed(files, "wf_feed0001");
+		// First line frames the run; last line settles it.
+		expect(lines[0]?.type).toBe("run:start");
+		expect(lines[0]?.runId).toBe("wf_feed0001");
+		expect(lines[0]?.parentSessionID).toBe("ses_parent");
+		expect(lines[0]?.scriptPath).toBe(handle.scriptPath);
+		expect(lines.at(-1)?.type).toBe("run:end");
+		expect(lines.at(-1)?.status).toBe("completed");
+
+		// The interior lines are exactly the stamped progress events the handle
+		// carries, in order — feed and handle.progress are the same stream.
+		const interior = lines.slice(1, -1);
+		const progress = engine.statusOf(handle.runId)?.progress ?? [];
+		expect(interior).toEqual(progress as unknown as typeof interior);
+		// The cached call emitted agent:start + agent:end (no agent:launched).
+		expect(interior.some((l) => l.type === "agent:start")).toBe(true);
+		expect(interior.some((l) => l.type === "agent:end")).toBe(true);
+
+		await engine.dispose();
+	});
+
+	test("a feed-write failure cannot fail the run (fenced): run still completes", async () => {
+		// An fs whose writeFile/append synthesis throws for the feed file only would
+		// be brittle to target; instead inject a feed fs via a facade whose appendFile
+		// path always errors. The simplest deterministic seam: a facade whose
+		// readFile/writeFile work for scripts/journals/records but whose feed writes
+		// blow up. We model that by making writeFile throw for any feed path.
+		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
+		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_prior002",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_prior002.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_prior002.js`]: SCRIPT,
+			[JOURNALS("wf_prior002")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_prior002.json`]: JSON.stringify(priorRecord),
+		});
+		// Wrap writeFile so any feed-path write throws — the run must survive.
+		const baseWrite = facade.writeFile.bind(facade);
+		facade.writeFile = async (path: string, data: string, enc: "utf-8") => {
+			if (path.includes("/workflow-feed/")) {
+				throw new Error("EIO: feed disk on fire");
+			}
+			return baseWrite(path, data, enc);
+		};
+		const errors: string[] = [];
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: { ...noopLogger, error: (msg) => errors.push(msg) },
+			ids: fixedIds("wf_feed0002"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_prior002",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+
+		// The run completes despite the feed disk being on fire.
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+		expect(engine.statusOf(handle.runId)?.record.returnValue).toBe("CACHED");
+		// Nothing was written; the writer logged its single failure line.
+		expect(readFeed(files, "wf_feed0002")).toEqual([]);
+		expect(errors.some((e) => e.includes("feed"))).toBe(true);
+
+		await engine.dispose();
 	});
 });

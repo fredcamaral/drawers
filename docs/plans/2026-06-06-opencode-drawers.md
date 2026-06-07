@@ -1139,7 +1139,7 @@ interface SessionRunner {
 
 #### Task 8.1.2: Feed writer — `workflow-feed/<runId>.jsonl`
 
-- [ ] Done
+- [x] Done
 
 **Context:** the engine stamps every runtime event at one choke point (`packages/workflows/src/plugin/engine.ts:632-637`, pushes `StampedProgressEvent` to `handle.progress`); run records are created at `engine.ts:616` and settled at `engine.ts:673,690,707`. Data subdirs are declared as constants (`engine.ts:246-248`: `workflow-runs`, `workflow-scripts`, `workflow-journals`) under the base dir resolved by `resolveDataBaseDir` (`engine.ts:349-351`; XDG default per `packages/core/src/persistence.ts:91`). There is no on-disk live event stream today — `handle.progress` dies with the process.
 

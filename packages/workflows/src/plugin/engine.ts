@@ -57,6 +57,7 @@ import type {
 	StampedProgressEvent,
 } from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
+import { createFeedWriter, type FeedFs, type FeedWriter } from "./feed";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
 
@@ -246,6 +247,7 @@ const SUBDIR_TASKS = "workflow-tasks";
 const SUBDIR_RUNS = "workflow-runs";
 const SUBDIR_SCRIPTS = "workflow-scripts";
 const SUBDIR_JOURNALS = "workflow-journals";
+const SUBDIR_FEED = "workflow-feed";
 
 /**
  * Adapt the engine's {@link FsFacade} to the {@link JournalFs} the journal needs.
@@ -258,6 +260,31 @@ function journalFsFromFacade(fs: FsFacade): JournalFs {
 	return {
 		mkdir: (path, opts) => fs.mkdir(path, opts),
 		readFile: (path, enc) => fs.readFile(path, enc),
+		appendFile: async (path, data, enc) => {
+			let prior = "";
+			try {
+				prior = await fs.readFile(path, enc);
+			} catch (err) {
+				if ((err as { code?: string }).code !== "ENOENT") {
+					throw err;
+				}
+			}
+			await fs.writeFile(path, prior + data, enc);
+		},
+	};
+}
+
+/**
+ * Adapt the engine's {@link FsFacade} to the {@link FeedFs} the live feed writer
+ * needs (Task 8.1.2). The feed only mkdir's + appends; `appendFile` is synthesized
+ * as read-modify-write over `readFile`/`writeFile` exactly as the journal's, so the
+ * in-memory test fs (which has no native `appendFile`) works unchanged. The writer's
+ * own dead-state fence absorbs any error this raises — a broken disk drops feed
+ * lines but never breaks the run.
+ */
+function feedFsFromFacade(fs: FsFacade): FeedFs {
+	return {
+		mkdir: (path, opts) => fs.mkdir(path, opts),
 		appendFile: async (path, data, enc) => {
 			let prior = "";
 			try {
@@ -354,6 +381,7 @@ export function createWorkflowEngine(
 	const subdir = (name: string) => join(base, name);
 	const scriptsDir = subdir(SUBDIR_SCRIPTS);
 	const journalsDir = subdir(SUBDIR_JOURNALS);
+	const feedDir = subdir(SUBDIR_FEED);
 
 	// Sub-workflow source resolver (spec §8): maps a name/{scriptPath} to source
 	// against the project directory. Threaded into every TOP-LEVEL run's
@@ -368,6 +396,15 @@ export function createWorkflowEngine(
 	const journalPath = (id: string) => join(journalsDir, `${id}.jsonl`);
 
 	const journalFs = fs ? journalFsFromFacade(fs) : undefined;
+	// The live feed writer's fs (Task 8.1.2): same read-modify-write synthesis as the
+	// journal so the in-memory test fs works unchanged. ALWAYS present (fs always is).
+	const feedFs = feedFsFromFacade(fs);
+	const feedLogger = logger
+		? {
+				error: (msg: string, meta?: Record<string, unknown>) =>
+					logger.error(msg, meta),
+			}
+		: undefined;
 	const journalLogger = logger
 		? {
 				error: (msg: string, meta?: Record<string, unknown>) =>
@@ -412,6 +449,11 @@ export function createWorkflowEngine(
 
 	// (3) In-memory run handles, keyed by runId.
 	const runs = new Map<string, RunHandle>();
+
+	// Per-run live feed writers (Task 8.1.2), keyed by runId. Created in startRun,
+	// reachable by stopRun for the cancel `run:end` line; dropped when the run
+	// settles (the writer holds only a serialized promise chain, no live handle).
+	const feeds = new Map<string, FeedWriter>();
 
 	// (4) The terminal-notice queue. markNotified flips + re-persists the record.
 	const queue = createNotificationQueue({
@@ -600,6 +642,25 @@ export function createWorkflowEngine(
 		runs.set(runId, handle);
 		persistRecord(record);
 
+		// The live feed (Task 8.1.2): one writer per run, framed by run:start now and
+		// run:end at settle. Every stamped progress event is appended in the onProgress
+		// choke below, so the feed file and handle.progress carry the same stream. The
+		// writer is fenced — a feed-write failure can never break the run.
+		const feed = createFeedWriter({
+			dir: feedDir,
+			runId,
+			fs: feedFs,
+			logger: feedLogger,
+		});
+		feeds.set(runId, feed);
+		feed.append({
+			type: "run:start",
+			runId,
+			parentSessionID: args.parentSessionID,
+			scriptPath,
+			at: clock.now(),
+		});
+
 		// Every run gets its OWN journal (empty file). onRecord persists each settled
 		// AND each re-recorded cached entry, so the new journal is self-contained.
 		const journal: Journal | undefined = journalFs
@@ -632,7 +693,11 @@ export function createWorkflowEngine(
 			onProgress: (e) => {
 				// Stamp at the ENGINE boundary (Task 6.2.1): the runtime stays clock-free;
 				// the timestamp comes from the engine's injected clock here.
-				handle.progress.push({ ...e, at: clock.now() });
+				const stamped = { ...e, at: clock.now() };
+				handle.progress.push(stamped);
+				// Mirror onto the live feed (Task 8.1.2): one source of truth for the
+				// status tool (handle.progress) and the TUI viewer (the feed file).
+				feed.append(stamped);
 				logger?.debug("workflow progress", { runId, event: e });
 			},
 			// Task 7.2.1: collect typed diagnostics for null/empty agent calls.
@@ -655,16 +720,19 @@ export function createWorkflowEngine(
 		const drainJournal = (): Promise<void> =>
 			Promise.allSettled(journalWrites).then(() => undefined);
 
-		// Fire DETACHED — never await the run. On settle, DRAIN the journal, then
-		// update the record. The settle promise is exposed on the handle so
-		// workflow_status's wait_ms blocks until the journal is durable (resume-safe).
+		// Fire DETACHED — never await the run. On settle, DRAIN the journal AND the
+		// feed, then update the record. The settle promise is exposed on the handle so
+		// workflow_status's wait_ms blocks until both are durable (resume-safe; the
+		// viewer sees the run:end line). The feed's run:end is appended ONCE — here on
+		// natural settle, or in stopRun on cancel (which removes the writer from the
+		// map so this branch can't double-write it).
 		handle.settled = run
 			.run(resolved.source)
 			.then(async (result) => {
 				await drainJournal();
 				return result;
 			})
-			.then((result) => {
+			.then(async (result) => {
 				// A stopRun() may have already flipped the record to cancelled; do not
 				// clobber a terminal record with the run's own (also-terminal) result.
 				if (handle.record.status !== "running") {
@@ -681,8 +749,15 @@ export function createWorkflowEngine(
 					// field entirely on a clean run.
 					...(diagnostics.length > 0 ? { diagnostics } : {}),
 				});
+				await finalizeFeed(runId, {
+					status: result.status,
+					...(result.agentCount !== undefined
+						? { agentCount: result.agentCount }
+						: {}),
+					...(budget !== undefined ? { budgetSpent: budget.spent() } : {}),
+				});
 			})
-			.catch((err: unknown) => {
+			.catch(async (err: unknown) => {
 				// createWorkflowRun.run() never rejects, but fence defensively.
 				if (handle.record.status !== "running") {
 					return;
@@ -693,9 +768,29 @@ export function createWorkflowEngine(
 					// Carry any diagnostics collected before the throw (Task 7.2.1).
 					...(diagnostics.length > 0 ? { diagnostics } : {}),
 				});
+				await finalizeFeed(runId, { status: "error" });
 			});
 
 		return { runId, scriptPath, name };
+	}
+
+	/**
+	 * Write the feed's terminal `run:end` line, drain the writer, and drop it from
+	 * the per-run map (Task 8.1.2). Idempotent by map presence: whoever finalizes
+	 * first (natural settle or stopRun) consumes the writer; later callers no-op.
+	 * Fenced — `settled()` never rejects, so a feed flush failure can't fail a run.
+	 */
+	async function finalizeFeed(
+		runId: string,
+		end: { status: string; agentCount?: number; budgetSpent?: number },
+	): Promise<void> {
+		const feed = feeds.get(runId);
+		if (feed === undefined) {
+			return;
+		}
+		feeds.delete(runId);
+		feed.append({ type: "run:end", ...end, at: clock.now() });
+		await feed.settled();
 	}
 
 	function stopRun(runId: string): void {
@@ -705,6 +800,11 @@ export function createWorkflowEngine(
 		}
 		handle.run?.abort();
 		settleRecord(handle, { status: "cancelled" });
+		// Frame the cancelled feed (Task 8.1.2). stopRun is synchronous, so fire the
+		// finalize detached — the writer is fenced and its chain serializes the
+		// run:end after any in-flight progress appends. Removing it from the map here
+		// guarantees the detached natural-settle branch won't double-write run:end.
+		void finalizeFeed(runId, { status: "cancelled" });
 	}
 
 	function statusOf(runId: string): RunHandle | undefined {
