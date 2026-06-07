@@ -23,9 +23,36 @@ const RESULT_MAX = 2000;
 /** Group label for agents emitted without a phase. */
 const NO_PHASE = "(no phase)";
 
+/** Upper bound on `wait_ms` — two minutes, matching the run-spawn ceiling. */
+const WAIT_MS_CAP = 120_000;
+
 /** Coerce a raw arg to string (opencode's raw path may hand a non-string). */
 function coerceId(raw: unknown): string {
 	return typeof raw === "string" ? raw : String(raw);
+}
+
+/**
+ * Coerce `wait_ms` to a non-negative integer capped at {@link WAIT_MS_CAP}, or 0
+ * (no wait). opencode's raw execute path applies no Zod coercion, so the arg may
+ * arrive as a number, a numeric string, an empty string, NaN, or absent — every
+ * non-positive/garbage value collapses to 0 (Phase 2 NaN lesson).
+ */
+function coerceWaitMs(raw: unknown): number {
+	if (raw === undefined || raw === null) {
+		return 0;
+	}
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n <= 0) {
+		return 0;
+	}
+	return Math.min(Math.floor(n), WAIT_MS_CAP);
+}
+
+/** Resolve after `ms`, never rejecting — the loser of the settle race. */
+function timeout(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
 }
 
 /** Map an `agent:end` status onto the rendered marker word. */
@@ -190,17 +217,40 @@ export function createWorkflowStatusTool(engine: WorkflowEngine) {
 			"Inspect a workflow run by run_id: live progress (phase groups, agent " +
 			"status, narrator lines) while running, or the result/error once it has " +
 			"completed. You do NOT need to poll — you are notified on completion; use " +
-			"this to read progress or the final result on demand.",
+			"this to read progress or the final result on demand. Optionally pass " +
+			"`wait_ms` to BLOCK (up to 120000ms) until the run settles before " +
+			"rendering — useful in a single-turn/headless context where there is no " +
+			"completion notification to re-invoke you.",
 		args: {
 			run_id: tool.schema
 				.string()
 				.describe("the wf_ run id returned by the workflow tool"),
+			wait_ms: tool.schema
+				.number()
+				.optional()
+				.describe(
+					"Block up to this many ms (capped at 120000) for a LIVE run to settle " +
+						"before rendering. Omit or 0 to read the current snapshot immediately.",
+				),
 		},
 		async execute(args, _context: ToolContext) {
 			const runId = coerceId(args.run_id);
 			const handle = engine.statusOf(runId);
 			if (handle === undefined) {
 				return unknownText(engine, runId);
+			}
+
+			// wait_ms affordance (Task 4.3.2): on a LIVE run with a settle promise,
+			// race it against the (capped) timeout so a single-turn caller can block
+			// in-process. A timeout simply renders the still-running snapshot — never
+			// throws. Terminal runs short-circuit (nothing to wait for).
+			const waitMs = coerceWaitMs(args.wait_ms);
+			if (
+				waitMs > 0 &&
+				handle.record.status === "running" &&
+				handle.settled !== undefined
+			) {
+				await Promise.race([handle.settled, timeout(waitMs)]);
 			}
 			return render(handle);
 		},

@@ -608,6 +608,37 @@ describe("createAgentPrimitive — cached replay path", () => {
 		expect(starts.length).toBe(2);
 	});
 
+	test("entries recorded OUT OF INDEX ORDER (concurrent journal) still replay cached", async () => {
+		// Live-harness regression: concurrent agents (pipeline/parallel) record into
+		// the journal in COMPLETION order, not call-index order — so entries[0] may
+		// carry index 1. Replay MUST look up by the `index` field, not array position,
+		// or the very first replayed call mismatches and the whole prefix breaks live.
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			// index 1 first (it settled first under concurrency), then index 0.
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+		];
+		const { agent, runner: r } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		// Calls happen in index order; each must find ITS entry regardless of position.
+		expect(await agent("a")).toBe("cached-a");
+		expect(await agent("b")).toBe("cached-b");
+		expect((r as FakeRunner).launches.length).toBe(0);
+	});
+
 	test("a cached hit re-records the entry via onRecord (journals stay self-contained on resume)", async () => {
 		const recorded: JournalEntry[] = [];
 		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });

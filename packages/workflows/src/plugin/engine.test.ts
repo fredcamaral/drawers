@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { FsFacade, IdGenerator } from "@drawers/core";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { createStructuredOutputTool } from "../runtime/structured/tool";
@@ -201,9 +204,9 @@ describe("createWorkflowEngine — settle updates record + queues notice", () =>
 			parentSessionID: "ses_parent",
 		});
 
-		// run() resolves on the microtask queue; give it a turn.
-		await Promise.resolve();
-		await Promise.resolve();
+		// Await the run's settle sync point (the journal-drain step adds microtask
+		// hops, so counting fixed ticks no longer suffices).
+		await engine.statusOf(handle.runId)?.settled;
 
 		const status = engine.statusOf(handle.runId);
 		expect(status?.record.status).toBe("completed");
@@ -240,8 +243,9 @@ describe("createWorkflowEngine — settle updates record + queues notice", () =>
 			source: BROKEN,
 			parentSessionID: "ses_parent",
 		});
-		await Promise.resolve();
-		await Promise.resolve();
+		// Await the run's settle sync point (the journal-drain step adds microtask
+		// hops, so counting fixed ticks no longer suffices).
+		await engine.statusOf(handle.runId)?.settled;
 
 		const status = engine.statusOf(handle.runId);
 		expect(status?.record.status).toBe("error");
@@ -271,8 +275,7 @@ describe("createWorkflowEngine — statusOf progress accumulation", () => {
 			source: `${META}log("step one");\nlog("step two");\nreturn null;\n`,
 			parentSessionID: "ses_parent",
 		});
-		await Promise.resolve();
-		await Promise.resolve();
+		await engine.statusOf(handle.runId)?.settled;
 
 		const status = engine.statusOf(handle.runId);
 		const logs = (status?.progress ?? []).filter((e) => e.type === "log");
@@ -282,6 +285,243 @@ describe("createWorkflowEngine — statusOf progress accumulation", () => {
 		]);
 
 		await engine.dispose();
+	});
+});
+
+describe("createWorkflowEngine — sub-workflow resolver wiring (spec §8)", () => {
+	test("a top-level run resolves a saved workflow by name and returns its value", async () => {
+		// The saved child lives at <dir>/.opencode/workflows/helper.js — the engine's
+		// resolver reads it off the SAME in-memory fs. The child returns instantly
+		// (no agents), so the parent settles without the inert client ever idling.
+		const CHILD = `export const meta = { name: "helper", description: "h" };\nreturn { marker: "HELPER_OK", got: args };\n`;
+		const { facade } = makeFs({
+			"/proj/.opencode/workflows/helper.js": CHILD,
+		});
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_sub00001"),
+		});
+
+		const PARENT = `${META}const r = await workflow("helper", { n: 1 });\nreturn r;\n`;
+		const handle = await engine.startRun({
+			source: PARENT,
+			parentSessionID: "ses_parent",
+		});
+		// Await the run's settle directly (it has no live agents → resolves promptly).
+		await engine.statusOf(handle.runId)?.settled;
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(status?.record.returnValue).toEqual({
+			marker: "HELPER_OK",
+			got: { n: 1 },
+		});
+
+		await engine.dispose();
+	});
+
+	test("an unknown sub-workflow name surfaces as a catchable script error", async () => {
+		const { facade } = makeFs();
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_sub00002"),
+		});
+		// The script catches the resolver throw and returns a sentinel — proving the
+		// error is catchable (not a detonation).
+		const PARENT = `${META}try { await workflow("ghost"); return "NOT_THROWN"; } catch (e) { return "CAUGHT:" + e.message; }\n`;
+		const handle = await engine.startRun({
+			source: PARENT,
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("completed");
+		expect(String(status?.record.returnValue)).toContain("CAUGHT");
+		expect(String(status?.record.returnValue)).toContain("ghost");
+
+		await engine.dispose();
+	});
+});
+
+describe("createWorkflowEngine — settled promise on the handle (Task 4.3.2)", () => {
+	test("an instant run exposes a settled promise that resolves after the record flips", async () => {
+		const { facade } = makeFs();
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_settle01"),
+		});
+
+		const handle = await engine.startRun({
+			source: INSTANT,
+			args: { v: 1 },
+			parentSessionID: "ses_parent",
+		});
+		const live = engine.statusOf(handle.runId);
+		expect(live?.settled).toBeInstanceOf(Promise);
+
+		await live?.settled;
+		// After settle resolves, the record is terminal.
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		await engine.dispose();
+	});
+});
+
+describe("createWorkflowEngine — default fs (no injected facade)", () => {
+	// Regression for the live-harness Scenario C bug: the production plugin entry
+	// builds the engine WITHOUT an fs, and the old engine gated script-persist /
+	// journal-write / resume-read on `if (fs)` — so in production scripts were never
+	// written and resume could not read the prior script ("no fs configured").
+	// The engine must default fs to a real node facade so all three paths work.
+	test("with no injected fs, the script is persisted to disk and a resume reads it back", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "wf-engine-defaultfs-"));
+		try {
+			const engine = createWorkflowEngine({
+				client: makeClient(),
+				directory: "/proj",
+				dataDir: dir,
+				clock,
+				logger: noopLogger,
+				ids: fixedIds("wf_real00001", "wf_real00002"),
+				// NO fs — exercise the production default.
+			});
+
+			const h1 = await engine.startRun({
+				source: INSTANT,
+				args: { v: 1 },
+				parentSessionID: "ses_parent",
+			});
+			await engine.statusOf(h1.runId)?.settled;
+
+			// The script was actually written to disk (the bug: it never was).
+			const persisted = await readFile(h1.scriptPath, "utf-8");
+			expect(persisted).toBe(INSTANT);
+
+			// A resume with no explicit source reads that persisted script back — the
+			// path that threw "no fs configured" before the fix.
+			const h2 = await engine.startRun({
+				resumeFromRunId: h1.runId,
+				parentSessionID: "ses_parent",
+			});
+			await engine.statusOf(h2.runId)?.settled;
+			const status = engine.statusOf(h2.runId);
+			expect(status?.record.status).toBe("completed");
+			expect(status?.record.resumedFrom).toBe(h1.runId);
+
+			await engine.dispose();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("createWorkflowEngine — journal is drained before settle (Task 4.3.2)", () => {
+	// Regression for the live-harness Scenario C SECOND bug: journal appends were
+	// fire-and-forget (`void journal?.record(e)`), so when a single-turn `opencode
+	// run` exited the instant the turn ended, the last appends had not flushed — a
+	// later resume then replayed NOTHING ("0 cached / N live"). The fix drains all
+	// journal writes before `handle.settled` resolves, so wait_ms guarantees a
+	// durable journal. Driven deterministically via the replay re-record path: a
+	// seeded prior journal replays as cached (no live agent needed against the inert
+	// client) and re-records into the NEW journal, which must be on disk after settle.
+	test("a resumed run's re-recorded journal is durable on disk by the time settled resolves", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "wf-engine-journaldrain-"));
+		try {
+			const { writeFile, mkdir } = await import("node:fs/promises");
+			const SCRIPT = `export const meta = { name: "j", description: "d" };\nconst r = await agent("do work", { label: "a" });\nreturn r;\n`;
+			const key = computeCallKey({ prompt: "do work", label: "a" });
+			const entry: JournalEntry = {
+				index: 0,
+				key,
+				status: "ok",
+				result: "CACHED_RESULT",
+			};
+
+			// Seed a TERMINAL prior run (record + script + journal) directly on disk so
+			// startup recovery loads it and the resume guard passes. The journal carries
+			// our matching cached entry.
+			await mkdir(join(dir, "workflow-runs"), { recursive: true });
+			await mkdir(join(dir, "workflow-scripts"), { recursive: true });
+			await mkdir(join(dir, "workflow-journals"), { recursive: true });
+			await writeFile(
+				join(dir, "workflow-scripts", "wf_prior0001.js"),
+				SCRIPT,
+				"utf-8",
+			);
+			await writeFile(
+				join(dir, "workflow-journals", "wf_prior0001.jsonl"),
+				`${JSON.stringify(entry)}\n`,
+				"utf-8",
+			);
+			await writeFile(
+				join(dir, "workflow-runs", "wf_prior0001.json"),
+				JSON.stringify({
+					id: "wf_prior0001",
+					parentSessionID: "ses_parent",
+					status: "completed",
+					description: "j",
+					createdAt: NOW - 1000,
+					completedAt: NOW - 500,
+					scriptPath: join(dir, "workflow-scripts", "wf_prior0001.js"),
+				}),
+				"utf-8",
+			);
+
+			const engine = createWorkflowEngine({
+				client: makeClient(),
+				directory: "/proj",
+				dataDir: dir,
+				clock,
+				logger: noopLogger,
+				ids: fixedIds("wf_resume0001"),
+			});
+			await engine.ready();
+
+			// Resume: the seeded entry replays as cached; onRecord re-records into the
+			// NEW journal. After settled resolves, that file MUST be on disk (drained).
+			const h2 = await engine.startRun({
+				resumeFromRunId: "wf_prior0001",
+				parentSessionID: "ses_parent",
+			});
+			await engine.statusOf(h2.runId)?.settled;
+
+			const newJournal = await readFile(
+				join(dir, "workflow-journals", "wf_resume0001.jsonl"),
+				"utf-8",
+			);
+			const lines = newJournal
+				.split("\n")
+				.filter((l) => l.length > 0)
+				.map((l) => JSON.parse(l) as JournalEntry);
+			expect(lines).toHaveLength(1);
+			expect(lines[0]?.key).toBe(key);
+			expect(lines[0]?.result).toBe("CACHED_RESULT");
+			// The resumed run completed with the cached value (fully replayed).
+			expect(engine.statusOf(h2.runId)?.record.status).toBe("completed");
+			expect(engine.statusOf(h2.runId)?.record.returnValue).toBe(
+				"CACHED_RESULT",
+			);
+
+			await engine.dispose();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 

@@ -452,19 +452,57 @@ describe("conformance (h) — cores gate limit enforced", () => {
 	});
 });
 
-// ---- (i) workflow() → Phase 4 error --------------------------------------
+// ---- (i) workflow() without a resolver → NestingError --------------------
 
-describe("conformance (i) — workflow() throws Phase 4", () => {
-	test("workflow() in script → status error mentioning Phase 4", async () => {
+describe("conformance (i) — workflow() needs a resolver (depth-1 guard)", () => {
+	test("a run with no resolveSubWorkflow → workflow() throws NestingError", async () => {
 		const h = makeHarness();
 		const run = createWorkflowRun({
 			runner: h.runner,
 			parentSessionID: "ses_root",
 			runId: "run_i",
 		});
+		// No resolveSubWorkflow → structurally a leaf/child: workflow() is unavailable.
 		const result = await run.run(`${META}return workflow("other");\n`);
 		expect(result.status).toBe("error");
-		expect(result.error).toContain("Phase 4");
+		expect(result.error).toContain("one level");
+	});
+
+	test("a top-level run WITH a resolver runs the child inline and returns its value", async () => {
+		const h = makeHarness();
+		// The child script returns a literal — no agents, settles instantly.
+		const CHILD = `export const meta = { name: "child", description: "c" };\nreturn { from: "child", got: args };\n`;
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_i2",
+			resolveSubWorkflow: async () => CHILD,
+		});
+		const result = await run.run(
+			`${META}const r = await workflow("helper", { x: 1 });\nreturn r;\n`,
+		);
+		expect(result.status).toBe("completed");
+		expect(result.returnValue).toEqual({ from: "child", got: { x: 1 } });
+	});
+
+	test("workflow() inside a child throws NestingError (depth 1, structural)", async () => {
+		const h = makeHarness();
+		// The child itself tries to nest — its workflow() must throw (resolver undefined).
+		const GRANDCHILD = `export const meta = { name: "gc", description: "g" };\nreturn 1;\n`;
+		const CHILD = `export const meta = { name: "child", description: "c" };\nreturn await workflow("grandchild");\n`;
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_i3",
+			resolveSubWorkflow: async (ref) =>
+				typeof ref === "string" && ref === "grandchild" ? GRANDCHILD : CHILD,
+		});
+		// Parent calls workflow("child"); the child's own workflow("grandchild") must
+		// throw NestingError, which surfaces as the child's error → parent's
+		// workflow() rethrows → parent run status error.
+		const result = await run.run(`${META}return await workflow("child");\n`);
+		expect(result.status).toBe("error");
+		expect(result.error).toContain("one level");
 	});
 });
 

@@ -7,7 +7,8 @@
 			"!**/dist",
 			"!**/.references",
 			"!**/.claude",
-			"!**/docs"
+			"!**/docs",
+			"!**/.opencode/workflows"
 		]
 	},
 	"linter": {

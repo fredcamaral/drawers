@@ -15,11 +15,18 @@
  * of the dirname), so tests run against a real temp dir or an in-memory facade.
  */
 
-import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { JournalEntry } from "../runtime/types";
 
+// computeCallKey / stableStringify / CallKeyInput moved to ../runtime/keys (Task
+// 4.3.2) so the runtime layer can hash without importing this plugin module. They
+// are re-exported here for back-compat with existing plugin/library import sites.
+export {
+	type CallKeyInput,
+	computeCallKey,
+	stableStringify,
+} from "../runtime/keys";
 export type { JournalEntry };
 
 /** The exact fs surface the journal uses. Defaults to `node:fs/promises`. */
@@ -56,57 +63,6 @@ export interface Journal {
 
 function errorText(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
-}
-
-/** The shape {@link computeCallKey} hashes — a call's identity for replay. */
-export interface CallKeyInput {
-	prompt: string;
-	label?: string;
-	phase?: string;
-	schema?: object;
-	model?: string;
-	agentType?: string;
-}
-
-/**
- * Stable, recursive, key-sorted JSON of an arbitrary JSON-ish value. Object keys
- * are emitted in sorted order so that `{ a, b }` and `{ b, a }` stringify
- * identically; arrays preserve order (order is meaningful); primitives defer to
- * `JSON.stringify`. `undefined` members are dropped (matching JSON semantics) so
- * an absent option does not perturb the hash.
- */
-function stableStringify(value: unknown): string {
-	if (value === null || typeof value !== "object") {
-		return JSON.stringify(value) ?? "null";
-	}
-	if (Array.isArray(value)) {
-		return `[${value.map((v) => stableStringify(v)).join(",")}]`;
-	}
-	const obj = value as Record<string, unknown>;
-	const keys = Object.keys(obj)
-		.filter((k) => obj[k] !== undefined)
-		.sort();
-	const body = keys
-		.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`)
-		.join(",");
-	return `{${body}}`;
-}
-
-/**
- * The replay identity of an `agent()` call: a sha256 hex over a stable stringify
- * of its `(prompt, opts)` inputs. Field order and schema key order are irrelevant
- * (sorted); the prompt, model, and schema PRESENCE all change the key.
- */
-export function computeCallKey(input: CallKeyInput): string {
-	const canonical = stableStringify({
-		prompt: input.prompt,
-		label: input.label,
-		phase: input.phase,
-		schema: input.schema,
-		model: input.model,
-		agentType: input.agentType,
-	});
-	return createHash("sha256").update(canonical).digest("hex");
 }
 
 export function createJournal(opts: JournalOptions): Journal {

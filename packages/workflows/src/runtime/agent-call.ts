@@ -1,5 +1,5 @@
 import type { ConcurrencyManager, SessionRunner } from "@drawers/core";
-import { computeCallKey } from "../plugin/journal";
+import { computeCallKey } from "./keys";
 import type { SchemaRegistry } from "./structured/registry";
 import { compileSchema } from "./structured/validate";
 import {
@@ -125,6 +125,17 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 	} = deps;
 	const awaitTimeoutMs = defaults.awaitTimeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS;
 
+	// Index → journaled entry. Concurrent agents record into the journal in
+	// COMPLETION order, not call-index order, so a positional `entries[index]`
+	// lookup mismatches the first concurrently-recorded call and voids the whole
+	// replay prefix. Map by the `index` field so lookup is order-independent.
+	const byIndex = new Map<number, JournalEntry>();
+	if (replay !== undefined) {
+		for (const entry of replay.entries) {
+			byIndex.set(entry.index, entry);
+		}
+	}
+
 	return async function agent(
 		prompt: string,
 		opts: AgentOpts = {},
@@ -151,7 +162,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// cap STILL applies (a replay must hit it where the original did), so check
 		// and increment counters exactly as the live path does — before resolving.
 		if (replay !== undefined && prefixIntact.value) {
-			const cached = replay.entries[index];
+			const cached = byIndex.get(index);
 			if (cached !== undefined && cached.key === key) {
 				if (counters.agents >= AGENT_LIFETIME_CAP) {
 					throw new AgentCapError();

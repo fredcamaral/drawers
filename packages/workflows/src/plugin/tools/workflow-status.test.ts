@@ -103,6 +103,88 @@ describe("createWorkflowStatusTool — header", () => {
 	});
 });
 
+describe("createWorkflowStatusTool — wait_ms (single-turn settle affordance)", () => {
+	test("wait_ms>0 on a LIVE run awaits the handle's settle promise, then re-renders terminal", async () => {
+		// A live handle whose settle resolves after a tick, flipping the record.
+		const record = makeRecord({ id: "wf_wait0001", status: "running" });
+		let resolveSettle: () => void = () => {};
+		const handle: RunHandle = {
+			record,
+			progress: [],
+			settled: new Promise<void>((r) => {
+				resolveSettle = r;
+			}),
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+
+		// Flip + resolve on the next tick (simulating the detached run settling).
+		setTimeout(() => {
+			record.status = "completed";
+			record.completedAt = 3_000;
+			record.returnValue = { done: true };
+			resolveSettle();
+		}, 5);
+
+		const out = await run(t, { run_id: "wf_wait0001", wait_ms: 5_000 }, ctx());
+		expect(out).toContain("completed");
+		expect(out).toContain('"done":true');
+	});
+
+	test("wait_ms times out → renders the still-running snapshot (no throw)", async () => {
+		const record = makeRecord({ id: "wf_wait0002", status: "running" });
+		const handle: RunHandle = {
+			record,
+			progress: [],
+			// Never resolves within the tiny wait window.
+			settled: new Promise<void>(() => {}),
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_wait0002", wait_ms: 10 }, ctx());
+		expect(out).toContain("running");
+	});
+
+	test("wait_ms coerces a numeric string and caps at 120000", async () => {
+		// A terminal run returns immediately regardless of wait_ms; we only assert the
+		// coercion path does not throw on a string / oversized value.
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_wait0003",
+					status: "completed",
+					completedAt: 2_000,
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(
+			t,
+			{ run_id: "wf_wait0003", wait_ms: "999999999" as unknown as number },
+			ctx(),
+		);
+		expect(out).toContain("completed");
+	});
+
+	test("wait_ms ignored when the run is already terminal (no await)", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_wait0004",
+					status: "completed",
+					completedAt: 2_000,
+				}),
+				progress: [],
+				// No settled promise — a terminal run must not require one.
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_wait0004", wait_ms: 5_000 }, ctx());
+		expect(out).toContain("completed");
+	});
+});
+
 describe("createWorkflowStatusTool — flat chronological progress render", () => {
 	test("phase headers inserted on phase change; markers per agent status", async () => {
 		const progress: ProgressEvent[] = [

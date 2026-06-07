@@ -21,7 +21,7 @@
 | 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
 | 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Complete |
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
-| 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Detailed |
+| 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
 | 5 | Both plugins published to npm and installable in a clean project via `"plugin": [...]` | 5.1 | Epic-level |
 
 ## Design decisions (binding across phases)
@@ -690,7 +690,7 @@ interface SessionRunner {
 
 #### Task 4.3.2: Sub-workflows + live e2e smoke — Phase 4 exit
 
-- [ ] Done
+- [x] Done — smoke A/B/C PASS (verified independently). **Three production bugs caught live, each with regression test:** (1) engine never persisted scripts/journals in production — all fs paths were `if (fs)`-gated and the entry injects none; fix: node-fs default; (2) journal appends fire-and-forget — single-turn exit dropped unflushed writes; fix: drain before `settled`; (3) **replay indexed the journal positionally but concurrent agents record in COMPLETION order** — resume was silently broken for every pipeline/parallel workflow (all prior tests were sequential); fix: byIndex Map lookup (agent-call.test.ts:611). Deviations: scenario C probes the plugin's own task store, not opencode's 21GB global SQLite; `wait_ms` on workflow_status (cap 120s) as the honest single-turn port of CC's task-notification re-invocation. **Phase 4 exit.**
 
 **Context:** Spec §8: `workflow(nameOrRef, args?)` runs a child workflow inline, returns its return value; child shares the parent's concurrency cap, agent counter, abort signal, budget (and here: schema registry); nesting depth 1 — `workflow()` inside a child throws; unknown name / unreadable path / child syntax error throw synchronously (catchable in the script). The runtime's `workflow` global is currently the NotYetSupported stub (runtime/index.ts). Live-harness model: `packages/background-agents/test-harness/` (PWD pinning, OPENCODE_BIN, file:// plugin registration, OPENCODE_DRAWERS_DATA_DIR).
 

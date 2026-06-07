@@ -52,6 +52,7 @@ import {
 import type { BudgetView, JournalEntry, ProgressEvent } from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
 import { createJournal, type Journal, type JournalFs } from "./journal";
+import { createSourceResolver } from "./resolve-source";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
 export interface EngineLogger {
@@ -102,6 +103,14 @@ export interface RunHandle {
 	 * snapshot. Absent for recovered records (the accumulator died with the process).
 	 */
 	budget?: BudgetView;
+	/**
+	 * Resolves when the detached run settles (Task 4.3.2). `workflow_status`'s
+	 * `wait_ms` affordance races this against a timeout so a single-turn/headless
+	 * caller can block on completion in-process (the honest equivalent of CC's
+	 * task-notification re-invocation, which `opencode run` lacks). Absent for
+	 * recovered records (the run died with the prior process).
+	 */
+	settled?: Promise<void>;
 }
 
 /** Arguments to launch a run. */
@@ -230,6 +239,21 @@ function journalFsFromFacade(fs: FsFacade): JournalFs {
 
 const defaultClock: Clock = { now: () => Date.now() };
 
+/**
+ * A node:fs/promises-backed {@link FsFacade} — the engine's production default when
+ * no fs is injected. The plugin entry builds the engine without an fs, and the
+ * engine's OWN paths (script persistence, journal writes, resume-read) are NOT the
+ * stores' internal default fs — they need this concrete facade or they silently
+ * no-op (the live-harness Scenario C bug: resume could not read the prior script,
+ * "no fs configured"). `node:fs/promises` exposes mkdir/readdir/readFile/writeFile/
+ * rename/rm with runtime-compatible signatures; the structural cast bridges the
+ * minor optional-arg differences. Lazy-required so the in-memory test path that
+ * injects its own fs never loads it.
+ */
+function nodeFsFacade(): FsFacade {
+	return require("node:fs/promises") as FsFacade;
+}
+
 /** Resolve the base data dir: explicit → env → undefined (store's XDG default). */
 function resolveDataDir(explicit?: string): string | undefined {
 	if (explicit !== undefined) {
@@ -289,7 +313,11 @@ export function createWorkflowEngine(
 	opts: CreateWorkflowEngineOptions,
 ): WorkflowEngine {
 	const clock = opts.clock ?? defaultClock;
-	const fs = opts.fs;
+	// Default to a real node facade when none is injected (the production plugin
+	// path passes none). This fs backs script persistence, journal writes, resume
+	// reads, AND sub-workflow source resolution — all of which silently no-op'd
+	// before, breaking resume in production (live-harness Scenario C regression).
+	const fs = opts.fs ?? nodeFsFacade();
 	const logger = opts.logger;
 	const base = resolveDataDir(opts.dataDir);
 	const ids = opts.ids ?? createIdGenerator({ prefix: RUN_PREFIX });
@@ -297,6 +325,15 @@ export function createWorkflowEngine(
 	const subdir = (name: string) => (base ? join(base, name) : undefined);
 	const scriptsDir = subdir(SUBDIR_SCRIPTS);
 	const journalsDir = subdir(SUBDIR_JOURNALS);
+
+	// Sub-workflow source resolver (spec §8): maps a name/{scriptPath} to source
+	// against the project directory. Threaded into every TOP-LEVEL run's
+	// createWorkflowRun so its workflow() global can nest one level; a child run is
+	// built (in the runtime) with resolveSubWorkflow undefined → depth-1 guard.
+	const resolveSubWorkflow = createSourceResolver({
+		directory: opts.directory,
+		fs,
+	});
 
 	/** The journal file path for a runId (under the journals subdir). */
 	const journalPath = (id: string) =>
@@ -542,12 +579,20 @@ export function createWorkflowEngine(
 				})
 			: undefined;
 
+		// Track every journal append so the run's settle can DRAIN them before
+		// resolving — a fire-and-forget append would otherwise race process teardown
+		// (live-harness Scenario C: a single-turn `opencode run` exits the instant
+		// the turn ends; an unflushed journal means a later resume replays nothing).
+		const journalWrites: Promise<void>[] = [];
+
 		const run = createWorkflowRun({
 			runner,
 			parentSessionID: args.parentSessionID,
 			runId,
 			args: resolved.runArgs,
 			registry,
+			// Top-level run: its workflow() global can nest one level (spec §8).
+			resolveSubWorkflow,
 			...(budget !== undefined ? { budget } : {}),
 			onProgress: (e) => {
 				handle.progress.push(e);
@@ -556,15 +601,27 @@ export function createWorkflowEngine(
 			replay: {
 				entries: resolved.entries,
 				onRecord: (e) => {
-					void journal?.record(e);
+					if (journal !== undefined) {
+						journalWrites.push(journal.record(e));
+					}
 				},
 			},
 		});
 		handle.run = run;
 
-		// Fire DETACHED — never await the run. On settle, update the record.
-		void run
+		/** Await all pending journal appends (fenced — a failed append must not throw). */
+		const drainJournal = (): Promise<void> =>
+			Promise.allSettled(journalWrites).then(() => undefined);
+
+		// Fire DETACHED — never await the run. On settle, DRAIN the journal, then
+		// update the record. The settle promise is exposed on the handle so
+		// workflow_status's wait_ms blocks until the journal is durable (resume-safe).
+		handle.settled = run
 			.run(resolved.source)
+			.then(async (result) => {
+				await drainJournal();
+				return result;
+			})
 			.then((result) => {
 				// A stopRun() may have already flipped the record to cancelled; do not
 				// clobber a terminal record with the run's own (also-terminal) result.
