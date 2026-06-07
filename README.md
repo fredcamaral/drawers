@@ -11,7 +11,7 @@ Two plugins ship today. Both spawn child sessions, watch them to completion, and
 | Package | What it gives you | Docs |
 |---|---|---|
 | `opencode-drawer-agents` | Fire-and-forget background agents — launch a task in a child session and pull its output later, without blocking the main loop. Tools: `bg_task`, `bg_output`, `bg_cancel`, `bg_list`. | [README](packages/background-agents/README.md) |
-| `opencode-drawer-workflows` | Deterministic multi-agent orchestration — author a workflow as JavaScript that fans out subagents, runs barriers and conditionals, and returns schema-conforming results. A port of Claude Code's Workflows feature. Tools: `workflow`, `workflow_status`, `workflow_stop` (plus a global `structured_output` tool). | [README](packages/workflows/README.md) |
+| `opencode-drawer-workflows` | Deterministic multi-agent orchestration — author a workflow as JavaScript that fans out subagents, runs barriers and conditionals, and returns schema-conforming results. A port of Claude Code's Workflows feature (one documented deviation: token budgets count workflow children only). Tools: `workflow`, `workflow_status`, `workflow_stop` (plus a global `structured_output` tool). | [README](packages/workflows/README.md) |
 
 ## Quickstart
 

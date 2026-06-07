@@ -54,7 +54,7 @@ Read a background task's result by id. Call this when notified that a task compl
 | `task_id` | string | — (required) | The `bg_` task id to read. |
 | `full` | boolean | `false` | Append the full filtered transcript after the summary. |
 | `block` | boolean | `false` | Wait for the task to finish before reading. |
-| `timeout_ms` | number | `60000` | Max ms to block; clamped to `300000`. Only used when `block=true`. Non-finite values fall back to the default. |
+| `timeout_ms` | number | `60000` | Max ms to block, clamped to the range `[0, 300000]`. Only used when `block=true`. A non-finite value (`NaN`, `Infinity`) falls back to the default; a negative finite value clamps to `0` (immediate non-blocking check). |
 
 ### `bg_cancel`
 
@@ -93,7 +93,7 @@ Terminal tasks are swept on load once older than 24 hours (by completion time). 
 
 The storage directory is resolved in this order:
 
-1. `$OPENCODE_DRAWERS_DATA_DIR`, if set and non-empty.
+1. `$OPENCODE_DRAWERS_DATA_DIR`, if set and non-empty — used as the task directory **directly**; no `opencode-drawers/tasks` suffix is appended.
 2. `$XDG_DATA_HOME/opencode-drawers/tasks`, if `XDG_DATA_HOME` is set.
 3. `~/.local/share/opencode-drawers/tasks` otherwise.
 
@@ -101,5 +101,5 @@ The storage directory is resolved in this order:
 
 | Variable | Effect |
 |----------|--------|
-| `OPENCODE_DRAWERS_DATA_DIR` | Storage directory for persisted task files. Takes precedence over the XDG default. |
+| `OPENCODE_DRAWERS_DATA_DIR` | Storage directory for persisted task files. Takes precedence over the XDG default. Used verbatim as the task directory — unlike the XDG default, no namespaced subpath is appended. |
 | `XDG_DATA_HOME` | When `OPENCODE_DRAWERS_DATA_DIR` is unset, the store base is `$XDG_DATA_HOME/opencode-drawers/tasks`; otherwise `~/.local/share/opencode-drawers/tasks`. |

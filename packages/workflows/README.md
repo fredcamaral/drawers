@@ -229,7 +229,7 @@ Note the shape: `parallel` takes **thunks** (`() => agent(...)`), not promises. 
 
 ### Agent failure is `null`; what throws instead
 
-`agent()` follows "degrade, don't detonate." An agent that dies on a terminal status, or a runner call that throws, resolves to `null` — never a rejection. Filter the nulls out:
+`agent()` follows "degrade, don't detonate." An agent that dies on a terminal status, or a runner call that throws, resolves to `null` — never a rejection. This includes the per-agent completion timeout: an agent still running after **30 minutes** degrades to `null` like any other failure. Filter the nulls out:
 
 ```js
 const reviews = (await pipeline(files, reviewStage)).filter(Boolean);

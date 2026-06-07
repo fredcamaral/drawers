@@ -22,7 +22,7 @@
 | 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Complete |
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
-| 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Detailed / 5.2 Epic-level |
+| 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Complete / 5.2 Epic-level |
 
 ## Design decisions (binding across phases)
 
@@ -724,7 +724,7 @@ interface SessionRunner {
 
 #### Task 5.1.1: README for `opencode-drawer-agents`
 
-- [ ] Done
+- [x] Done
 
 **Context:** The plugin exposes `bg_task`/`bg_output`/`bg_cancel`/`bg_list` (`packages/background-agents/src/index.ts:80-87`). No user-facing docs exist anywhere. Data persists under `$OPENCODE_DRAWERS_DATA_DIR` → `$XDG_DATA_HOME` fallback. Completion notices are passive: TUI toast + flushed into the parent's next message via the `chat.message` hook (design decision 1). Tasks survive opencode restarts (Phase 2 exit criterion).
 
@@ -739,7 +739,7 @@ interface SessionRunner {
 
 #### Task 5.1.2: README + authoring manual for `opencode-drawer-workflows`
 
-- [ ] Done
+- [x] Done
 
 **Context:** The plugin exposes `workflow`/`workflow_status`/`workflow_stop`/`structured_output` (`packages/workflows/src/plugin/index.ts:88-93`). The script runtime API is `agent`/`pipeline`/`parallel`/`phase`/`log`/`args`/`budget`/`workflow` (`packages/workflows/src/runtime/types.ts:83-93`). Determinism bans live in `packages/workflows/src/runtime/evaluate.ts` (Date.now, Math.random, argless `new Date`, scheduling primitives; `console.*` → narrator log). Meta must be a pure literal (`runtime/meta.ts`). Caps: 1000 agent calls lifetime, 4096 items per composition, concurrency gate `min(16, cores−2)`. Resume: journal-backed longest-unchanged-prefix replay, only settled non-null results journaled, works across restarts (`plugin/journal.ts`, `runtime/keys.ts`). Budget: hard ceiling over child sessions' output+reasoning tokens (`plugin/budget.ts`) — note the declared deviation from CC's shared-pool semantics. Sub-workflows: depth-1, saved names resolve from `.opencode/workflows/<name>.js|.mjs`, child error THROWS (unlike `agent()`'s null). `workflow_status` has `wait_ms` (cap 120000) as the single-turn substitute for CC's task notifications.
 
@@ -754,7 +754,7 @@ interface SessionRunner {
 
 #### Task 5.1.3: Root README
 
-- [ ] Done
+- [x] Done
 
 **Context:** The repo is a Bun-workspace monorepo: `packages/core` (shared engine, npm-private), `packages/background-agents` (`opencode-drawer-agents`), `packages/workflows` (`opencode-drawer-workflows`). Root `package.json` carries `test`, `typecheck`, `lint`, `smoke:agents`, `smoke:workflows` scripts. The "drawer" concept: independently installable OpenCode plugins sharing one engine.
 
@@ -769,7 +769,7 @@ interface SessionRunner {
 
 #### Task 5.1.4: Documentation review pass
 
-- [ ] Done
+- [x] Done — docs-reviewer found 2 HIGH factual errors (bg_output `timeout_ms` clamp range misstated; `OPENCODE_DRAWERS_DATA_DIR` appends no `tasks` suffix in the agents store — README implied symmetry with XDG tiers) + 1 gap (30-min per-agent timeout undocumented); all fixed and spot-checked against source. All other dimensions clean. ⚠️ Pre-publish flag for Epic 5.2: the same env var behaves differently across plugins (agents: verbatim task dir; workflows: base dir with `workflow-*` subdirs) — decide whether to align the agents store before first release.
 
 **Context:** Tasks 5.1.1–5.1.3 are written in parallel by separate agents; cross-document consistency (terminology, install instructions, the passive-notification story told the same way twice) is nobody's job until this task.
 
