@@ -38,8 +38,6 @@ function isRecordable(budget: unknown): budget is RecordableBudget {
 
 /** Lifetime agent-count backstop per workflow (spec §5). */
 const AGENT_LIFETIME_CAP = 1_000;
-/** Default per-agent completion timeout: 30 minutes. */
-const DEFAULT_AWAIT_TIMEOUT_MS = 1_800_000;
 /** Label fallback length when no `opts.label` is given. */
 const LABEL_PREFIX_LEN = 60;
 
@@ -81,7 +79,7 @@ export interface AgentPrimitiveDeps {
 	currentPhase: () => string | undefined;
 	/** Live task ids, so abort() (Task 3.2.3) can cancel in-flight work. */
 	liveTasks?: Set<string>;
-	defaults: { agent: string; awaitTimeoutMs?: number };
+	defaults: { agent: string };
 	/**
 	 * Per-run schema/result registry for `agent({ schema })` structured output
 	 * (Task 3.3.2). The same instance backs the `structured_output` tool, so a
@@ -148,7 +146,6 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		replay,
 		callIndex,
 	} = deps;
-	const awaitTimeoutMs = defaults.awaitTimeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS;
 
 	/**
 	 * Capture a child's raw final text for a diagnostic (Task 7.2.1), capped at
@@ -375,8 +372,14 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				});
 			}
 
-			// 8. Wait for it to reach a terminal status.
-			const done = await runner.awaitCompletion(task.id, awaitTimeoutMs);
+			// 8. Wait for it to reach a terminal status — for as LONG as it takes.
+			// Workflows are long-running by nature; there is no per-agent wall-clock
+			// timeout (a fired timeout would reject this await and abandon a child that
+			// is still working, breaking the run with no way to resume that agent). The
+			// completion gate still resolves this on genuine terminal states: normal
+			// idle completion, session-gone (error), or the stale backstop (45min of
+			// TOTAL silence — which an actively-working agent never reaches).
+			const done = await runner.awaitCompletion(task.id);
 			status = done.status;
 
 			// 8b. Budget accounting (§6, Task 4.3.1): once the child has settled on
@@ -498,7 +501,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// One nudge: re-prompt the child to call the tool, then await again.
 		try {
 			await runner.resume(task.id, STRUCTURED_NUDGE);
-			await runner.awaitCompletion(task.id, awaitTimeoutMs);
+			await runner.awaitCompletion(task.id);
 		} catch (err) {
 			emit({
 				type: "warn",

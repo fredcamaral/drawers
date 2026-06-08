@@ -186,7 +186,7 @@ interface HarnessOverrides {
 	budget?: BudgetView;
 	currentPhase?: () => string | undefined;
 	liveTasks?: Set<string>;
-	defaults?: { agent: string; awaitTimeoutMs?: number };
+	defaults?: { agent: string };
 	registry?: SchemaRegistry;
 	replay?: {
 		entries: JournalEntry[];

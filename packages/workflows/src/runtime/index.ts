@@ -84,7 +84,7 @@ export interface WorkflowRunDeps {
 	 * collects these onto the run handle and persists them on the run record.
 	 */
 	onDiagnostic?: DiagnosticEmitter;
-	defaults?: { agent?: string; awaitTimeoutMs?: number };
+	defaults?: { agent?: string };
 	/**
 	 * Deterministic-resume seam (spec §7, Task 7.3.1). Present on a resume:
 	 * `entries` is the prior run's journal (replayed per-key + occurrence,
@@ -247,7 +247,6 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		liveTasks,
 		defaults: {
 			agent: deps.defaults?.agent ?? DEFAULT_AGENT,
-			awaitTimeoutMs: deps.defaults?.awaitTimeoutMs,
 		},
 		registry,
 		replay: deps.replay,
