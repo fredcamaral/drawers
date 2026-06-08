@@ -59,3 +59,43 @@ export async function resolveRunId(
 	}
 	return newest?.runId;
 }
+
+/**
+ * List EVERY run in `feedDir` (settled and live alike), most-recently-modified first.
+ *
+ * Backs the route's `←/→` run switcher (Phase 8 cross-session ask): a glance over the
+ * dir is the bus, so a run started by ANOTHER opencode session in the same repo shows
+ * up here the next time the route re-scans — no shared in-process state required. The
+ * freshest run sits at index 0, matching {@link resolveRunId}'s "default to the freshest"
+ * contract (the first entry is what a bare open lands on). Non-`.jsonl` entries are
+ * ignored; a file that vanishes mid-scan is skipped; a missing dir yields `[]`.
+ */
+export async function listRunIds(
+	feedDir: string,
+	fs: RunsFs,
+	join: (...parts: string[]) => string,
+): Promise<string[]> {
+	let names: string[];
+	try {
+		names = await fs.readdir(feedDir);
+	} catch {
+		return [];
+	}
+	const entries: { runId: string; mtimeMs: number }[] = [];
+	for (const name of names) {
+		if (!name.endsWith(FEED_SUFFIX)) {
+			continue;
+		}
+		try {
+			const info = await fs.stat(join(feedDir, name));
+			entries.push({
+				runId: name.slice(0, -FEED_SUFFIX.length),
+				mtimeMs: info.mtimeMs,
+			});
+		} catch {
+			// A file vanishing mid-scan is harmless — skip it.
+		}
+	}
+	entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	return entries.map((e) => e.runId);
+}

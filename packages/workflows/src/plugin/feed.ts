@@ -59,6 +59,14 @@ export interface RunStartLine {
 	parentSessionID: string;
 	/** The persisted script path, when one exists (always set in practice). */
 	scriptPath?: string;
+	/**
+	 * The DECLARED phase titles from `meta.phases`, in order (Task 8.3.3). Lets the
+	 * viewer paint the whole pipeline as pending headers from the first frame — agents
+	 * (created imperatively as execution reaches each phase) fill in live. Absent when
+	 * the script declared no `meta.phases`; a viewer then derives phases from agents
+	 * alone (the prior behavior).
+	 */
+	phases?: string[];
 	at: number;
 }
 

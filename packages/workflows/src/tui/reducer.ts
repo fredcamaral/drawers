@@ -23,7 +23,7 @@
 import type { RunStatus } from "../plugin/engine";
 import type { EnrichedProgressEvent, FeedEvent } from "../plugin/feed";
 import type { SessionTokenSnapshot } from "../plugin/session-stats";
-import { phaseMarker, totalTokens } from "./format";
+import { MARK_PENDING, phaseMarker, totalTokens } from "./format";
 
 export type { FeedEvent } from "../plugin/feed";
 
@@ -201,6 +201,12 @@ export function createRunStateReducer(): RunStateReducer {
 	let status: RunViewState["status"] = "running";
 	let startedAt: number | undefined;
 	let endedAt: number | undefined;
+	// DECLARED phase titles from `run:start` (meta.phases), in order. Seeds the phase
+	// list so the WHOLE pipeline shows as pending headers before any agent launches into
+	// a later phase; agents (created imperatively as execution reaches each phase) then
+	// overlay their occurrences. Empty when the script declared no phases (derive-from-
+	// agents, the prior behavior).
+	let declaredPhases: string[] = [];
 
 	// Agents in start order across all phases (preserves chronology for grouping);
 	// phase grouping happens at `state()` time off this flat list.
@@ -329,6 +335,9 @@ export function createRunStateReducer(): RunStateReducer {
 			case "run:start":
 				runId = event.runId;
 				startedAt = event.at;
+				if (event.phases !== undefined) {
+					declaredPhases = event.phases;
+				}
 				break;
 			case "run:cancel-requested":
 				// Only interpose `cancelling` while still running; a terminal status wins.
@@ -367,7 +376,19 @@ export function createRunStateReducer(): RunStateReducer {
 		// <For> (which memoizes per item REFERENCE) re-renders a row whose stats/status
 		// changed — a stable identity would freeze the live row. This mirrors how the
 		// PhaseView objects below are rebuilt fresh on every call.
+		// Seed the order with the DECLARED phases (the full pipeline, pending), then
+		// append any phase an agent reported that wasn't declared (e.g. NO_PHASE, or a
+		// phase string the script used without listing in meta.phases). A declared phase
+		// with no agents yet renders as a pending header (✗/…/✓ derivation only applies
+		// once it has occurrences).
 		const order: string[] = [];
+		const seen = new Set<string>();
+		for (const name of declaredPhases) {
+			if (!seen.has(name)) {
+				order.push(name);
+				seen.add(name);
+			}
+		}
 		const groups = new Map<string, AgentView[]>();
 		for (const row of agents) {
 			const phase = row.phase ?? NO_PHASE;
@@ -375,7 +396,10 @@ export function createRunStateReducer(): RunStateReducer {
 			if (group === undefined) {
 				group = [];
 				groups.set(phase, group);
-				order.push(phase);
+				if (!seen.has(phase)) {
+					order.push(phase);
+					seen.add(phase);
+				}
 			}
 			group.push({ ...row });
 		}
@@ -386,7 +410,9 @@ export function createRunStateReducer(): RunStateReducer {
 				name,
 				done,
 				total: group.length,
-				marker: phaseMarker(group),
+				// A declared-but-not-started phase (no occurrences) is pending, not done —
+				// `phaseMarker([])` would read ✓ (vacuously no failures/running).
+				marker: group.length === 0 ? MARK_PENDING : phaseMarker(group),
 				agents: group,
 			};
 		});

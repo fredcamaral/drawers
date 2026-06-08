@@ -83,10 +83,35 @@ export function shortModel(model: string): string {
 		: afterSlash;
 }
 
+/**
+ * Truncate `text` to at most `width` columns, marking a cut with a trailing `…`
+ * (Task 8.3.3 beautify). The tree pane renders ONE line per row — long agent rows
+ * that would otherwise word-wrap into a ragged second line (the `· 40 tools` /
+ * dangling `tools` artifact) are clipped instead, and the selected row's full stats
+ * stay readable in the Detail pane. `width ≤ 0` yields the empty string; `width === 1`
+ * yields the bare ellipsis; text already within `width` passes through untouched.
+ * Column width is approximated by code-unit length — fine for the ASCII-plus-glyph
+ * row vocabulary the tree uses (markers, model ids, compact stat numbers).
+ */
+export function truncateLine(text: string, width: number): string {
+	if (width <= 0) {
+		return "";
+	}
+	if (text.length <= width) {
+		return text;
+	}
+	if (width === 1) {
+		return "…";
+	}
+	return `${text.slice(0, width - 1)}…`;
+}
+
 /** The CC-style per-status marker for an agent row and phase header. */
 export const MARK_DONE = "✓";
 export const MARK_FAIL = "✗";
 export const MARK_RUNNING = "…";
+/** A DECLARED-but-not-yet-started phase (no agents launched into it yet). */
+export const MARK_PENDING = "·";
 
 /** Map an agent's status word onto its row marker. `undefined` → still running. */
 export function statusMarker(status: string | undefined): string {

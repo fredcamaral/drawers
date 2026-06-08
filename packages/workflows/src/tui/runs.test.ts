@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { type RunsFs, resolveRunId } from "./runs";
+import { listRunIds, type RunsFs, resolveRunId } from "./runs";
 
 /**
  * Tests for the feed-dir run resolution (Task 8.3.3). `resolveRunId` carries the
@@ -104,5 +104,57 @@ describe("resolveRunId", () => {
 	test("an empty-string explicit falls through to scanning", async () => {
 		const fs = makeDir({ "wf_only.jsonl": 1 });
 		expect(await resolveRunId(FEED_DIR, "", fs, join)).toBe("wf_only");
+	});
+});
+
+describe("listRunIds", () => {
+	test("returns every .jsonl run, most-recently-modified first", async () => {
+		const fs = makeDir({
+			"wf_a.jsonl": 100,
+			"wf_b.jsonl": 300,
+			"wf_c.jsonl": 200,
+		});
+		expect(await listRunIds(FEED_DIR, fs, join)).toEqual([
+			"wf_b",
+			"wf_c",
+			"wf_a",
+		]);
+	});
+
+	test("index 0 matches resolveRunId's freshest default", async () => {
+		const fs = makeDir({ "wf_old.jsonl": 1, "wf_new.jsonl": 9 });
+		const list = await listRunIds(FEED_DIR, fs, join);
+		expect(list[0]).toBe(await resolveRunId(FEED_DIR, undefined, fs, join));
+	});
+
+	test("ignores non-.jsonl entries even when newer", async () => {
+		const fs = makeDir({
+			"wf_a.jsonl": 100,
+			"scratch.txt": 999,
+			"wf_b.jsonl": 200,
+		});
+		expect(await listRunIds(FEED_DIR, fs, join)).toEqual(["wf_b", "wf_a"]);
+	});
+
+	test("a file vanishing mid-scan is skipped", async () => {
+		const entries = { "wf_gone.jsonl": 500, "wf_live.jsonl": 100 };
+		const fs: RunsFs = {
+			readdir: async () => Object.keys(entries),
+			stat: async (path: string) => {
+				const name = path.slice(FEED_DIR.length + 1);
+				if (name === "wf_gone.jsonl") {
+					const err = new Error("ENOENT") as Error & { code: string };
+					err.code = "ENOENT";
+					throw err;
+				}
+				return { mtimeMs: 100 };
+			},
+		};
+		expect(await listRunIds(FEED_DIR, fs, join)).toEqual(["wf_live"]);
+	});
+
+	test("a missing dir yields an empty list", async () => {
+		const fs = makeDir({}, { missing: true });
+		expect(await listRunIds(FEED_DIR, fs, join)).toEqual([]);
 	});
 });

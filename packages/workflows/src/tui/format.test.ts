@@ -6,6 +6,7 @@ import {
 	shortModel,
 	statusMarker,
 	totalTokens,
+	truncateLine,
 } from "./format";
 
 /**
@@ -75,5 +76,27 @@ describe("statusMarker", () => {
 		expect(statusMarker("cached")).toBe("✓");
 		expect(statusMarker("error")).toBe("✗");
 		expect(statusMarker("cancelled")).toBe("✗");
+	});
+});
+
+describe("truncateLine", () => {
+	test("passes through text within the width untouched", () => {
+		expect(truncateLine("✓ Plan Sanity", 20)).toBe("✓ Plan Sanity");
+		expect(truncateLine("exact", 5)).toBe("exact");
+	});
+
+	test("clips with a trailing ellipsis when over the width", () => {
+		expect(truncateLine("P1 Frontend QA  291.9k tok · 6 tools", 12)).toBe(
+			"P1 Frontend…",
+		);
+		// The result is exactly `width` columns (ellipsis included).
+		expect(truncateLine("0123456789", 4)).toHaveLength(4);
+		expect(truncateLine("0123456789", 4)).toBe("012…");
+	});
+
+	test("degenerate widths: ≤0 → empty, 1 → bare ellipsis", () => {
+		expect(truncateLine("anything", 0)).toBe("");
+		expect(truncateLine("anything", -3)).toBe("");
+		expect(truncateLine("anything", 1)).toBe("…");
 	});
 });

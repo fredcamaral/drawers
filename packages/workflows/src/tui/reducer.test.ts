@@ -671,3 +671,81 @@ describe("createRunStateReducer — in-flight prefix (no run:end)", () => {
 		expect(s.phases[0]?.marker).toBe("…");
 	});
 });
+
+describe("createRunStateReducer — declared phases (meta.phases seeding)", () => {
+	test("seeds the WHOLE pipeline as pending headers before any agent launches", () => {
+		const s = reduce([
+			{
+				type: "run:start",
+				runId: "wf_p",
+				parentSessionID: "ses_p",
+				phases: ["Preflight", "Phase 1", "Phase 2", "Final"],
+				at: 1,
+			},
+		]);
+		expect(s.phases.map((p) => p.name)).toEqual([
+			"Preflight",
+			"Phase 1",
+			"Phase 2",
+			"Final",
+		]);
+		// Every declared phase is pending (no occurrences yet): marker "·", 0/0.
+		for (const p of s.phases) {
+			expect(p.marker).toBe("·");
+			expect(p.total).toBe(0);
+			expect(p.done).toBe(0);
+			expect(p.agents).toEqual([]);
+		}
+	});
+
+	test("agents overlay their declared phase; later phases stay pending", () => {
+		const s = reduce([
+			{
+				type: "run:start",
+				runId: "wf_p",
+				parentSessionID: "ses_p",
+				phases: ["Phase 1", "Phase 2"],
+				at: 1,
+			},
+			{ type: "agent:start", label: "impl", phase: "Phase 1", at: 2 },
+			{
+				type: "agent:end",
+				label: "impl",
+				status: "completed",
+				at: 3,
+			},
+		]);
+		// Declared order preserved; Phase 1 now reflects its done agent, Phase 2 pending.
+		expect(s.phases.map((p) => p.name)).toEqual(["Phase 1", "Phase 2"]);
+		expect(s.phases[0]?.marker).toBe("✓");
+		expect(s.phases[0]?.done).toBe(1);
+		expect(s.phases[0]?.total).toBe(1);
+		expect(s.phases[1]?.marker).toBe("·");
+		expect(s.phases[1]?.total).toBe(0);
+	});
+
+	test("an agent phase not in meta.phases appends after the declared ones", () => {
+		const s = reduce([
+			{
+				type: "run:start",
+				runId: "wf_p",
+				parentSessionID: "ses_p",
+				phases: ["Phase 1"],
+				at: 1,
+			},
+			{ type: "agent:start", label: "stray", phase: "Hotfix", at: 2 },
+		]);
+		expect(s.phases.map((p) => p.name)).toEqual(["Phase 1", "Hotfix"]);
+		expect(s.phases[0]?.marker).toBe("·"); // declared, still pending
+		expect(s.phases[1]?.total).toBe(1); // the stray agent's phase
+	});
+
+	test("no declared phases → derive from agents alone (prior behavior)", () => {
+		const s = reduce([
+			{ type: "run:start", runId: "wf_p", parentSessionID: "ses_p", at: 1 },
+			{ type: "agent:start", label: "a", phase: "build", at: 2 },
+		]);
+		expect(s.phases.map((p) => p.name)).toEqual(["build"]);
+		expect(s.phases[0]?.total).toBe(1);
+	});
+});

@@ -429,6 +429,25 @@ function extractName(source: string): string {
 	}
 }
 
+/**
+ * The DECLARED phase titles from `meta.phases`, in order, for the `run:start` feed
+ * line (Task 8.3.3) — so the viewer paints the whole pipeline upfront. Returns
+ * `undefined` when no phases are declared or the script can't be parsed (the viewer
+ * then derives phases from agents alone). Best-effort: a parse failure here never
+ * blocks a run (the real parse/validation happens at execution).
+ */
+function extractDeclaredPhases(source: string): string[] | undefined {
+	try {
+		const phases = parseScript(source).meta.phases;
+		if (phases === undefined || phases.length === 0) {
+			return undefined;
+		}
+		return phases.map((p) => p.title);
+	} catch {
+		return undefined;
+	}
+}
+
 /** The retrieval hint naming the workflow_status tool for a run. */
 function runHint(runId: string): string {
 	return `workflow_status run_id=${runId} for the result`;
@@ -733,6 +752,7 @@ export function createWorkflowEngine(
 		const resolved = await resolveResume(args);
 		const runId = ids.next(liveRunIds());
 		const name = extractName(resolved.source);
+		const declaredPhases = extractDeclaredPhases(resolved.source);
 		const scriptPath = join(scriptsDir, `${runId}.js`);
 
 		// Persist the script source BEFORE execution (the spec's "persisted script
@@ -807,6 +827,7 @@ export function createWorkflowEngine(
 			runId,
 			parentSessionID: args.parentSessionID,
 			scriptPath,
+			...(declaredPhases !== undefined ? { phases: declaredPhases } : {}),
 			at: clock.now(),
 		});
 
