@@ -51,7 +51,7 @@ To run the plugin straight from a local checkout — for development of the plug
 }
 ```
 
-Once loaded, the plugin contributes four tools to every session: `workflow`, `workflow_status`, `workflow_stop`, and `structured_output`.
+Once loaded, the plugin contributes four tools to every session — `workflow`, `workflow_status`, `workflow_stop`, and `structured_output` — and a **native TUI viewer** you open with **`ctrl+o`** (see [The native TUI viewer](#the-native-tui-viewer)). The same package ships both the server tools and the viewer; there is no separate install.
 
 ---
 
@@ -230,7 +230,7 @@ Note the shape: `parallel` takes **thunks** (`() => agent(...)`), not promises. 
 
 ### Agent failure is `null`; what throws instead
 
-`agent()` follows "degrade, don't detonate." An agent that dies on a terminal status, or a runner call that throws, resolves to `null` — never a rejection. This includes the per-agent completion timeout: an agent still running after **30 minutes** degrades to `null` like any other failure. Filter the nulls out:
+`agent()` follows "degrade, don't detonate." An agent that dies on a terminal status, or a runner call that throws, resolves to `null` — never a rejection. There is **no per-agent wall-clock timeout**: workflows are long-running by nature, so an agent waits for as long as it needs to reach a terminal status (the completion gate still resolves it on normal idle completion, a vanished session, or a stale backstop of 45 minutes of *total* silence — which an actively-working agent never reaches). Filter the nulls out:
 
 ```js
 const reviews = (await pipeline(files, reviewStage)).filter(Boolean);
@@ -508,7 +508,11 @@ Beyond the textual `workflow_status` tool, the package ships a second plugin sur
 It contributes two things to the TUI:
 
 - A **`sidebar_content` slot** — a passive one-line glance per active run (`… <run-id>  <done>/<total> agents · <elapsed>`, the CC-style `done/total` where the leading number is how many agents finished), invisible when no run is live. Click a run (or open the viewer from the palette) to jump into the full-screen route for that run.
-- A **full-screen `workflows` route** — three panes (Phases | Agents | Detail). Open it from the command palette (`/workflows`). In-route keys: `j/k` move the selection within the focused pane, `enter` drills Phases → Agents → Detail, `esc` backs out one pane then closes the route, and `x` writes the cancel sentinel for the open run (the exact external touch the engine's control watcher consumes — the run settles `cancelled`).
+- A **full-screen `workflows` route** — a tree on the left (every phase, with its agents indented beneath it) and a Detail pane on the right. Open it with **`ctrl+o`**, or `/workflows` from the command palette, or by clicking the sidebar line. The declared `meta.phases` paint as pending `·` headers from the first frame — the whole pipeline is visible up front; agents fill in live as execution reaches each phase. In-route keys:
+  - `↑/↓` (or `k/j`) — move the agent selection (the tree scrolls to follow it).
+  - `←/→` (or `h/l`) — switch between runs (every run in the feed dir, freshest first; the header shows `run i/N`). One viewer flips between workflows launched from different sessions in the same repo.
+  - `x` (or `s`) — write the cancel sentinel for the open run (the external touch the engine's control watcher consumes — the run settles `cancelled`).
+  - `q` (or `esc`) — quit the viewer.
 
 ### Installing the viewer surface
 
@@ -532,8 +536,8 @@ The pure reduction/summary logic is unit-tested under `bun test`, but live rende
 1. **Install both surfaces.** Point your `opencode.json` at `opencode-drawer-workflows` (or the dev `file://` form) and launch OpenCode's TUI against opencode `1.16.2` (the `./tui` entry is `index.tsx` so the host transform owns component creation — see the single-instance rule above).
 2. **Launch a multi-phase workflow.** Run a script with at least two phases and a handful of agents (the canonical review workflow in [Example 3](#example-3--the-canonical-review-workflow-pipeline--adversarial-verify-with-a-sub-workflow) works well). The `workflow` tool returns a `run_id` immediately.
 3. **Watch the sidebar summarize it.** Within ~1s the `sidebar_content` slot shows a line like `… <run-id>  3/5 agents · 1m 12s` (3 of 5 agents finished), the count climbing as agents settle.
-4. **Open the route.** Run `/workflows` from the command palette (or click the sidebar line). The full-screen Phases | Agents | Detail view opens on that run.
-5. **See it update live.** As the engine appends to the feed, the Phases counters, the per-agent CC-style rows (`✓ impl  opus-4-8  112.7k tok · 51 tools · 7m 8s`), and the Detail pane (last tools, note, token breakdown, sessionID) update in real time. Navigate with `j/k/enter/esc`.
+4. **Open the route.** Press **`ctrl+o`** (or run `/workflows`, or click the sidebar line). The full-screen tree + Detail view opens on that run, the whole `meta.phases` pipeline visible as pending `·` headers from the first frame.
+5. **See it update live.** As the engine appends to the feed, the phase markers, the per-agent CC-style rows (`✓ impl  opus-4-8  112.7k tok · 51 tools · 7m 8s`), and the Detail pane (last tools, note, token breakdown, sessionID) update in real time. Move the selection with `↑/↓`, switch runs with `←/→`; the tree scrolls to follow the selection.
 6. **Cancel through the sentinel.** Press `x`. The view flips to `cancelling` (the feed's `run:cancel-requested` line), the engine's control watcher consumes the sentinel, the children stop, and the run settles `cancelled`.
 7. **Restart and re-render.** Quit and relaunch the TUI, then open `/workflows` again. The now-settled run re-renders from its feed file alone — the viewer holds no state of its own.
 
