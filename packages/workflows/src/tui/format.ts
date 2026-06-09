@@ -97,9 +97,18 @@ export function formatRelativeTime(thenMs: number, nowMs: number): string {
 	return `${Math.floor(hours / 24)}d`;
 }
 
-/** Sum every token field into the one number {@link formatTokens} renders. */
+/**
+ * Sum every token field into the one number {@link formatTokens} renders. Each
+ * field is coerced defensively (the Phase 2 NaN lesson, mirroring `budget.ts`):
+ * this is fed from feed-parsed data whose per-variant fields are NOT validated by
+ * `parseFeedLine`, so a partial `tokens` object missing e.g. `cacheWrite` must
+ * contribute 0 rather than poison the whole sum into `NaN`.
+ */
 export function totalTokens(t: SessionTokenSnapshot): number {
-	return t.input + t.output + t.reasoning + t.cacheRead + t.cacheWrite;
+	const n = (v: unknown): number => (typeof v === "number" ? v : 0);
+	return (
+		n(t.input) + n(t.output) + n(t.reasoning) + n(t.cacheRead) + n(t.cacheWrite)
+	);
 }
 
 /**

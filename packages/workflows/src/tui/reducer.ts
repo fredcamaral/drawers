@@ -281,6 +281,13 @@ export function createRunStateReducer(): RunStateReducer {
 		if (row === undefined) {
 			return;
 		}
+		// `tokens` is REQUIRED on the wire type, but `parseFeedLine` casts without
+		// validating per-variant fields — a format-drifted / hand-edited `agent:stats`
+		// line may omit it. Guard the dereference the same way `applyEnd` guards its
+		// optional `tokens`, so a tokens-less line is a no-op, not a crash.
+		if (e.tokens === undefined) {
+			return;
+		}
 		row.tokens = totalTokens({
 			input: e.tokens.input,
 			output: e.tokens.output,
