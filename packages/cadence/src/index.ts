@@ -17,12 +17,9 @@
  * All logging routes through `client.app.log` (structured JSON) — never `console`.
  */
 
+import { adaptSdkClient } from "@drawers/core";
 import type { Plugin } from "@opencode-ai/plugin";
-import {
-	type CadenceClient,
-	type CadenceEngineLogger,
-	createCadenceEngine,
-} from "./engine";
+import { type CadenceEngineLogger, createCadenceEngine } from "./engine";
 import { createCadenceStore } from "./store";
 import { createGoalTool } from "./tools/goal";
 import { createListTool } from "./tools/list";
@@ -57,9 +54,12 @@ export const CadencePlugin: Plugin = async ({ client }) => {
 
 	const store = createCadenceStore({ logger });
 	const engine = createCadenceEngine({
-		// The live SDK client is a structural superset of the engine's CadenceClient
-		// surface (session.promptAsync + session.messages). Narrow through unknown.
-		client: client as unknown as CadenceClient,
+		// Narrow the live SDK client through core's single drift-detection adapter
+		// (the same one background-agents/workflows use). adaptSdkClient returns an
+		// EngineClient — a structural superset of the engine's CadenceClient surface
+		// (session.promptAsync + session.messages) — so the compiler validates the IO
+		// boundary instead of an `as unknown as` double-cast erasing it.
+		client: adaptSdkClient(client),
 		store,
 		logger,
 	});
