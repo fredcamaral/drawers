@@ -206,6 +206,8 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
 			[...tasks.values()].filter(
 				(t) => t.status === "running" || t.status === "pending",
 			),
+		getBySession: (sessionID) =>
+			[...tasks.values()].find((t) => t.sessionID === sessionID),
 		freeSlot: (t) => {
 			freed.push(t.id);
 		},

@@ -203,6 +203,15 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 	const maxDepth = deps.config?.maxDepth ?? DEFAULT_MAX_DEPTH;
 
 	const tasks = new Map<string, BgTask>();
+	// Secondary index: sessionID → task, so the completion gate resolves a task by
+	// session in O(1) on every SDK event instead of linearly scanning the task map.
+	// Written wherever `task.sessionID` is assigned (launch, resume, recovery).
+	const tasksBySession = new Map<string, BgTask>();
+	function indexSession(task: BgTask): void {
+		if (task.sessionID !== undefined) {
+			tasksBySession.set(task.sessionID, task);
+		}
+	}
 	// While a task's acquire is in-flight, map taskId → (model, waiterId) so a
 	// cancellation can reject the still-queued waiter by its id.
 	const inflightAcquire = new Map<
@@ -232,6 +241,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			[...tasks.values()].filter(
 				(t) => t.status === "running" || t.status === "pending",
 			),
+		getBySession: (sessionID) => tasksBySession.get(sessionID),
 		freeSlot: (task) => {
 			// Slot held → release it. Else if the waiter is still queued → cancel
 			// it (denies the launch acquire). Else nothing to free.
@@ -298,6 +308,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			// `startedAt ?? createdAt` (both preserved), so stale-timeout applies to
 			// recovered running tasks without any extra wiring.
 			tasks.set(task.id, task);
+			indexSession(task); // recovered tasks may already carry a sessionID.
 
 			if (isTerminal(task.status)) {
 				continue; // terminal: visible to list/readOutput, no session check.

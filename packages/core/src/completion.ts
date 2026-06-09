@@ -90,6 +90,13 @@ export interface CompletionGateDeps {
 	/** Tasks currently `pending`/`running` (the poll's candidate set). */
 	runningTasks(): BgTask[];
 	/**
+	 * Look up the task owning a session id in O(1) (the runner's sessionID index).
+	 * Returns any task carrying that sessionID regardless of status; the gate
+	 * filters to non-terminal itself. Replaces the per-event linear scan over
+	 * {@link runningTasks} that ran on every SDK event of an active turn.
+	 */
+	getBySession(sessionID: string): BgTask | undefined;
+	/**
 	 * Release the concurrency resource the task holds. The runner decides
 	 * release-vs-cancelWaiter; the gate just signals "this task is done with its
 	 * slot". Synchronous and idempotent-safe from the gate's perspective (the
@@ -271,6 +278,7 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	const {
 		getTask,
 		runningTasks,
+		getBySession,
 		freeSlot,
 		abortSession,
 		fetchMessages,
@@ -485,14 +493,17 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		};
 	}
 
-	/** Find the tracked running/pending task owning a session id. */
+	/**
+	 * Find the tracked running/pending task owning a session id. O(1) via the
+	 * runner's sessionID index; terminal tasks are filtered out so this keeps the
+	 * exact "pending/running owner" semantics of the former linear scan.
+	 */
 	function trackedBySession(sessionID: string): BgTask | undefined {
-		for (const t of runningTasks()) {
-			if (t.sessionID === sessionID) {
-				return t;
-			}
+		const t = getBySession(sessionID);
+		if (!t || isTerminal(t.status)) {
+			return undefined;
 		}
-		return undefined;
+		return t;
 	}
 
 	/** Extract a sessionID from any event that carries one (for activity tracking). */
