@@ -426,6 +426,67 @@ startup.
 
 ---
 
+## TUI rendering (Solid/opentui surface)
+
+These four are about the *TUI* plugin surface, not the server one. Depth, full
+API tables, and the scroll-follow patterns live in `references/tui-rendering.md`;
+these are the traps that bite first.
+
+## 18. `solid-js` / `@opentui` value imports belong in `.tsx` only
+
+opencode's host transforms `.tsx`/`.jsx` at load and the transformed code
+resolves Solid/opentui to the **host's single instance**. A `.ts` file under the
+TUI source is *not* transformed, so any value import of `solid-js`/`@opentui` in
+it binds to this package's nested copy — a **second** Solid/opentui runtime — and
+you get `Orphan text error: "" must have a <text> as a parent` at navigate time.
+Keep all Solid/opentui imports in `.tsx`; pure logic stays Solid-free `.ts` (e.g.
+`paths.ts`, the JSX-free helper). The index header documents this as load-bearing
+(`packages/workflows/src/tui/index.tsx:12-26`) and a test enforces it — every
+non-`.tsx` file under `src/tui` must import no `solid-js`/`@opentui`
+(`packages/workflows/src/tui/paths.test.ts:77-84`). See `references/tui-rendering.md`.
+
+## 19. The TUI dist must be bundled *with* the Solid transform
+
+`@opentui/solid`'s `./jsx-runtime` and `./jsx-dev-runtime` both point at a
+**type-only** `.d.ts` — there is no runtime jsx factory (`@opentui/solid`
+`package.json:41-42`). The host injects the real factory via its load-time
+transform; a plain `tsc`/`Bun.build` does **not** inherit it and emits generic
+`jsxDEV()`/`jsx()` calls against that nonexistent runtime, so `dist/tui.js`
+crashes on the first JSX call. This shipped as `opencode-drawer-workflows@1.0.0`
+and crashed the viewer. Fix in `scripts/build.ts`: import
+`createSolidTransformPlugin` from `@opentui/solid/bun-plugin`, pass it as a
+`plugins:[…]` entry on the `.tsx` TUI entry **only**, and externalize `@opentui/*`
++ `solid-js` so the bundle uses the host's single instance
+(`scripts/build.ts:16-17,31,36-41,80-85`). See `references/tui-rendering.md`.
+
+## 20. Validating `src` is not validating the `dist`
+
+The host re-compiles `.tsx` from **source** at load, so a TUI plugin loaded via
+`file://` or a config path "works" in dev even when the bundler is misconfigured.
+A published `.js` dist gets **no** such transform (the host filter matches only
+`.tsx`/`.jsx`, `@opentui/solid` `scripts/solid-plugin.ts:100`), so `opencode run`
+against source can pass while the npm bundle crashes on load — exactly the 1.0.0
+trap. Therefore smoke-test the **built bundle**, not just source: grep `dist/tui.js`
+for `jsxDEV` (must be 0) and `createComponent` (must be >0). Note: this repo's only
+smoke harness drives the *server* source, not the dist
+(`packages/workflows/test-harness/run-smoke.ts`); the static guard against the
+dual-instance crash is `paths.test.ts:77-84`, not a built-bundle grep — so the dist
+gap is currently unprotected. See `references/tui-rendering.md`.
+
+## 21. `ScrollBox` culling renders off-viewport rows black; flex panes need `minWidth={0}`
+
+`ScrollBoxOptions.viewportCulling` defaults to **true** and drops children outside
+the measured viewport (`@opentui/core` `ScrollBox.d.ts:18-126`); in practice in-box
+rows got dropped to the background ("black") unless each scrollable row is
+`flexShrink={0}` so it takes its natural height — see the live comment at
+`packages/workflows/src/tui/route.tsx:452-453`, fixed with `viewportCulling={false}`
+for small lists (`route.tsx:454`) and `<text flexShrink={0}>` per row
+(`route.tsx:469,475`). Separately, flex panes sharing a row need `minWidth={0}` or a
+child's min-content width blocks shrinking and the split + scrollbar gutter drift
+(`route.tsx:446-456`). See `references/tui-rendering.md`.
+
+---
+
 ## Debugging checklist
 
 1. Structured logging only — `client.app.log`, never `console`.

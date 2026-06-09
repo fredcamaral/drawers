@@ -98,7 +98,80 @@ flags for a clean bed:
 OPENCODE_PURE=1 opencode run hi   # only your file:// / config-listed plugin runs
 ```
 
-## 5. Unit testing (optional, for complex plugins)
+## 5. Validate the BUILT bundle, not just source (TUI plugins)
+
+Everything above iterates from **source** (`file://`). For a server plugin that is
+the whole story — the host loads your `.ts` directly. For a **TUI** plugin it is a
+trap: `file://` dev can pass while the published npm bundle crashes on load.
+
+The reason is a transform asymmetry. opencode's host loader compiles `.tsx`/`.jsx`
+at load time with `@opentui/solid`'s Solid transform — the `onLoad` filter is
+`/\.(js|ts)x$/` (`@opentui/solid/scripts/solid-plugin.ts:100`). So when you point a
+config at `src/index.tsx`, the host **re-compiles the JSX itself** and it works.
+A published `.js` dist is *not* re-transformed (the filter is `.tsx`/`.jsx` only),
+so whatever your bundler emitted is what runs. If your `Bun.build` did not inherit
+the Solid transform, it emits generic `jsxDEV()` calls against a runtime with no
+implementation, and `dist/tui.js` crashes on the first JSX call
+(`scripts/build.ts:22-30`). That is exactly what shipped as
+`opencode-drawer-workflows@1.0.0` — source-tested green, bundle dead on load. A
+package shipping both surfaces (`"exports": { ".": "./dist/index.js", "./tui":
+"./dist/tui.js" }`, `packages/workflows/package.json:19-23`) loads them by
+independent runtimes; this gap is the **TUI dist's** alone. See
+`references/tui.md` §loading for the dual-surface mechanics and
+`references/tui-rendering.md` for the build-transform fix in `scripts/build.ts`.
+
+> Smoke-testing source proves nothing about the dist. **Smoke-test the artifact.**
+
+This repo does **not** yet ship this guard — `test-harness/run-smoke.ts` drives
+`opencode run` against the *server* source (`src/plugin/index.ts` via `file://`)
+and never touches `dist/tui.js`. The closest existing protection is
+`src/tui/paths.test.ts:69-92`, a *source*-level static check that no `.ts` under
+`src/tui` imports `solid-js`/`@opentui` (the dual-instance guard). Neither covers
+the src-vs-dist gap. Add the two checks below.
+
+**Grep the built bundle.** A correctly transformed TUI bundle has the Solid
+universal-runtime calls and none of the generic JSX-runtime calls:
+
+```bash
+test "$(grep -c jsxDEV packages/workflows/dist/tui.js)" -eq 0    # generic runtime → MUST be 0
+test "$(grep -c 'createComponent' packages/workflows/dist/tui.js)" -gt 0  # Solid universal → MUST be >0
+```
+
+On the current dist this passes: `jsxDEV` → 0, `createComponent` → `>0`
+(`packages/workflows/dist/tui.js`; don't pin the exact count — it moves with the
+`.tsx`). A nonzero `jsxDEV` means the transform did not run on that entry — the 1.0.0
+failure mode.
+
+**Import-smoke the bundle in Bun.** Grep proves the call shape; evaluating the
+module proves it actually loads against the externalized host instance without
+throwing:
+
+```bash
+bun -e 'await import("./packages/workflows/dist/tui.js"); console.log("tui bundle loaded")'
+```
+
+Run both after every build, before publish. Source iteration (§1–§4) and these two
+checks together cover load-time correctness for a dual-surface package.
+
+## 6. Render behaviors are NOT unit-testable — do a manual TUI pass
+
+Load-time checks (above) and the unit tests (below) cover wiring and pure logic.
+They say nothing about how the TUI actually draws. Scroll-follow, viewport
+culling, and flex layout under resize have no headless assertion — opentui renders
+to a real terminal. Budget a manual validation pass and eyeball:
+
+- **Scroll-follow** — drive the active row off-screen (down past the fold, then
+  back up); the view should track it, not freeze top-pinned. See
+  `references/tui-rendering.md` for the real-geometry follow pattern.
+- **Culling / black rows** — scroll a list with many rows; rows must not drop to
+  background as they cross the viewport edge (the `viewportCulling` trap —
+  `references/tui-rendering.md`).
+- **Layout under resize** — shrink and grow the terminal width; flex panes must
+  re-split cleanly and the scrollbar gutter must stay flush, not drift.
+- **Truncation** — at narrow widths each row stays one line (no wrap-induced
+  geometry drift that breaks scroll math).
+
+## 7. Unit testing (optional, for complex plugins)
 
 The plugin function is a plain async function — call it with a mocked context and
 invoke hooks directly. No opencode process needed.

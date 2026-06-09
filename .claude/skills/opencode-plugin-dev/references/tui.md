@@ -75,6 +75,11 @@ opentui intrinsics (`<box>`, `<text>`) and Solid primitives (`createSignal`,
 `createMemo`, `For`, `Show`) from `solid-js`. State is read reactively off `api`
 (e.g. `api.state.session.todo(id)`, `api.theme.current`).
 
+For the rendering deep-dive — layout/flex traps, `ScrollBox` + scroll-follow
+patterns, and the `.tsx`-only rule (a `.ts` importing `solid-js`/`@opentui` spins a
+second runtime instance and crashes with `Orphan text`) — see
+`references/tui-rendering.md`.
+
 Canonical shape (the internal sidebar-todo plugin, verbatim structure):
 
 ```tsx
@@ -118,9 +123,18 @@ use; `meta` carries load metadata (`first`/`updated`/`same`, version, fingerprin
 `@opencode-ai/plugin` declares `@opentui/core`, `@opentui/keymap`, `@opentui/solid`
 (`>=0.3.2`) as **optional** peer dependencies (`packages/plugin/package.json:24-39`,
 each `optional: true` in `peerDependenciesMeta`). Server-only plugins never install
-them. A TUI plugin must provide them — they supply the JSX runtime, key/RGBA types,
-and the `SolidPlugin` slot core that `tui.ts` re-exports. Install them in your
-plugin package when you ship a `./tui` entrypoint.
+them. A TUI plugin must provide them — they supply the runtime values
+(`@opentui/solid`'s `createComponent`/render core), key/RGBA types, and the
+`SolidPlugin` slot core that `tui.ts` re-exports. Install them in your plugin
+package when you ship a `./tui` entrypoint.
+
+**They do NOT supply a JSX runtime.** `@opentui/solid`'s `./jsx-runtime` and
+`./jsx-dev-runtime` exports both point at a **type-only `.d.ts` stub**
+(`@opentui/solid/package.json:41-42`), so the JSX must be compiled away by the
+Solid transform — which the host applies to `.tsx`/`.jsx` at load but a bundler
+does not inherit, the crash that shipped as `opencode-drawer-workflows@1.0.0`. The
+full mechanism and the build fix live in `references/tui-rendering.md` (rendering
+mechanics) and `references/publishing.md` (wiring the transform into your build).
 
 ## Registration and loading
 

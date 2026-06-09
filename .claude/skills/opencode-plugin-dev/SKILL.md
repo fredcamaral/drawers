@@ -40,6 +40,13 @@ writing hook or tool code:
 Vendored examples and blog posts go stale fast. The generated refs are truth.
 </critical>
 
+> **`file:line` citations are version-pinned anchors, not gospel.** The line numbers
+> throughout these references point into specific opencode/SDK/opentui versions (each
+> reference dates itself in its header) and **drift across releases**. Use them to
+> *locate* — "find this symbol near here" — then verify against your installed
+> version by matching on the surrounding code, not the literal line. `hooks.md` /
+> `events.md` are regenerable (Step 1); the hand-written source cites are not.
+
 ## Gated workflow
 
 Follow these steps in order. Steps 1 and 2 are gates — do not write code until
@@ -101,7 +108,11 @@ The lists below are verified against the current `Hooks` interface.
   `readV1Plugin` (`packages/opencode/src/plugin/shared.ts:285-301`); a single module exports `server()`
   OR `tui()`, never both (`shared.ts:293-295`). Note the published `@opencode-ai/plugin` type still pins
   `PluginModule.tui?: never` (`plugin/src/index.ts:79`) — the type lags the runtime. To **build** a TUI
-  plugin (Solid-JSX/opentui panes, dialogs, routes, keybinds, v2 client), read `references/tui.md`. For
+  plugin (Solid-JSX/opentui panes, dialogs, routes, keybinds, v2 client), read `references/tui.md`. Such a
+  plugin must be **bundled with the Solid transform** (`@opentui/solid`'s `createSolidTransformPlugin`),
+  not plain `tsc`/`Bun.build` — `@opentui/solid`'s `./jsx-runtime` is a type-only stub, so an untransformed
+  bundle emits `jsxDEV()` calls against a nonexistent runtime and crashes on load
+  (`references/tui-rendering.md`, `references/publishing.md`). For
   server-side UI from a server plugin, use `client.tui.*` (toasts / prompt / dialogs) instead
   (`references/ui-feedback.md`).
 - New built-in tools baked into the binary → contribute to `packages/opencode`, or add them as plugin tools instead.
@@ -273,6 +284,7 @@ TUI render and the JSON-RPC stream.
 | Publish to npm, naming conventions, version-update notifications | `references/publishing.md` |
 | Show toasts or inline status in the TUI from a *server* plugin (via `client.tui.*`) | `references/ui-feedback.md` |
 | Render custom UI panes in the TUI (`./tui` entrypoint, v2 client) | `references/tui.md` |
+| Build/compile a TUI plugin's JSX, lay out panes, ScrollBox + scroll-follow, TUI UX patterns | `references/tui-rendering.md` |
 | Regenerate `hooks.md` / `events.md` from the installed SDK | `scripts/extract-plugin-api.ts` |
 
 ## Common mistakes
@@ -295,6 +307,7 @@ TUI render and the JSON-RPC stream.
 | Listening for `permission.updated` | It is in the v1 `Event` union but is a **phantom** — no source emits it. Use `permission.asked` / `permission.replied` instead. (`vcs.branch.updated` IS real.) Verify any event against `references/events.md`. |
 | Depending on `tui.*` events in headless runs | `tui.*` events only fire under the TUI, not for CLI/headless server runs. |
 | `process.cwd()` for paths | Prefer `directory` / `worktree` from `PluginInput` (or `ctx.directory` in a tool) — cwd may not be the session root. |
+| Bundling a `./tui` plugin with `tsc` / plain `Bun.build` | The bundle crashes on load: `@opentui/solid`'s `jsx-runtime` is a **type-only stub**, so untransformed JSX emits `jsxDEV()` against no runtime. Bundle with the Solid transform (`createSolidTransformPlugin`) and externalize `@opentui/*` + `solid-js`. See `references/tui-rendering.md`. |
 
 ## Credits
 

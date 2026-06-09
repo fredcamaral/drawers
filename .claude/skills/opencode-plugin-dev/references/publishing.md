@@ -120,6 +120,60 @@ my-plugin/
   An external plugin must compile to `dist/` and ship JS (the layout above), or
   it will publish a broken/empty tarball.
 
+## Building a TUI plugin for publish (NOT just tsc)
+
+The `"build": "tsc"` above is correct for a **server** plugin. For a **TUI**
+plugin it ships a crashing bundle. opencode's host transforms `.tsx`/`.jsx` at
+load with babel-preset-solid (filter `/\.(js|ts)x$/`, `solid-plugin.ts:100`),
+but a separate bundler (`tsc`, or a plain `Bun.build`) does **not** inherit that
+transform. And there is nothing for the runtime to fall back to:
+`@opentui/solid`'s `./jsx-runtime` and `./jsx-dev-runtime` both point at the
+same `.d.ts` — a **type-only** stub with no runtime jsx factory
+(`@opentui/solid/package.json:41-42`). So an un-transformed `.tsx` entry emits
+generic `jsxDEV()`/`jsx()` calls against a runtime that does not exist, and the
+bundle crashes on the first JSX call.
+
+**Post-mortem (`opencode-drawer-workflows@1.0.0`):** the published `dist/tui.js`
+was built without the Solid transform, emitted `jsxDEV()` against the type-only
+runtime, and crashed the viewer on load. The trap is that it *worked in dev* —
+opencode re-compiles the `.tsx` from source at load — so the misconfigured
+bundler is invisible until you smoke-test the **built** bundle. See
+`references/tui.md` for why the runtime is type-only and what the transform
+produces.
+
+The fix: bundle the `.tsx` entry with the Solid transform and externalize the
+host-provided peers. Worked example from `scripts/build.ts`:
+
+```typescript
+// @ts-expect-error — `@opentui/solid/bun-plugin` ships no published types.
+import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"; // build.ts:16-17
+
+const solidPlugin: BunPlugin = createSolidTransformPlugin();            // build.ts:31
+
+// build.ts:36-41 — host-provided peers; bundling a second copy re-creates
+// the dual-instance "Orphan text" crash (see references/tui.md).
+const TUI_PEER_EXTERNALS = ["@opentui/core", "@opentui/keymap", "@opentui/solid", "solid-js"];
+
+// build.ts:80-85 — ONLY the .tsx TUI entry carries plugins.
+{
+  entry: "src/tui/index.tsx",
+  outName: "tui.js",
+  external: [...SERVER_EXTERNALS, ...TUI_PEER_EXTERNALS],
+  plugins: [solidPlugin],
+}
+```
+
+`createSolidTransformPlugin()` is called with **no arguments**; its defaults are
+`moduleName: "@opentui/solid"` and `generate: "universal"`
+(`solid-plugin.ts:105,129`) — the same transform the host applies. Externalizing
+`@opentui/*` + `solid-js` makes the compiled output reference the **host's**
+single instance, so there is no second copy and no dual-instance crash.
+
+**The rule:** the built TUI dist must contain **0** occurrences of `jsxDEV` and
+**>0** of `createComponent`. The fixed `dist/tui.js` greps to `0 jsxDEV` /
+`22 createComponent`. Grep the bundle as a publish gate — see
+`references/testing.md` for the smoke test.
+
 ## Export shape: named `Plugin`, or the structured `{ id, server }` module
 
 Two export shapes load (`applyPlugin` → `readV1Plugin` in `shared.ts:272-304`):
@@ -276,3 +330,5 @@ Guidance:
 | Scoped package 404 on install        | `publishConfig.access: "public"`          |
 | README says `npm install`            | Tell users to add to `opencode.json` only |
 | Awaiting the update check            | Fire-and-forget; never block init         |
+| `tsc`-built TUI bundle               | Bundle with the Solid transform; `tsc`/plain `Bun.build` emit `jsxDEV` against a type-only runtime |
+| TUI dist passes in dev, crashes from npm | Smoke-test the BUILT bundle: 0 `jsxDEV`, >0 `createComponent` |
