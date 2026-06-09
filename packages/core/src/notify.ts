@@ -87,9 +87,13 @@ export function createNotificationQueue(
 	const { onNotify, markNotified, logger } = opts;
 	const renderHint = opts.renderHint ?? defaultHint;
 
-	/** Per-parent FIFO of pending notices. */
-	const queues = new Map<string, TaskNotice[]>();
-	/** Dedup seen-set, keyed taskId+completedAt. */
+	/**
+	 * Per-parent FIFO of pending notices. Each entry carries its dedup `key`
+	 * alongside the notice so {@link flushFor} can prune the matching `seen` entry
+	 * on drain — dedup only needs to cover the window between enqueue and flush.
+	 */
+	const queues = new Map<string, Array<{ notice: TaskNotice; key: string }>>();
+	/** Dedup seen-set, keyed taskId+completedAt. Pruned on flush (see queues). */
 	const seen = new Set<string>();
 
 	function buildNotice(task: BgTask): TaskNotice {
@@ -107,13 +111,14 @@ export function createNotificationQueue(
 		return notice;
 	}
 
-	function enqueue(task: BgTask): TaskNotice {
+	function enqueue(task: BgTask, key: string): TaskNotice {
 		const notice = buildNotice(task);
+		const entry = { notice, key };
 		const list = queues.get(task.parentSessionID);
 		if (list) {
-			list.push(notice);
+			list.push(entry);
 		} else {
-			queues.set(task.parentSessionID, [notice]);
+			queues.set(task.parentSessionID, [entry]);
 		}
 		return notice;
 	}
@@ -128,7 +133,7 @@ export function createNotificationQueue(
 			return; // duplicate completion → no-op
 		}
 		seen.add(key);
-		const notice = enqueue(task);
+		const notice = enqueue(task, key);
 		if (onNotify) {
 			try {
 				onNotify(notice);
@@ -155,7 +160,7 @@ export function createNotificationQueue(
 			// no-ops (no double-enqueue across restart), then enqueue silently —
 			// no onNotify, to avoid a toast storm on restart.
 			seen.add(key);
-			enqueue(task);
+			enqueue(task, key);
 		}
 	}
 
@@ -165,9 +170,15 @@ export function createNotificationQueue(
 			return [];
 		}
 		queues.delete(parentSessionID);
+		// Prune the dedup keys for the drained notices: dedup only needs to span the
+		// window between enqueue and flush, so retaining keys past the drain would
+		// grow `seen` unbounded over the process lifetime.
+		for (const { key } of list) {
+			seen.delete(key);
+		}
 		// Persist the notified flag fire-and-forget; flush stays synchronous.
 		if (markNotified) {
-			for (const notice of list) {
+			for (const { notice } of list) {
 				markNotified(notice.taskId).catch((err: unknown) => {
 					logger?.error?.("markNotified failed", {
 						id: notice.taskId,
@@ -176,17 +187,19 @@ export function createNotificationQueue(
 				});
 			}
 		}
-		return list; // already oldest-first (push order)
+		return list.map((e) => e.notice); // already oldest-first (push order)
 	}
 
 	function pending(parentSessionID?: string): TaskNotice[] {
 		if (parentSessionID !== undefined) {
 			const list = queues.get(parentSessionID);
-			return list ? [...list] : [];
+			return list ? list.map((e) => e.notice) : [];
 		}
 		const all: TaskNotice[] = [];
 		for (const list of queues.values()) {
-			all.push(...list);
+			for (const e of list) {
+				all.push(e.notice);
+			}
 		}
 		return all;
 	}
