@@ -127,11 +127,21 @@ function runOpencode(prompt: string, dataDir: string): Promise<RunResult> {
 	});
 }
 
-/** Read all persisted task JSON files from the store dir. */
+/**
+ * Read all persisted task JSON files from the store dir. The engine resolves its
+ * store base as `join(resolveDataBaseDir(dataDir), "tasks")` (engine.ts), so the
+ * `<id>.json` files land under the `tasks` LEAF of the data dir — NOT at the data
+ * dir root. Scanning the root would only ever return the `tasks` subdir entry and
+ * always yield `[]`, silently timing out every wait. Read the leaf.
+ */
+function storeDir(dataDir: string): string {
+	return join(dataDir, "tasks");
+}
+
 async function readTasks(dataDir: string): Promise<PersistedTask[]> {
 	let names: string[];
 	try {
-		names = await readdir(dataDir);
+		names = await readdir(storeDir(dataDir));
 	} catch {
 		return [];
 	}
@@ -141,7 +151,7 @@ async function readTasks(dataDir: string): Promise<PersistedTask[]> {
 			continue;
 		}
 		try {
-			const raw = await readFile(join(dataDir, name), "utf-8");
+			const raw = await readFile(join(storeDir(dataDir), name), "utf-8");
 			tasks.push(JSON.parse(raw) as PersistedTask);
 		} catch {
 			// torn/partial file mid-write — ignore, will retry next poll.
@@ -382,6 +392,16 @@ async function main(): Promise<void> {
 	try {
 		const a = await scenarioA(dataDir);
 		const afterA = (await readTasks(dataDir)).length;
+		// Path-drift tripwire: scenario A must have persisted at least one task file
+		// under the store leaf. If this is ever 0, the harness is scanning the wrong
+		// directory (engine store-dir drift) — fail loudly here instead of letting
+		// every subsequent wait time out opaquely.
+		if (afterA === 0) {
+			throw new Error(
+				`no task files found under ${storeDir(dataDir)} after scenario A — ` +
+					"the harness is reading the wrong store directory (engine path drift).",
+			);
+		}
 		await scenarioB(dataDir, afterA);
 		// Restart recovery uses Scenario A's completed task (guaranteed terminal).
 		await scenarioC(dataDir, a.id);
