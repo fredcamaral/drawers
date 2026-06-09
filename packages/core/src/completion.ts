@@ -147,6 +147,17 @@ const STALE_CANCEL_REASON =
 	"Task went stale and was cancelled (no activity past the timeout). " +
 	"Do NOT create a replacement task; report the timeout to the user.";
 
+/**
+ * Distinct reason for a task force-cancelled while STILL QUEUED — it never
+ * acquired a concurrency slot (no `startedAt`), so it never ran. Using
+ * {@link STALE_CANCEL_REASON} here would falsely tell the agent the worker
+ * stalled mid-turn, misleading any retry/triage logic keyed on the reason text.
+ */
+const QUEUE_TIMEOUT_CANCEL_REASON =
+	"Task was cancelled: it never acquired a concurrency slot within the " +
+	"timeout window (the queue for its model stayed saturated). " +
+	"Do NOT create a replacement task; report the timeout to the user.";
+
 export interface CompletionGate {
 	/**
 	 * Synchronously flip a task to a terminal status (the mutex), then run async
@@ -645,9 +656,16 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	}
 
 	async function pollTask(task: BgTask, now: number): Promise<void> {
-		// Stale timeout: force-cancel with an anti-replacement instruction.
+		// Stale timeout: force-cancel with an anti-replacement instruction. A task
+		// that never started (no `startedAt`) is still queued in the concurrency
+		// manager — it never ran, so it gets the queue-timeout reason rather than
+		// the mid-turn "went stale" one (which would mislead retry/triage logic).
 		if (now - activityOf(task) >= staleTimeoutMs) {
-			tryComplete(task.id, "cancelled", STALE_CANCEL_REASON);
+			const reason =
+				task.startedAt === undefined
+					? QUEUE_TIMEOUT_CANCEL_REASON
+					: STALE_CANCEL_REASON;
+			tryComplete(task.id, "cancelled", reason);
 			return;
 		}
 		const sessionID = task.sessionID;

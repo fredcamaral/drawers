@@ -529,10 +529,20 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			throw err;
 		}
 
-		// (7) promote to running.
+		// (7) promote to running. A persist failure here would otherwise reject the
+		// caller with the task stuck `running` and its slot still held — no prompt
+		// in flight, so only the stale timeout (default 45min) could free it. Route
+		// the failure through the gate's error flip (which releases the slot via
+		// freeSlot) so the slot tears down immediately, then rethrow to the caller.
 		task.sessionID = sessionID;
+		indexSession(task); // register in the sessionID index for O(1) gate lookup.
 		task.startedAt = clock.now();
-		await setIntermediate(task, "running");
+		try {
+			await setIntermediate(task, "running");
+		} catch (err) {
+			gate.tryComplete(id, "error", errorMessage(err));
+			throw err;
+		}
 
 		// (8) fire-and-forget prompt. Failure routes through the gate (error flip
 		// releases the slot). Context parts (forked transcript) are prepended.
@@ -632,7 +642,15 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		task.completedAt = undefined;
 		task.error = undefined;
 		task.notified = undefined;
-		await setIntermediate(task, "running");
+		// Mirror launch step (7): a persist failure during promote-to-running must
+		// not leak the freshly re-acquired slot. Route it through the gate's error
+		// flip (releases the slot) instead of rejecting raw with the slot held.
+		try {
+			await setIntermediate(task, "running");
+		} catch (err) {
+			gate.tryComplete(taskId, "error", errorMessage(err));
+			throw err;
+		}
 
 		// Invalidate the gate's per-turn caches so a stale idle / cached positive
 		// from the previous turn can't instantly complete the new one.
