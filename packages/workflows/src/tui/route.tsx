@@ -658,7 +658,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 			</box>
 			<box flexShrink={0} paddingLeft={1}>
 				<text fg={theme().textMuted}>
-					↑↓ agent · ←→ run · x cancel run · q/esc quit
+					↑↓ agent · ←→ run · x cancel · s save · q/esc quit
 				</text>
 			</box>
 		</box>

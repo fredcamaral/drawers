@@ -76,11 +76,51 @@ args: {
 ```
 
 - An empty object `args: {}` is valid for a no-argument tool.
-- `.optional()` makes the arg `T | undefined`; `.default(v)` makes it required
-  in the schema but auto-filled when omitted. Prefer `.default()` when a sane
-  default exists — it removes a decision from the model.
+- `.optional()` makes the arg `T | undefined`. `.default(v)` is honored by the
+  *schema/type*, but **do not trust it at runtime** — opencode's raw tool-execute
+  path does not reliably apply Zod defaults or coercion, so an omitted or
+  wrong-typed arg can reach `execute()` as `undefined`, `NaN`, or the wrong type
+  regardless of the declared schema (see "Defensive coercion" below). Declare
+  `.default()` and types for the model's benefit, then re-validate every value
+  yourself.
 - The shape is `z.ZodRawShape` — a flat record of schemas. opencode wraps it in
   a `z.ZodObject` for you. Do not pass a pre-built `z.object(...)`.
+
+## Defensive coercion — the schema is NOT enforced at the call boundary
+
+The hard-won rule: **treat `args` as untrusted at runtime, even though `z.infer`
+types it as clean.** opencode's raw tool-execute path does not reliably apply Zod
+`.default()` or coercion before calling `execute()`. An omitted arg with a
+`.default()` can arrive `undefined`; a `number()` can arrive `NaN`; a model can
+hand a `string()` arg an *object*. The declared schema shapes the *type* and guides
+the *model* — it is not a runtime gate.
+
+The canonical failure: a `timeout_ms: tool.schema.number().default(60000)` arg the
+model omitted arrived as `NaN`, flowed into `setTimeout(cb, NaN)` (which fires in
+~1ms), and a "block until done" tool instantly returned "still running" — silently
+breaking the feature with no error thrown. `NaN`/`undefined` defaults are the trap
+precisely because they don't throw; they just behave wrongly downstream.
+
+Coerce defensively at the top of every `execute`:
+
+```typescript
+async execute(rawArgs, ctx) {
+  const a = rawArgs as Record<string, unknown>
+  // number with a real fallback — never trust .default()
+  const timeoutMs = Number.isFinite(a.timeout_ms as number) ? (a.timeout_ms as number) : 60000
+  // id/string that a model might send as an object or omit
+  const id = typeof a.id === "string" ? a.id : String(a.id ?? "")
+  // a "string" arg a model may send as structured JSON
+  const note = typeof a.note === "string" ? a.note : JSON.stringify(a.note ?? "")
+  // ...
+}
+```
+
+Rules of thumb: numbers → `Number.isFinite(x) ? x : fallback`; required strings →
+`typeof x === "string" ? x : String(x)`; "string" args a model may structure →
+accept either and stringify. Corollary for tests: you **cannot** validate coercion
+by trusting the schema — pass garbage (`undefined`, `NaN`, an object) straight into
+`execute` and assert the fallback holds.
 
 ## `execute(args, context)` and `ToolContext`
 

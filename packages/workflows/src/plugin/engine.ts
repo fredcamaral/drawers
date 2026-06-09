@@ -631,11 +631,10 @@ export function createWorkflowEngine(
 	// Engine-owned per-agent worktree manager (Epic H.1.6). Constructed ONCE from the
 	// host `$` bound to the project root (sibling to the checkpointer's shared probe),
 	// then threaded through every run's WorkflowRunDeps → AgentPrimitiveDeps so the
-	// future isolation mint-point (Epic H.1.2) can reach it. ABSENT shell → a documented
-	// no-op (`create` returns null), so isolation requests degrade-to-null as today
-	// (Epic 0.4). The manager probes the work-tree lazily on first use (its own latch),
-	// so no extra startup probe is needed here. UNUSED today — this task wires the handle
-	// only (no behavior change until H.1.2 consumes it).
+	// isolation mint-point (Epic H.1.2) calls it at the `isolation:'worktree'` seam. An ABSENT shell → a documented
+	// no-op (`create` returns null), so isolation requests degrade-to-null on a
+	// no-shell engine. The manager probes the work-tree lazily on first use (its own latch),
+	// so no extra startup probe is needed here.
 	const worktreeManager: WorktreeManager = createWorktreeManager({
 		shell: opts.shell,
 		directory: opts.directory,

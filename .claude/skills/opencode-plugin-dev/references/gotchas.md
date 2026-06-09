@@ -190,6 +190,22 @@ keep using it — but don't be blindsided if a future opencode steers you to the
 `session.status` / `session.next.step.ended` family (which aren't in the v1 union
 yet).
 
+**Orchestrating background/child sessions? `session.idle` + a quiet-poll is not
+enough.** If you build your own completion gate (waking on idle, or polling for "no
+events for N seconds + some assistant output present"), beware: silent windows >5s
+with *zero* SDK events are **normal mid-turn** — first-token latency on a large
+prompt can be 20–30s, and an API `ECONNRESET` + retry backoff looks identical to
+"done." A quiet-time heuristic will mark a task complete *mid-flight*, and
+downstream reads (e.g. a structured-output registry) then see an empty result. Add
+a **liveness veto** before completing, from two best-effort signals: (1)
+`client.session.status()` — if it reports `busy`/`retry` (or the read itself
+*throws*), the turn is live, do not complete; (2) the newest post-watermark
+assistant message lacking `time.completed` means the turn is still streaming. Route
+every completion path through one `assessTurn → {valid, live}` choke point,
+status-veto first. Testing footgun: a *blocking in-session tool* cannot reproduce
+this — it starves the turn events and the status reads simultaneously; unit-test the
+gate logic rather than relying on a sleeping-tool e2e.
+
 ---
 
 ## 7. Throw semantics are NOT uniform — it depends on the hook
@@ -391,6 +407,11 @@ export const MyPlugin: Plugin = async ({ $ }) => {
 }
 ```
 
+Separately, the `BunShell` *type* is imported-but-not-re-exported by
+`@opencode-ai/plugin`, so `import type { BunShell } from "@opencode-ai/plugin"`
+does **not** resolve. Derive it from the input type instead:
+`type BunShell = PluginInput["$"]`.
+
 ---
 
 ## 16. A tool guard double-fires for subagents
@@ -423,6 +444,13 @@ config-mutation hook has already run). So mutating providers/models in `config`
 works — the provider layer honors what you injected. Mutate `cfg` in place; the
 return value is ignored, and a throw here is swallowed (logged), so it can't break
 startup.
+
+The same hook injects **agents, keybinds, and slash commands** — mutate
+`cfg.agent`, `cfg.keybind`, `cfg.command` in place. There is **no** dedicated
+"register a command" plugin API: a user-facing `/command` is just a `cfg.command`
+entry. This is how Claude-Code-style loaders work — they read `.claude/commands` /
+`.opencode/command/*.md` markdown (with `$ARGUMENTS`) and translate each into a
+`cfg.command` entry, project scope overriding user scope.
 
 ---
 
@@ -484,6 +512,38 @@ for small lists (`route.tsx:454`) and `<text flexShrink={0}>` per row
 (`route.tsx:469,475`). Separately, flex panes sharing a row need `minWidth={0}` or a
 child's min-content width blocks shrinking and the split + scrollbar gutter drift
 (`route.tsx:446-456`). See `references/tui-rendering.md`.
+
+## 22. A `./tui` plugin and a server plugin are SEPARATE PROCESSES — talk via files
+
+The TUI plugin runs in the opencode **TUI process**; a server/`"."` plugin runs in
+the **server process**. They share no memory — a viewer pane **cannot call the
+server plugin's in-memory engine** directly. Any "viewer drives the engine" feature
+(cancel a run from a panel, save it, read live run state) must cross the process
+boundary through the filesystem:
+
+- **Control channel (viewer → engine):** the viewer writes a sentinel file
+  (e.g. `<dataDir>/<ns>-control/<id>.cancel`); the engine runs a **poll loop** over
+  that dir, acts, then deletes the sentinel. Poll, don't `fs.watch` — watch is
+  platform-flaky and most engine FS abstractions don't expose it. Put any payload
+  (e.g. a save name) in the sentinel body and read it before consuming.
+- **Data channel (engine → viewer):** the engine appends to a JSONL **feed file**;
+  the viewer tails it. Frame it — a `run:start` first line and a `run:end` last line
+  as the termination marker the viewer keys on. The viewer holds **no state of its
+  own**: it re-renders a settled run purely from the feed file, so it survives a TUI
+  restart.
+- Serialize every append through a single promise-chain queue (one
+  `JSON.stringify(ev)+"\n"` at a time) so concurrent writes never interleave a
+  half-line, and fence it with a dead-latch (first FS error logs once, flips dead,
+  drops later writes — a broken disk must never break a run).
+- **Ordering footgun:** on a *cancel*, in-flight children's `*:end` events can land
+  *after* you wrote `run:end`, breaking the "run:end is terminal" invariant the
+  viewer trusts. A closure holding a direct writer reference keeps appending after
+  you drop it from a map — emit `run:end` only from the run's own settle branch
+  (after the abort has flushed the in-flight ends), or seal the writer first.
+
+Because the viewer is a detached reader, its toasts are **optimistic** — they
+confirm the sentinel was *written*, not that the engine validated and acted. Expose
+the same operation as a server-plugin tool when the caller needs the real outcome.
 
 ---
 
