@@ -141,6 +141,46 @@ describe("createEngine", () => {
 		await engine.runner.dispose();
 	});
 
+	test("recovered running task whose session is dead reconciles to error and queues exactly one notice", async () => {
+		// sessionAlive:false makes the fake client's session.get() throw, mirroring
+		// an expired/gone session at restart. The runner's recovery routine must
+		// finalize the recovered running task through the gate (status → error),
+		// which fires onTaskComplete → queue.push exactly once. The terminal task is
+		// already notified so it does NOT re-queue; only the reconciled one does.
+		const fs = makeFs(
+			Object.fromEntries([
+				[
+					`${TASKS}/bg_terminal.json`,
+					JSON.stringify(terminalTask({ notified: true })),
+				],
+				[`${TASKS}/bg_running.json`, JSON.stringify(runningTask())],
+			]),
+		);
+		const engine = await createEngine({
+			client: makeClient({ sessionAlive: false }),
+			dataDir: BASE,
+			fs,
+			logger: noopLogger,
+		});
+
+		// Recovery is detached; dispose() drains the recovery promise (the
+		// `session.get` rejection → gate.tryComplete). The terminal flip itself is
+		// synchronous, but the gate's teardown (which fires onTaskComplete →
+		// queue.push) runs detached afterwards, so drain a few ticks for it to land.
+		await engine.runner.dispose();
+		for (let i = 0; i < 5; i += 1) {
+			await Promise.resolve();
+		}
+
+		const reconciled = engine.runner.list().find((t) => t.id === "bg_running");
+		expect(reconciled?.status).toBe("error");
+
+		// Exactly one notice for the reconciled task — the already-notified terminal
+		// is not re-queued.
+		const pending = engine.queue.pending("ses_parent");
+		expect(pending.map((n) => n.taskId)).toEqual(["bg_running"]);
+	});
+
 	test("seeds the notification queue with the recovered terminal (un-notified) task", async () => {
 		const fs = makeFs({
 			[`${TASKS}/bg_terminal.json`]: JSON.stringify(terminalTask()),

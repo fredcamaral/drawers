@@ -102,6 +102,29 @@ describe("createBgCancelTool", () => {
 		expect(out).not.toContain("bg_done");
 	});
 
+	test("all with a mixed batch: one cancel throws, the rest succeed — both reported, count covers all attempted", async () => {
+		const runner = makeRunner({
+			list: () => [task("bg_run", "running"), task("bg_pend", "pending")],
+			cancel: async (id) => {
+				if (id === "bg_pend") {
+					throw new Error("backend unavailable");
+				}
+				return task(id, "cancelled");
+			},
+		});
+		const tool = createBgCancelTool(runner);
+		const out = await run(tool, { all: true }, makeContext());
+		// The succeeding task reports its cancelled status …
+		expect(out).toContain("bg_run");
+		expect(out).toContain("cancelled");
+		// … and the failing one reports a per-task error line (one rejection must
+		// NOT abort the whole batch via Promise.all).
+		expect(out).toContain("bg_pend");
+		expect(out).toContain("error: backend unavailable");
+		// The count header reflects ALL attempted tasks, not just the successes.
+		expect(out).toContain("2 task(s)");
+	});
+
 	test("both task_id and all set: error string, no cancel calls", async () => {
 		const runner = makeRunner({
 			cancel: () => {
