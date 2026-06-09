@@ -9,10 +9,7 @@
 
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import type { CadenceEngine } from "../engine";
-
-function asString(value: unknown): string {
-	return typeof value === "string" ? value : "";
-}
+import { asString } from "./args";
 
 export function createStopTool(engine: CadenceEngine) {
 	return tool({

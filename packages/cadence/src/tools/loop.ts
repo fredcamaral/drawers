@@ -14,18 +14,7 @@
 
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import type { CadenceEngine } from "../engine";
-
-function asString(value: unknown): string {
-	return typeof value === "string" ? value : "";
-}
-
-function asPositiveInt(value: unknown): number | undefined {
-	const n = typeof value === "number" ? value : Number(value);
-	if (!Number.isFinite(n) || n <= 0) {
-		return undefined;
-	}
-	return Math.floor(n);
-}
+import { asPositiveInt, asString } from "./args";
 
 export function createLoopTool(engine: CadenceEngine) {
 	return tool({
