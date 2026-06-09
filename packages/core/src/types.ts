@@ -70,6 +70,15 @@ export interface LaunchRequest {
 	 */
 	contextParts?: TextPartInput[];
 	/**
+	 * Per-launch project/worktree directory forwarded as the `session.create`
+	 * QUERY param (SDK `SessionCreateData.query.directory`), which re-roots the
+	 * worker's Bash/tool cwd (host-probed green 2026-06-08 against opencode
+	 * v1.16.2). UNUSED until per-agent worktree isolation (Epic H.1) wires it;
+	 * absent → the engine-wide directory applies as today. It is a CREATE-time
+	 * query, NOT a body field and NOT a prompt-time param — see SessionCreateBody.
+	 */
+	directory?: string;
+	/**
 	 * Invoked SYNCHRONOUSLY after the child session is created and BEFORE the
 	 * prompt is dispatched. Lets callers register per-session state (e.g. a
 	 * structured-output schema) with no race against the child's first turn.

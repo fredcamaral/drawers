@@ -76,6 +76,38 @@ describe("adaptSdkClient", () => {
 		expect(res).toEqual({ data: undefined });
 	});
 
+	test("create: forwards query.directory verbatim when present (Epic H.1)", async () => {
+		const { client, calls } = makeFake();
+		const engine = adaptSdkClient(client);
+
+		await engine.session.create({
+			body: { parentID: "ses_parent", title: "a task" },
+			query: { directory: "/tmp/wt-abc" },
+		});
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toEqual({
+			method: "create",
+			opts: {
+				body: { parentID: "ses_parent", title: "a task" },
+				query: { directory: "/tmp/wt-abc" },
+			},
+		});
+	});
+
+	test("create: omits query when absent (byte-identical to today)", async () => {
+		const { client, calls } = makeFake();
+		const engine = adaptSdkClient(client);
+
+		await engine.session.create({ body: { title: "x" } });
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toEqual({
+			method: "create",
+			opts: { body: { title: "x" } },
+		});
+	});
+
 	test("promptAsync: forwards { path, body } verbatim", async () => {
 		const { client, calls } = makeFake();
 		const engine = adaptSdkClient(client);

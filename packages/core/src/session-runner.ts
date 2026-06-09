@@ -67,6 +67,13 @@ export interface EngineClient {
 	session: {
 		create(opts: {
 			body?: SessionCreateBody;
+			/**
+			 * Optional create-time query (SDK `SessionCreateData.query`). The only
+			 * field the engine forwards is `directory`, which re-roots the worker's
+			 * Bash/tool cwd (Epic H.1, host-probed green 2026-06-08). Absent → the
+			 * call shape is byte-identical to today.
+			 */
+			query?: { directory?: string };
 		}): Promise<{ data?: { id: string } }>;
 		promptAsync(opts: {
 			path: { id: string };
@@ -449,6 +456,14 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		try {
 			const created = await client.session.create({
 				body: { parentID: req.parentSessionID, title: req.description },
+				// Epic H.1 (inert seam): forward the per-launch worktree directory as
+				// the create-time query.directory ONLY when present, so an absent
+				// directory yields the byte-identical create call shape as today. NOT
+				// forwarded to resume()/dispatchPrompt — the probe validated create-time
+				// re-rooting alone.
+				...(req.directory !== undefined
+					? { query: { directory: req.directory } }
+					: {}),
 			});
 			const newID = created.data?.id;
 			if (!newID) {

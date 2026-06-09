@@ -51,6 +51,13 @@ export interface SdkSessionClient {
 	session: {
 		create(opts: {
 			body?: SessionCreateBody;
+			/**
+			 * Create-time query (SDK `SessionCreateData.query`). The real generated
+			 * client's `create` accepts `query?: { directory?: string }`, so this
+			 * structural widening stays assignable. The engine forwards only
+			 * `directory` (Epic H.1, host-probed green) — re-roots the worker cwd.
+			 */
+			query?: { directory?: string };
 		}): Promise<SdkResult<{ id: string }>>;
 		promptAsync(opts: {
 			path: { id: string };
@@ -94,7 +101,14 @@ export function adaptSdkClient(client: SdkSessionClient): EngineClient {
 	return {
 		session: {
 			create: async (opts) => {
-				const res = await client.session.create({ body: opts.body });
+				const res = await client.session.create({
+					body: opts.body,
+					// Epic H.1 (inert seam): forward the create-time directory query ONLY
+					// when present, so the live SDK call is byte-identical to today when
+					// no query is passed — preserving this adapter's "single drift-
+					// detection point" contract.
+					...(opts.query !== undefined ? { query: opts.query } : {}),
+				});
 				return { data: res.data ? { id: res.data.id } : undefined };
 			},
 			promptAsync: async (opts) =>

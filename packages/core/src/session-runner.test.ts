@@ -38,6 +38,9 @@ async function flush(): Promise<void> {
 
 interface CreateCall {
 	body: SessionCreateBody;
+	/** Recorded verbatim so a test can assert the directory query is forwarded
+	 * only when present (H.1.2) and absent (no `query` key) otherwise. */
+	query?: { directory?: string };
 }
 interface PromptCall {
 	id: string;
@@ -62,7 +65,12 @@ function makeClient() {
 	const client: EngineClient = {
 		session: {
 			create(opts) {
-				createCalls.push({ body: opts.body ?? {} });
+				createCalls.push({
+					body: opts.body ?? {},
+					...("query" in opts && opts.query !== undefined
+						? { query: opts.query }
+						: {}),
+				});
 				return createDeferred.promise;
 			},
 			promptAsync(opts) {
@@ -247,6 +255,43 @@ describe("createSessionRunner — launch happy path", () => {
 		const statuses = persisted.map((p) => p.status);
 		expect(statuses).toContain("pending");
 		expect(statuses).toContain("running");
+	});
+
+	test("LaunchRequest.directory forwards to session.create as query.directory", async () => {
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+		const launched = runner.launch(baseReq({ directory: "/tmp/wt-abc" }));
+		await flush();
+		h.resolveCreate("ses_child");
+		await launched;
+
+		expect(h.createCalls).toHaveLength(1);
+		const call = at(h.createCalls, 0);
+		expect(call.body).toEqual({
+			parentID: "ses_parent",
+			title: "do the thing",
+		});
+		expect(call.query).toEqual({ directory: "/tmp/wt-abc" });
+	});
+
+	test("absent directory yields a create call with no query key", async () => {
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+		const launched = runner.launch(baseReq());
+		await flush();
+		h.resolveCreate("ses_child");
+		await launched;
+
+		expect(h.createCalls).toHaveLength(1);
+		expect(at(h.createCalls, 0).query).toBeUndefined();
 	});
 });
 
