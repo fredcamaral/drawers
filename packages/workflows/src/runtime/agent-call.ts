@@ -377,8 +377,6 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 
 		const key = computeCallKey({
 			prompt,
-			label: opts.label,
-			phase: opts.phase,
 			schema: opts.schema,
 			model: opts.model,
 			agentType: opts.agentType,

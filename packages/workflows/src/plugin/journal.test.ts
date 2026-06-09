@@ -64,8 +64,8 @@ describe("computeCallKey", () => {
 	});
 
 	test("is stable across input field ordering", () => {
-		const a = computeCallKey({ prompt: "p", model: "m", label: "l" });
-		const b = computeCallKey({ label: "l", model: "m", prompt: "p" });
+		const a = computeCallKey({ prompt: "p", model: "m", agentType: "g" });
+		const b = computeCallKey({ agentType: "g", model: "m", prompt: "p" });
 		expect(a).toBe(b);
 	});
 

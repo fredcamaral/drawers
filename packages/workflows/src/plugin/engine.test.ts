@@ -1709,7 +1709,7 @@ describe("createWorkflowEngine — default-install resolution (no dataDir, no en
 			const base = join(xdg, "opencode-drawers");
 			const { writeFile, mkdir } = await import("node:fs/promises");
 			const SCRIPT = `export const meta = { name: "j", description: "d" };\nconst r = await agent("do work", { label: "a" });\nreturn r;\n`;
-			const key = computeCallKey({ prompt: "do work", label: "a" });
+			const key = computeCallKey({ prompt: "do work" });
 			const entry: JournalEntry = {
 				index: 0,
 				key,
@@ -1817,7 +1817,7 @@ describe("createWorkflowEngine — journal is drained before settle (Task 4.3.2)
 		try {
 			const { writeFile, mkdir } = await import("node:fs/promises");
 			const SCRIPT = `export const meta = { name: "j", description: "d" };\nconst r = await agent("do work", { label: "a" });\nreturn r;\n`;
-			const key = computeCallKey({ prompt: "do work", label: "a" });
+			const key = computeCallKey({ prompt: "do work" });
 			const entry: JournalEntry = {
 				index: 0,
 				key,
@@ -3139,7 +3139,7 @@ describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
 	// progress events and no live child needed.
 	test("a completed run leaves run:start … events … run:end matching handle.progress", async () => {
 		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
-		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const key = computeCallKey({ prompt: "do work" });
 		const seeded: JournalEntry[] = [
 			{ index: 0, key, status: "ok", result: "CACHED" },
 		];
@@ -3207,7 +3207,7 @@ describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
 		// readFile/writeFile work for scripts/journals/records but whose feed writes
 		// blow up. We model that by making writeFile throw for any feed path.
 		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
-		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const key = computeCallKey({ prompt: "do work" });
 		const seeded: JournalEntry[] = [
 			{ index: 0, key, status: "ok", result: "CACHED" },
 		];
@@ -3269,7 +3269,7 @@ describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
 		// facade whose appendFile is real but whose readFile would throw if the feed
 		// path were ever read back — proving the synthesis path is not taken.
 		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
-		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const key = computeCallKey({ prompt: "do work" });
 		const seeded: JournalEntry[] = [
 			{ index: 0, key, status: "ok", result: "CACHED" },
 		];
@@ -3581,8 +3581,6 @@ describe("createWorkflowEngine — enriched agent:end + RunRecord.agents (Task 8
 		const SCRIPT = `${META}const r = await agent("do work", { label: "cachee", phase: "Review" });\nreturn r;\n`;
 		const key = computeCallKey({
 			prompt: "do work",
-			label: "cachee",
-			phase: "Review",
 		});
 		const seeded: JournalEntry[] = [
 			{ index: 0, key, status: "ok", result: "CACHED" },

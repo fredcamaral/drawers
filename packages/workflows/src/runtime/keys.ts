@@ -19,8 +19,6 @@ import { createHash } from "node:crypto";
 /** The shape {@link computeCallKey} hashes — a call's identity for replay. */
 export interface CallKeyInput {
 	prompt: string;
-	label?: string;
-	phase?: string;
 	schema?: object;
 	model?: string;
 	agentType?: string;
@@ -53,13 +51,17 @@ export function stableStringify(value: unknown): string {
 /**
  * The replay identity of an `agent()` call: a sha256 hex over a stable stringify
  * of its `(prompt, opts)` inputs. Field order and schema key order are irrelevant
- * (sorted); the prompt, model, and schema PRESENCE all change the key.
+ * (sorted); the prompt, model, schema, and agentType all change the key.
+ *
+ * `label` and `phase` are DELIBERATELY excluded: they are display/grouping metadata
+ * the agent worker never sees, so reorganizing them on a resume (renaming a label,
+ * moving an agent to another phase) is a cosmetic edit that must NOT void the cached
+ * verdict — otherwise the tool's per-item replay promise ("only changed, new, and
+ * previously-failed calls run live") would re-run identical work at full token cost.
  */
 export function computeCallKey(input: CallKeyInput): string {
 	const canonical = stableStringify({
 		prompt: input.prompt,
-		label: input.label,
-		phase: input.phase,
 		schema: input.schema,
 		model: input.model,
 		agentType: input.agentType,

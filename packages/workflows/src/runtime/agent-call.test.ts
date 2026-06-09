@@ -2123,7 +2123,7 @@ describe("createAgentPrimitive — write-ahead intent (Phase 3)", () => {
 		expect(intents).toHaveLength(1);
 		expect(intents[0]).toEqual({
 			index: 0,
-			key: computeCallKey({ prompt: "do work", label: "L" }),
+			key: computeCallKey({ prompt: "do work" }),
 			status: "intent",
 			label: "L",
 		});
