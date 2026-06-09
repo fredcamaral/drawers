@@ -653,6 +653,31 @@ export function createWorkflowEngine(
 	// (3) In-memory run handles, keyed by runId.
 	const runs = new Map<string, RunHandle>();
 
+	// Index of LIVE (status === "running") runs by their parentSessionID, so the
+	// latency-sensitive `chat.message` digest path (engine.liveRunsFor) costs
+	// O(this parent's live runs) instead of O(every run ever started in the session).
+	// A runId joins on handle creation and is dropped the moment it settles (the single
+	// settleRecord choke point) — terminal runs leave this index entirely.
+	const liveRunsByParent = new Map<string, Set<string>>();
+	const indexLiveRun = (parentSessionID: string, runId: string): void => {
+		const set = liveRunsByParent.get(parentSessionID);
+		if (set === undefined) {
+			liveRunsByParent.set(parentSessionID, new Set([runId]));
+		} else {
+			set.add(runId);
+		}
+	};
+	const unindexLiveRun = (parentSessionID: string, runId: string): void => {
+		const set = liveRunsByParent.get(parentSessionID);
+		if (set === undefined) {
+			return;
+		}
+		set.delete(runId);
+		if (set.size === 0) {
+			liveRunsByParent.delete(parentSessionID);
+		}
+	};
+
 	// Per-run live feed writers (Task 8.1.2), keyed by runId. Created in startRun,
 	// reachable by stopRun for the cancel `run:end` line; dropped when the run
 	// settles (the writer holds only a serialized promise chain, no live handle).
@@ -774,6 +799,9 @@ export function createWorkflowEngine(
 		patch: Partial<RunRecord> & { status: RunStatus },
 	): void {
 		Object.assign(handle.record, patch, { completedAt: clock.now() });
+		// The run is now terminal — drop it from the live-run index so the digest path
+		// never scans a settled run (and the index does not grow unbounded).
+		unindexLiveRun(handle.record.parentSessionID, handle.record.id);
 		persistRecord(handle.record);
 		noticePush(handle.record);
 	}
@@ -924,6 +952,8 @@ export function createWorkflowEngine(
 			budget,
 		};
 		runs.set(runId, handle);
+		// A freshly started run is live until settleRecord drops it from the index.
+		indexLiveRun(record.parentSessionID, runId);
 		persistRecord(record);
 
 		// The live feed (Task 8.1.2): one writer per run, framed by run:start now and
@@ -1492,12 +1522,17 @@ export function createWorkflowEngine(
 	}
 
 	function liveRunsFor(parentSessionID: string): RunHandle[] {
+		// O(this parent's live runs): the index holds only running runs (joined at
+		// handle creation, dropped at settleRecord), so the digest hot path never scans
+		// settled runs. The status === "running" recheck stays as a belt-and-braces guard.
+		const ids = liveRunsByParent.get(parentSessionID);
+		if (ids === undefined) {
+			return [];
+		}
 		const out: RunHandle[] = [];
-		for (const handle of runs.values()) {
-			if (
-				handle.record.status === "running" &&
-				handle.record.parentSessionID === parentSessionID
-			) {
+		for (const runId of ids) {
+			const handle = runs.get(runId);
+			if (handle !== undefined && handle.record.status === "running") {
 				out.push(handle);
 			}
 		}
