@@ -11,6 +11,7 @@
  */
 
 import type { FsFacade } from "@drawers/core";
+import { lookupBuiltin } from "./builtins";
 
 /** The saved-workflow subdirectory under the project directory. */
 const WORKFLOWS_SUBDIR = ".opencode/workflows";
@@ -20,6 +21,13 @@ export interface SourceResolverDeps {
 	directory: string;
 	/** fs facade; the engine passes its injected one (in-memory in tests). */
 	fs: FsFacade;
+	/**
+	 * Built-in workflow registry (Epic 2.2). A name present here resolves to its
+	 * built-in source BEFORE the on-disk lookup, so a built-in wins over a user
+	 * file of the same name. The engine passes {@link BUILTIN_WORKFLOWS}; absent
+	 * → no built-ins (current behavior). Tests inject a fake registry.
+	 */
+	builtins?: Record<string, string>;
 }
 
 /** Join two path segments with a single separator (no node:path dependency). */
@@ -70,11 +78,16 @@ async function loadSavedWorkflow(
 export function createSourceResolver(
 	deps: SourceResolverDeps,
 ): (nameOrRef: string | { scriptPath: string }) => Promise<string> {
-	const { directory, fs } = deps;
+	const { directory, fs, builtins } = deps;
 	const wfDir = joinPath(directory, WORKFLOWS_SUBDIR);
 
 	return async (nameOrRef) => {
 		if (typeof nameOrRef === "string") {
+			// Built-in wins over a same-named user file (Epic 2.2).
+			const builtin = lookupBuiltin(nameOrRef, builtins);
+			if (builtin !== undefined) {
+				return builtin;
+			}
 			return loadSavedWorkflow(fs, wfDir, nameOrRef);
 		}
 		// An absolute scriptPath (e.g. the persisted path the `workflow` tool hands

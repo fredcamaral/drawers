@@ -38,6 +38,9 @@ export const SUBDIR_CONTROL = "workflow-control";
 /** Cancel-sentinel suffix — MUST match the engine watcher's `SENTINEL_SUFFIX`. */
 export const SENTINEL_SUFFIX = ".cancel";
 
+/** Save-sentinel suffix — MUST match the engine watcher's `SAVE_SUFFIX`. */
+export const SAVE_SUFFIX = ".save";
+
 /** The minimal fs surface {@link writeCancelSentinel} writes through. Injectable. */
 export interface CancelFs {
 	mkdir(path: string, opts: { recursive: true }): Promise<unknown>;
@@ -66,5 +69,42 @@ export async function writeCancelSentinel(opts: {
 	await fs.writeFile(
 		join(opts.controlDir, `${opts.runId}${SENTINEL_SUFFIX}`),
 		"",
+	);
+}
+
+/**
+ * Coerce a run's display name into a filesystem-safe workflow name the engine's
+ * validator will accept: invalid-char runs → `-`, leading/trailing `.`/`-`
+ * stripped, empty → `"workflow"`. The TUI derives the save name from the run's
+ * own `meta.name` (which allows spaces/unicode), so a spaced name like
+ * "Deep Review" must become "Deep-Review" or the engine silently refuses it.
+ * The `workflow_save_run` tool does NOT slug — it requires a valid name up front.
+ */
+export function slugifyWorkflowName(raw: string): string {
+	const s = raw
+		.trim()
+		.replace(/[^A-Za-z0-9._-]+/g, "-")
+		.replace(/^[-.]+|[-.]+$/g, "");
+	return s.length > 0 ? s : "workflow";
+}
+
+/**
+ * Write the save sentinel for `runId`: `mkdir(<controlDir>)` then
+ * `<controlDir>/<runId>.save` whose BODY is the target workflow name. The
+ * engine's poll loop reads the body and copies the run's script to
+ * `.opencode/workflows/<name>.js` (Epic 4.2). The channel is one-way, mirroring
+ * cancel — the save outcome is logged engine-side, not returned here.
+ */
+export async function writeSaveSentinel(opts: {
+	controlDir: string;
+	runId: string;
+	name: string;
+	fs?: CancelFs;
+}): Promise<void> {
+	const fs = opts.fs ?? defaultCancelFs;
+	await fs.mkdir(opts.controlDir, { recursive: true });
+	await fs.writeFile(
+		join(opts.controlDir, `${opts.runId}${SAVE_SUFFIX}`),
+		opts.name,
 	);
 }

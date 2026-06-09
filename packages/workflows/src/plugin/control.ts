@@ -24,11 +24,14 @@
 import { join } from "node:path";
 
 const SENTINEL_SUFFIX = ".cancel";
+const SAVE_SUFFIX = ".save";
 
 /** The minimal fs surface the watcher needs — a subset of the engine `FsFacade`. */
 export interface ControlFs {
 	readdir(path: string): Promise<string[]>;
 	rm(path: string, opts: { force: true }): Promise<void>;
+	/** Read a `.save` sentinel's body (the target workflow name). */
+	readFile(path: string, encoding: "utf-8"): Promise<string>;
 }
 
 export interface ControlLogger {
@@ -48,6 +51,13 @@ export interface ControlWatcherOptions {
 	 * swallows it and still consumes the sentinel.
 	 */
 	onCancel(runId: string): Promise<void>;
+	/**
+	 * Save one run's script as a named workflow, where `name` is the `.save`
+	 * sentinel's body (Epic 4.2). Optional — absent → `.save` sentinels are still
+	 * consumed but do nothing. Like {@link onCancel} it may reject; the watcher
+	 * swallows it and still consumes the sentinel.
+	 */
+	onSave?(runId: string, name: string): Promise<void>;
 	/** Injectable interval arming; defaults to `globalThis.setInterval`. */
 	setIntervalFn?: (cb: () => void, ms: number) => unknown;
 	/** Injectable interval clearing; defaults to `globalThis.clearInterval`. */
@@ -114,24 +124,44 @@ export function createControlWatcher(
 		readdirErrorLogged = false;
 
 		for (const name of names) {
-			if (!name.endsWith(SENTINEL_SUFFIX)) {
-				continue;
+			let handled = false;
+			if (name.endsWith(SENTINEL_SUFFIX)) {
+				handled = true;
+				const runId = name.slice(0, -SENTINEL_SUFFIX.length);
+				try {
+					await opts.onCancel(runId);
+				} catch (err) {
+					// onCancel failures never stop the loop — the sentinel is still consumed.
+					opts.logger?.debug?.("workflow control onCancel failed", {
+						runId,
+						err: errorText(err),
+					});
+				}
+			} else if (name.endsWith(SAVE_SUFFIX)) {
+				handled = true;
+				const runId = name.slice(0, -SAVE_SUFFIX.length);
+				try {
+					// The sentinel body carries the target name; read it BEFORE consuming.
+					const saveName = (
+						await opts.fs.readFile(join(opts.dir, name), "utf-8")
+					).trim();
+					await opts.onSave?.(runId, saveName);
+				} catch (err) {
+					opts.logger?.debug?.("workflow control onSave failed", {
+						runId,
+						err: errorText(err),
+					});
+				}
 			}
-			const runId = name.slice(0, -SENTINEL_SUFFIX.length);
-			try {
-				await opts.onCancel(runId);
-			} catch (err) {
-				// onCancel failures never stop the loop — the sentinel is still consumed.
-				opts.logger?.debug?.("workflow control onCancel failed", {
-					runId,
-					err: errorText(err),
-				});
+			if (!handled) {
+				continue;
 			}
 			try {
 				await opts.fs.rm(join(opts.dir, name), { force: true });
 			} catch (err) {
 				// Consume-and-forget: a sentinel that can't be removed retries next tick,
-				// which is harmless because onCancel is idempotent.
+				// which is harmless because onCancel is idempotent and onSave is safe to
+				// repeat (a duplicate save refuses on the existing-file guard).
 				opts.logger?.debug?.("workflow control sentinel removal failed", {
 					name,
 					err: errorText(err),

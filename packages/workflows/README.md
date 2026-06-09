@@ -21,11 +21,13 @@ This README is both the package landing page and the complete authoring manual. 
    - [Budget](#budget)
    - [Resume](#resume)
    - [Saved workflows](#saved-workflows)
+   - [Built-in workflows](#built-in-workflows)
    - [Sub-workflows](#sub-workflows)
-4. [Worked examples](#worked-examples)
-5. [Environment variables](#environment-variables)
-6. [The native TUI viewer](#the-native-tui-viewer)
-7. [Honest limitations](#honest-limitations)
+4. [Patterns](#patterns)
+5. [Worked examples](#worked-examples)
+6. [Environment variables](#environment-variables)
+7. [The native TUI viewer](#the-native-tui-viewer)
+8. [Honest limitations](#honest-limitations)
 
 ---
 
@@ -51,7 +53,7 @@ To run the plugin straight from a local checkout — for development of the plug
 }
 ```
 
-Once loaded, the plugin contributes four tools to every session — `workflow`, `workflow_status`, `workflow_stop`, and `structured_output` — and a **native TUI viewer** you open with **`ctrl+o`** (see [The native TUI viewer](#the-native-tui-viewer)). The same package ships both the server tools and the viewer; there is no separate install.
+Once loaded, the plugin contributes five tools to every session — `workflow`, `workflow_status`, `workflow_stop`, `workflow_save_run`, and `structured_output` — and a **native TUI viewer** you open with **`ctrl+o`** (see [The native TUI viewer](#the-native-tui-viewer)). The same package ships both the server tools and the viewer; there is no separate install.
 
 ---
 
@@ -102,6 +104,18 @@ Aborts a running workflow and all its in-flight agents.
 | `run_id` | string | yes | The `wf_…` run id. |
 
 Three honest outcomes: unknown id → error listing known runs; already-terminal run → reports its status, no-op; running run → cancels and confirms.
+
+### `workflow_save_run` — persist a run as a reusable workflow
+
+Takes a run you have already launched and saves **its script** to `.opencode/workflows/<name>.js`, so the same workflow can be re-invoked by `name` later. The run may be finished or still running — it is the persisted *source* that is saved, not the result. This is the programmatic path behind the TUI's `s` keybinding.
+
+| Parameter | Type | Required | Meaning |
+|---|---|---|---|
+| `run_id` | string | yes | The `wf_…` run id whose script to save. |
+| `name` | string | yes | Name to save under. Charset is `[A-Za-z0-9._-]` (no `/`, `\`, or `.`/`..` traversal). |
+| `overwrite` | boolean | no | Replace an existing saved workflow of the same name. Defaults to `false`. |
+
+It **validates the script** (the same parse the launcher uses) before writing, and writes nothing on any refusal. Refusals: a bad name; a name that collides with a [built-in](#built-in-workflows) (built-ins win at resolve time, so a saved file by that name would never load); an unknown `run_id`; an unreadable or invalid source; or an existing file without `overwrite: true`.
 
 ### `structured_output` — internal, child-facing
 
@@ -175,9 +189,10 @@ const summary = await agent("Summarize the architecture of this repo in 3 bullet
 | `schema` | object (JSON Schema) | supported | Request a validated structured result (see [Structured output](#structured-output-via-schema)). |
 | `model` | string | supported | Model override; default inherits the session model. |
 | `agentType` | string | supported | Custom subagent type from the same registry as the `Agent` tool. |
-| `isolation` | `"worktree"` | **recognized but unsupported** | There is no worktree session primitive; the call emits a warn and runs **without** isolation. |
+| `tools` | string[] | supported | Tool names to **enable** for this agent (e.g. web search/fetch). Names are environment-dependent (the platform/MCP servers define them); composes with `schema`. This is the seam the built-in `deep-research` workflow uses. Omit to inherit the session's tools. |
+| `isolation` | `"worktree"` | supported (git-backed) | Runs the agent in its **own git worktree** — a scratch branch checked out in a sibling dir — so parallel mutating agents never clobber one shared tree; the agent's edits are committed and merged back when it settles. Active only on a git-backed run with shell access; on a non-git / no-shell checkout it degrades to `null` with a loud diagnostic rather than silently running unisolated. |
 
-The `isolation: "worktree"` option is honestly a no-op in this port: it is recognized, warns, and proceeds without isolation. Do not rely on it for parallel file mutation.
+**`isolation: "worktree"` in depth.** On a git-backed run (a real work tree with shell access) an `isolation: "worktree"` agent is minted its own worktree — `git worktree add` on a scratch branch `wf/<runId>/<label>`, checked out in a sibling directory — and runs there in isolation. When it settles, its uncommitted edits are committed onto the scratch branch and merged back into the main tree: a clean merge reclaims the worktree and branch; a **merge conflict** preserves the worktree and resolves the agent to a `{ status: "conflict" }` result for manual resolution; any other merge failure preserves the worktree and degrades the agent to `null` for re-attempt on resume. On a **non-git or no-shell** checkout there is no worktree primitive, so the call degrades to `null` with a loud diagnostic — it never silently runs unisolated. Use it for agents that mutate files in parallel.
 
 #### `phase(title)` and `log(message)`
 
@@ -349,6 +364,20 @@ Place a script at `.opencode/workflows/<name>.js` (or `.mjs`) in your project di
 
 Name resolution tries `<name>.js` first, then `<name>.mjs`, rooted at `<project>/.opencode/workflows/`. An unknown name returns an error listing what is available in that directory.
 
+You do not have to hand-author the file: a run you launched inline (via `script` or `script_path`) can be promoted into a saved workflow with the [`workflow_save_run`](#workflow_save_run--persist-a-run-as-a-reusable-workflow) tool or the TUI viewer's `s` keybinding — both persist the run's script under a name you choose so it becomes invocable by `name` thereafter.
+
+### Built-in workflows
+
+Some workflows ship **inside the plugin** and resolve by name with no file on disk. A built-in **wins** over a same-named user file in `.opencode/workflows/` — a shipped capability stays predictably available and cannot be silently shadowed.
+
+| Name | What it does |
+|---|---|
+| `deep-research` | Fans out web searches across independent angles, extracts checkable claims with source URLs, adversarially verifies each claim against its own source (dropping the unsupported ones), and synthesizes a cited report. Invoke with `{ "name": "deep-research", "args": "{\"question\": \"…\"}" }`. |
+
+`deep-research`'s research agents request the `tools` allowlist `["websearch", "webfetch", "exa", "firecrawl"]` — names are environment-dependent, so whichever your OpenCode/MCP setup provides activates and the rest are no-ops. If your deployment names web tools differently, the built-in source is the place to adjust.
+
+A `/deep-research <question>` slash-command wrapper ships at `.opencode/command/deep-research.md` in this package; copy it into your project's `.opencode/command/` to get the ergonomic invocation (OpenCode has no plugin-level command registration, so command files are project-scoped).
+
 ### Sub-workflows
 
 The `workflow(nameOrRef, args?)` global runs another workflow inline as a sub-step. `nameOrRef` is either a saved-name string or a `{ scriptPath }` ref (read relative to the project directory). `args` becomes the child's verbatim `args`.
@@ -366,6 +395,70 @@ Semantics:
 - **Resume.** The sub-workflow boundary is journaled as a single key over the *resolved child source* + args. Editing the child source (even a change the parent never sees) changes that key and re-runs the child; otherwise a matching boundary replays the cached child result without running the child at all. The child's internal agent calls get no individual journal entries — the one boundary key covers them.
 
 ---
+
+## Patterns
+
+Six composable shapes the Claude Code workflow guidance names; ours mirrors them. Each is the same move — "spawn isolated agents, then combine" — arranged differently. Naming the pattern when you ask for a workflow sharpens what Claude builds. Mix them freely; a research workflow is fan-out → adversarial-verification → generate-and-filter in one pipeline.
+
+- **classify-and-act** — one agent classifies the input, then you branch to a specialist agent per class (or classify the *output* at the end to shape it). Example 2 below is this shape: each file is classified into a severity bucket before anything acts on it. Mixed backlogs, triage.
+- **fan-out-and-synthesize** — one agent per independent step, each in its own clean context so the steps never cross-contaminate, then a **barrier** that merges their structured outputs into one result. Example 1 below fans out with no synthesis barrier; add a `parallel`-gated merge step to turn it into full fan-out-and-synthesize. Per-file audits, multi-angle research.
+- **adversarial-verification** — for each finding, spawn a *separate* agent whose only job is to refute it against a rubric. Producer and skeptic never share a context, which is what kills self-preference: a finding survives only if the skeptic cannot knock it down. Example 3 below is the flagship. Security findings, factual claims.
+- **generate-and-filter** — overgenerate a wide set of candidates, then a judge agent keeps only the rubric-passers. The generator and the judge **must be different agents** — a generator grading its own output is self-preference wearing a different hat. Naming, design exploration:
+
+```js
+// generate-and-filter: overgenerate in parallel, then a DIFFERENT agent judges.
+const candidates = await parallel(
+  Array.from({ length: 12 }, (_, i) =>
+    () => agent("Propose CLI tool name #" + i + " for: " + args.brief, { label: "gen:" + i }),
+  ),
+);
+const top3 = {
+  type: "object",
+  properties: { names: { type: "array", items: { type: "string" } } },
+  required: ["names"],
+};
+return await agent(
+  "Keep the 3 best names against the rubric (short, memorable, no clash):\n" +
+    candidates.filter(Boolean).join("\n"),
+  { label: "judge", schema: top3 },
+);
+```
+
+- **tournament** — N agents attempt the *same* task with different approaches; a judge compares them **pairwise** ("is A better than B?") until one wins. Comparative judgment is more reliable than absolute 1–10 scoring, which drifts. The deterministic JS loop holds the bracket; only the running order stays in context. There is **no `tournament()` primitive** — use `agent()` plus a plain loop, because keeping the bracket in JS is exactly what preserves resume. Taste-based ranking, sorting 1000+ items:
+
+```js
+// tournament: the bracket lives in the JS loop, not in an agent.
+const pick = {
+  type: "object",
+  properties: { winner: { type: "string", enum: ["A", "B"] } },
+  required: ["winner"],
+};
+let bracket = (
+  await parallel(
+    args.approaches.map((a, i) =>
+      () => agent("Draft a solution using approach: " + a, { label: "attempt:" + i }),
+    ),
+  )
+).filter(Boolean);
+while (bracket.length > 1) {
+  const next = [];
+  for (let i = 0; i < bracket.length; i += 2) {
+    if (i + 1 >= bracket.length) {
+      next.push(bracket[i]);
+      continue;
+    }
+    const v = await agent(
+      "Which is better, A or B? Reply 'A' or 'B'.\n\nA:\n" + bracket[i] + "\n\nB:\n" + bracket[i + 1],
+      { label: "judge:" + i, schema: pick },
+    );
+    next.push(v && v.winner === "B" ? bracket[i + 1] : bracket[i]);
+  }
+  bracket = next;
+}
+return { winner: bracket[0] };
+```
+
+- **loop-until-done** — for unknown-size work, loop spawning agents until a stop condition is met (no new findings for K rounds, no errors left in the logs) instead of a fixed pass count; pair the budget guard as a ceiling so an open-ended hunt cannot run away. Bug hunts, log-driven root-cause. Example 2 below shows the budget-guarded variant.
 
 ## Worked examples
 
@@ -511,7 +604,8 @@ It contributes two things to the TUI:
 - A **full-screen `workflows` route** — a tree on the left (every phase, with its agents indented beneath it) and a Detail pane on the right. Open it with **`ctrl+o`**, or `/workflows` from the command palette, or by clicking the sidebar line. The declared `meta.phases` paint as pending `·` headers from the first frame — the whole pipeline is visible up front; agents fill in live as execution reaches each phase. In-route keys:
   - `↑/↓` (or `k/j`) — move the agent selection (the tree scrolls to follow it).
   - `←/→` (or `h/l`) — switch between runs (every run in the feed dir, freshest first; the header shows `run i/N`). One viewer flips between workflows launched from different sessions in the same repo.
-  - `x` (or `s`) — write the cancel sentinel for the open run (the external touch the engine's control watcher consumes — the run settles `cancelled`).
+  - `x` — cancel the open run. It asks for confirmation first (cancel is destructive and `x` is a bare letter), then writes the cancel sentinel the engine's control watcher consumes — the run settles `cancelled`.
+  - `s` — save the open run as a named workflow under its display name. It writes a save sentinel the engine consumes, which validates the run's script and persists it to `.opencode/workflows/<name>.js` (the same path as the [`workflow_save_run`](#workflow_save_run--persist-a-run-as-a-reusable-workflow) tool). The toast is optimistic — it reports the request, not the validated outcome; use the tool when you need the full result.
   - `q` (or `esc`) — quit the viewer.
 
 ### Installing the viewer surface
@@ -538,14 +632,15 @@ The pure reduction/summary logic is unit-tested under `bun test`, but live rende
 3. **Watch the sidebar summarize it.** Within ~1s the `sidebar_content` slot shows a line like `… <run-id>  3/5 agents · 1m 12s` (3 of 5 agents finished), the count climbing as agents settle.
 4. **Open the route.** Press **`ctrl+o`** (or run `/workflows`, or click the sidebar line). The full-screen tree + Detail view opens on that run, the whole `meta.phases` pipeline visible as pending `·` headers from the first frame.
 5. **See it update live.** As the engine appends to the feed, the phase markers, the per-agent CC-style rows (`✓ impl  opus-4-8  112.7k tok · 51 tools · 7m 8s`), and the Detail pane (last tools, note, token breakdown, sessionID) update in real time. Move the selection with `↑/↓`, switch runs with `←/→`; the tree scrolls to follow the selection.
-6. **Cancel through the sentinel.** Press `x`. The view flips to `cancelling` (the feed's `run:cancel-requested` line), the engine's control watcher consumes the sentinel, the children stop, and the run settles `cancelled`.
-7. **Restart and re-render.** Quit and relaunch the TUI, then open `/workflows` again. The now-settled run re-renders from its feed file alone — the viewer holds no state of its own.
+6. **Save the run as a workflow.** Press `s`. A toast confirms the save request; the engine consumes the save sentinel, validates the open run's script, and writes it to `.opencode/workflows/<run-name>.js`. Confirm the file appears and is invocable by `name` on a later `workflow` call.
+7. **Cancel through the sentinel.** Press `x`. The view flips to `cancelling` (the feed's `run:cancel-requested` line), the engine's control watcher consumes the sentinel, the children stop, and the run settles `cancelled`.
+8. **Restart and re-render.** Quit and relaunch the TUI, then open `/workflows` again. The now-settled run re-renders from its feed file alone — the viewer holds no state of its own.
 
 ---
 
 ## Honest limitations
 
 - **No active wake in a single-turn host.** In an interactive session a settling run actively wakes an idle parent (and falls back to the toast + next-message flush when busy). But a headless `opencode run` exits — and the server shuts down — when the turn ends, so there is no live session to wake. The blocking option there is `workflow_status` with `wait_ms` (capped at 120000ms), which holds the turn open in-process until the run settles.
-- **`isolation: "worktree"` is recognized but unsupported.** There is no worktree session primitive, so the option warns and runs without isolation. Do not use it for safe parallel file mutation.
+- **`isolation: "worktree"` needs a git-backed run.** Worktree isolation is active on a git work tree with shell access; on a non-git or no-shell checkout there is no worktree primitive, so the call degrades to `null` with a loud diagnostic rather than running unisolated. A merge-back conflict resolves the agent to a `{ status: "conflict" }` result with the worktree preserved for manual resolution (see [`isolation: "worktree"` in depth](#agentprompt-opts)).
 - **Budget counts workflow-children only**, not the whole turn — a declared deviation from Claude Code's turn-wide pool (see [Budget](#budget)).
 ```

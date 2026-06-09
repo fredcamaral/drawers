@@ -10,7 +10,7 @@ import { type ControlFs, createControlWatcher } from "./control";
 
 const DIR = "/wf-data/workflow-control";
 
-function makeFs(names: string[] = []) {
+function makeFs(names: string[] = [], contents: Record<string, string> = {}) {
 	const present = new Set(names);
 	const calls: { readdir: number; rm: string[] } = { readdir: 0, rm: [] };
 	const fs: ControlFs = {
@@ -25,6 +25,7 @@ function makeFs(names: string[] = []) {
 			calls.rm.push(path);
 			present.delete(path.slice(`${DIR}/`.length));
 		},
+		readFile: async (path: string) => contents[path.slice(`${DIR}/`.length)] ?? "",
 	};
 	return { fs, present, calls };
 }
@@ -37,6 +38,7 @@ function enoentFs() {
 			throw err;
 		},
 		rm: async () => {},
+		readFile: async () => "",
 	};
 	return fs;
 }
@@ -86,6 +88,47 @@ describe("createControlWatcher — tick", () => {
 		expect(cancelled).toEqual(["wf_abc"]);
 		expect(calls.rm).toEqual([`${DIR}/wf_abc.cancel`]);
 		expect(present.has("wf_abc.cancel")).toBe(false);
+	});
+
+	test("a `<runId>.save` sentinel triggers onSave with the body name and is removed", async () => {
+		const { fs, present, calls } = makeFs(["wf_abc.save"], {
+			"wf_abc.save": "  myflow  ",
+		});
+		const saved: Array<{ runId: string; name: string }> = [];
+		const cancelled: string[] = [];
+		const watcher = createControlWatcher({
+			dir: DIR,
+			fs,
+			intervalMs: 1000,
+			onCancel: async (runId) => {
+				cancelled.push(runId);
+			},
+			onSave: async (runId, name) => {
+				saved.push({ runId, name });
+			},
+		});
+
+		await watcher.tick();
+
+		// Name is read from the body and trimmed; cancel is untouched.
+		expect(saved).toEqual([{ runId: "wf_abc", name: "myflow" }]);
+		expect(cancelled).toEqual([]);
+		expect(calls.rm).toEqual([`${DIR}/wf_abc.save`]);
+		expect(present.has("wf_abc.save")).toBe(false);
+	});
+
+	test("a `.save` sentinel with no onSave handler is still consumed", async () => {
+		const { fs, present } = makeFs(["wf_x.save"], { "wf_x.save": "n" });
+		const watcher = createControlWatcher({
+			dir: DIR,
+			fs,
+			intervalMs: 1000,
+			onCancel: async () => {},
+		});
+
+		await watcher.tick();
+
+		expect(present.has("wf_x.save")).toBe(false);
 	});
 
 	test("a missing control dir (ENOENT) yields no cancels and does not throw", async () => {
@@ -156,6 +199,7 @@ describe("createControlWatcher — tick", () => {
 			rm: async () => {
 				throw new Error("EBUSY");
 			},
+			readFile: async () => "",
 		};
 		const watcher = createControlWatcher({
 			dir: DIR,

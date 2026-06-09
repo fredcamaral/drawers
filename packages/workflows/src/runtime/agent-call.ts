@@ -165,7 +165,7 @@ export interface AgentPrimitiveDeps {
 		 * Epic H.1.3: the worktree dir to re-root the verify shell to. For an
 		 * `isolation:'worktree'` agent the `{check}` command must run in the WORKTREE
 		 * checkout (where the agent's edits live), not the main tree. ABSENT → the
-		 * engine-wide directory applies as today.
+		 * engine-wide directory applies.
 		 */
 		directory?: string;
 	}) => Promise<{ passed: boolean; available: boolean; reason?: string }>;
@@ -179,26 +179,26 @@ export interface AgentPrimitiveDeps {
 	 */
 	serializeOnCheckpoint?: <T>(task: () => Promise<T>) => Promise<T>;
 	/**
-	 * Per-agent project/worktree directory (Epic H.1, inert seam), forwarded
+	 * Per-agent project/worktree directory (Epic H.1), forwarded
 	 * straight to `runner.launch` → `session.create`'s `query.directory`, which
 	 * re-roots the worker's Bash/tool cwd (host-probed green 2026-06-08). This is
 	 * an ENGINE-OWNED dep, NOT an `AgentOpts` field — no script can request it and
 	 * it is deliberately ABSENT from {@link computeCallKey}/`CallKeyInput` (a
 	 * worktree path would re-key every cached agent on resume and re-run settled
-	 * work), exactly like the `contextDiff`/`verifyDiff` exclusion. UNUSED until
-	 * the future worktree-lifecycle code MINTS a per-agent directory; ABSENT → the
-	 * engine-wide directory applies as today.
+	 * work), exactly like the `contextDiff`/`verifyDiff` exclusion. The mint-point (Epic H.1.2) sets it: an
+	 * `isolation:'worktree'` agent launches in its minted worktree dir; ABSENT or non-isolated → the
+	 * engine-wide directory applies.
 	 */
 	directory?: string;
 	/**
 	 * The OPAQUE per-agent worktree manager (Epic H.1.6), constructed once by the
-	 * engine from the host `$` and threaded straight to this primitive. The future
-	 * isolation mint-point (Epic H.1.2) will call `worktreeManager.create(key)` at the
-	 * `isolation:'worktree'` seam (replacing the current degrade-to-null) and feed the
+	 * engine from the host `$` and threaded straight to this primitive. The
+	 * isolation mint-point (Epic H.1.2) calls `worktreeManager.create(key)` at the
+	 * `isolation:'worktree'` seam and feeds the
 	 * minted dir into the {@link AgentPrimitiveDeps.directory} launch injection. OPAQUE
-	 * to the runtime — see {@link WorktreeManagerSeam}. UNUSED today (this task threads
-	 * the handle only); ABSENT (no-shell engine, standalone library, child runs) →
-	 * isolation requests degrade-to-null as today (Epic 0.4).
+	 * to the runtime — see {@link WorktreeManagerSeam}. ABSENT (no-shell engine,
+	 * standalone library, child runs) or a null `create` →
+	 * isolation requests degrade-to-null with a loud diagnostic.
 	 */
 	worktreeManager?: WorktreeManagerSeam;
 }
@@ -616,6 +616,20 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			// 7. Launch the subagent. For structured output, register the compiled
 			// schema against the child sessionID the instant it exists (synchronous
 			// onSessionCreated hook), before the child's first turn can call the tool.
+			// toolsOverride is assembled from two independent sources that compose:
+			// the structured-output tool (when a schema is compiled) and any explicit
+			// opts.tools (Epic 2.1). Empty → omitted, so the no-schema/no-tools launch
+			// is byte-identical to before.
+			const toolsOverride: Record<string, boolean> = {};
+			if (compiled !== undefined) {
+				toolsOverride.structured_output = true;
+			}
+			for (const name of opts.tools ?? []) {
+				const trimmed = name.trim();
+				if (trimmed.length > 0) {
+					toolsOverride[trimmed] = true;
+				}
+			}
 			const task = await runner.launch({
 				parentSessionID,
 				description: label,
@@ -635,9 +649,9 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 					? {
 							onSessionCreated: (sid: string) =>
 								registry.register(sid, compiled),
-							toolsOverride: { structured_output: true },
 						}
 					: {}),
+				...(Object.keys(toolsOverride).length > 0 ? { toolsOverride } : {}),
 			});
 			taskId = task.id;
 			sessionId = task.sessionID;

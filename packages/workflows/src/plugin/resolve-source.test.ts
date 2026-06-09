@@ -54,6 +54,32 @@ describe("createSourceResolver — saved name", () => {
 	});
 });
 
+describe("createSourceResolver — built-in precedence (Epic 2.2)", () => {
+	const builtins = { research: "BUILTIN SOURCE" };
+
+	test("a built-in name shadows a saved user file of the same name", async () => {
+		const fs = makeFs({
+			"/proj/.opencode/workflows/research.js": "USER SOURCE",
+		});
+		const resolve = createSourceResolver({ directory: DIR, fs, builtins });
+		await expect(resolve("research")).resolves.toBe("BUILTIN SOURCE");
+	});
+
+	test("a name absent from built-ins still resolves from disk", async () => {
+		const fs = makeFs({
+			"/proj/.opencode/workflows/helper.js": "USER SOURCE",
+		});
+		const resolve = createSourceResolver({ directory: DIR, fs, builtins });
+		await expect(resolve("helper")).resolves.toBe("USER SOURCE");
+	});
+
+	test("a name in neither built-ins nor disk still rejects", async () => {
+		const fs = makeFs({});
+		const resolve = createSourceResolver({ directory: DIR, fs, builtins });
+		await expect(resolve("ghost")).rejects.toThrow(/ghost/);
+	});
+});
+
 describe("createSourceResolver — scriptPath ref", () => {
 	test("resolves { scriptPath } relative to the project directory", async () => {
 		const fs = makeFs({ "/proj/flows/x.js": "REF SOURCE" });

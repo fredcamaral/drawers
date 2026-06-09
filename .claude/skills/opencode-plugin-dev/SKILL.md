@@ -293,6 +293,7 @@ TUI render and the JSON-RPC stream.
 |---------|-----|
 | `client.registerTool()` | Does not exist. Register tools via the `tool` hook: `tool: { name: tool({...}) }`. |
 | Raw `zod` import for tool args, or a `parameters:` field | Use `args:` with `tool.schema.*` (zod re-exported from `@opencode-ai/plugin`). No `parameters` key. |
+| Trusting `.default()` / `z.infer` for runtime arg *values* | opencode's raw execute path applies **no** Zod defaults/coercion — an omitted arg can reach `execute()` as `undefined`/`NaN`/wrong-typed and break silently. Coerce defensively. See `references/custom-tools.md` → "Defensive coercion". |
 | `console.log` / `console.error` in a plugin | Corrupts TUI + JSON-RPC. Use `client.app.log({ body: { service, level, message } })`. |
 | Nested or `.tsx`/`.mjs` plugin files in the auto-scan dir | The glob is `{plugin,plugins}/*.{ts,js}` — one level deep, `.ts`/`.js` only. Both `plugin/` and `plugins/` load (plural is convention); subdirs and other extensions are ignored. |
 | Flat `client.app.log({ service, level, message })` | Must be `body`-wrapped: `client.app.log({ body: { ... } })`. |

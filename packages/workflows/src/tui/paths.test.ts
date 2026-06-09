@@ -5,6 +5,7 @@ import {
 	ROUTE_WORKFLOWS,
 	SENTINEL_SUFFIX,
 	SIDEBAR_SLOT_ORDER,
+	slugifyWorkflowName,
 	SUBDIR_CONTROL,
 	SUBDIR_FEED,
 	writeCancelSentinel,
@@ -16,6 +17,32 @@ import {
  * (it needs the host's Solid transform + runtime). The entry's shape is enforced by
  * `satisfies TuiPluginModule` at typecheck and by the manual host walkthrough.
  */
+
+describe("slugifyWorkflowName", () => {
+	test("spaced display names become hyphenated, filesystem-safe names", () => {
+		expect(slugifyWorkflowName("Deep Review")).toBe("Deep-Review");
+	});
+
+	test("invalid chars collapse to a single dash and edges are stripped", () => {
+		expect(slugifyWorkflowName("  my/weird name!  ")).toBe("my-weird-name");
+	});
+
+	test("path-traversal attempts are defanged", () => {
+		expect(slugifyWorkflowName("../escape")).toBe("escape");
+		expect(slugifyWorkflowName("..")).toBe("workflow");
+	});
+
+	test("an all-invalid or empty name falls back to 'workflow'", () => {
+		expect(slugifyWorkflowName("")).toBe("workflow");
+		expect(slugifyWorkflowName("   ")).toBe("workflow");
+		expect(slugifyWorkflowName("///")).toBe("workflow");
+	});
+
+	test("an already-valid name is preserved", () => {
+		expect(slugifyWorkflowName("deep-research")).toBe("deep-research");
+		expect(slugifyWorkflowName("my_flow.v2")).toBe("my_flow.v2");
+	});
+});
 
 describe("path/layout constants", () => {
 	test("match the engine's subdir layout (the feed is the bus)", () => {

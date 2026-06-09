@@ -51,7 +51,11 @@ import {
 	statusMarker,
 	truncateLine,
 } from "./format";
-import { writeCancelSentinel } from "./paths";
+import {
+	slugifyWorkflowName,
+	writeCancelSentinel,
+	writeSaveSentinel,
+} from "./paths";
 import {
 	type AgentView,
 	createRunStateReducer,
@@ -333,6 +337,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{ name: "workflows.prevRun", run: () => switchRun(-1) },
 				{ name: "workflows.quit", run: () => quit() },
 				{ name: "workflows.cancel", run: () => cancelSelected() },
+				{ name: "workflows.save", run: () => void saveSelected() },
 			],
 			// One entry PER key — `@opentui/keymap` does not comma-split a binding key.
 			bindings: [
@@ -347,6 +352,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{ key: "q", cmd: "workflows.quit" },
 				{ key: "escape", cmd: "workflows.quit" },
 				{ key: "x", cmd: "workflows.cancel" },
+				{ key: "s", cmd: "workflows.save" },
 			],
 		});
 	});
@@ -460,6 +466,41 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				variant: "error",
 				title: "Cancel failed",
 				message: `Could not write the cancel sentinel for ${id}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			});
+		}
+	}
+
+	/**
+	 * `s` saves the open run as a named workflow under the run's own display name.
+	 * Non-destructive (it writes a file, never overwrites without the tool's
+	 * overwrite flag — the engine refuses a collision), so no confirm dialog. The
+	 * control channel is one-way: we toast optimistically here and the engine logs
+	 * the actual outcome; the `workflow_save_run` tool is the path with full result
+	 * feedback. A failed sentinel write is fenced into an error toast.
+	 */
+	async function saveSelected(): Promise<void> {
+		const id = runId();
+		if (id === undefined) {
+			return;
+		}
+		// Derive a filesystem-safe name from the run's display name (which may carry
+		// spaces) so the engine's validator accepts it — the one-way channel can't
+		// report a rejection back, so we must not hand it a name it will refuse.
+		const name = slugifyWorkflowName(view().name ?? id);
+		try {
+			await writeSaveSentinel({ controlDir: props.controlDir, runId: id, name });
+			props.api.ui.toast({
+				variant: "info",
+				title: "Saving run",
+				message: `Saving "${name}" to .opencode/workflows/${name}.js — see logs for the result.`,
+			});
+		} catch (err) {
+			props.api.ui.toast({
+				variant: "error",
+				title: "Save failed",
+				message: `Could not write the save sentinel for ${id}: ${
 					err instanceof Error ? err.message : String(err)
 				}`,
 			});
@@ -617,7 +658,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 			</box>
 			<box flexShrink={0} paddingLeft={1}>
 				<text fg={theme().textMuted}>
-					↑↓ agent · ←→ run · x cancel run · q/esc quit
+					↑↓ agent · ←→ run · x cancel · s save · q/esc quit
 				</text>
 			</box>
 		</box>

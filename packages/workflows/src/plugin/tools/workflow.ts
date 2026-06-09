@@ -22,6 +22,7 @@
 import type { FsFacade } from "@drawers/core";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { parseScript } from "../../runtime/meta";
+import { BUILTIN_WORKFLOWS, lookupBuiltin } from "../builtins";
 import type { WorkflowEngine } from "../engine";
 
 /** The saved-workflow subdirectory under the project directory. */
@@ -71,7 +72,7 @@ function joinPath(base: string, rel: string): string {
 }
 
 /** A node:fs/promises-backed default facade (used when no fs is injected). */
-function nodeFs(): FsFacade {
+export function nodeFs(): FsFacade {
 	// Lazy require so the module stays import-light for the in-memory test path.
 	const fs = require("node:fs/promises") as {
 		mkdir: FsFacade["mkdir"];
@@ -168,12 +169,21 @@ function architectureEcho(source: string | undefined): string[] {
 	return lines;
 }
 
-/** Read a saved workflow by name: try <dir>/<name>.js, then .mjs. */
-async function loadSavedWorkflow(
+/**
+ * Resolve a workflow by name: a built-in wins over a same-named user file (Epic
+ * 2.2), then try <dir>/<name>.js, then .mjs. `builtins` defaults to the shipped
+ * registry; tests inject a fake to exercise precedence without a real built-in.
+ */
+export async function loadSavedWorkflow(
 	fs: FsFacade,
 	wfDir: string,
 	name: string,
+	builtins: Record<string, string> = BUILTIN_WORKFLOWS,
 ): Promise<{ ok: true; source: string } | { ok: false; error: string }> {
+	const builtin = lookupBuiltin(name, builtins);
+	if (builtin !== undefined) {
+		return { ok: true, source: builtin };
+	}
 	for (const ext of [".js", ".mjs"]) {
 		try {
 			const source = await fs.readFile(
@@ -211,7 +221,7 @@ async function loadSavedWorkflow(
  * every turn of every session, in exchange for correct scripts on the first try.
  * The full reference (with worked examples) is the package README.
  */
-const WORKFLOW_DESCRIPTION = `Run a workflow: an orchestration script that fans out to MANY agents and can consume large token volumes. ONLY use this when the user has opted into orchestration (the \`ultracode\` keyword, a standing ultracode toggle, an explicit request for multi-agent orchestration, a skill that invokes it, or a request to run a named/saved workflow); otherwise use single agent calls, or describe the workflow and its rough cost and ask. Returns immediately with a run_id — the run executes in the background and you are notified on completion; do not poll (workflow_status with wait_ms is the blocking option for single-turn contexts).
+export const WORKFLOW_DESCRIPTION = `Run a workflow: an orchestration script that fans out to MANY agents and can consume large token volumes. ONLY use this when the user has opted into orchestration (the \`ultracode\` keyword, a standing ultracode toggle, an explicit request for multi-agent orchestration, a skill that invokes it, or a request to run a named/saved workflow); otherwise use single agent calls, or describe the workflow and its rough cost and ask. Returns immediately with a run_id — the run executes in the background and you are notified on completion; do not poll (workflow_status with wait_ms is the blocking option for single-turn contexts).
 
 ## Script format
 
@@ -227,7 +237,7 @@ The body below the meta runs in an async context: use top-level await freely; a 
 
 ## Script API (the only globals available)
 
-- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType, contextDiff. isolation:'worktree' runs the agent in its OWN git worktree (a scratch branch checked out in a sibling dir) when the run is git-backed, so parallel mutating agents never overwrite each other on one tree; it degrades to null with a loud diagnostic ONLY on a non-git / no-shell checkout (where there is no worktree primitive) rather than silently running unisolated. contextDiff:true (FOR REVIEW AGENTS) injects the engine-computed REAL git diff (since run start) as model-only context, and refuses the review (degrades to null) when that diff is empty — so a reviewer reviews what is actually ON DISK, never narrative-only claims. The diff does not change the resume cache key, so a reviewer still replays its verdict on resume. On a non-git checkout it is inert (the review runs with no diff). verifyDiff (FOR FIX/IMPLEMENT AGENTS) is a post-condition the engine checks AFTER the agent settles, against GIT/DISK truth — NOT the agent's self-report. verifyDiff:true (or {}) asserts the unit's git diff is non-empty (the agent actually wrote to disk); verifyDiff:{check:'<cmd>'} runs <cmd> (e.g. a test) and asserts exit 0. On failure the result is downgraded to null (so it re-runs on resume); it does NOT change the resume cache key. Best-effort: it proves something is on disk or a command passed, not that the work is correct. Inert on a non-git checkout.
+- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType, tools (string[] — enable named platform/MCP tools for this agent, e.g. web search/fetch for research; names are environment-dependent and a no-op if the platform lacks them; omit to inherit the session's tools), contextDiff. isolation:'worktree' runs the agent in its OWN git worktree (a scratch branch checked out in a sibling dir) when the run is git-backed, so parallel mutating agents never overwrite each other on one tree; it degrades to null with a loud diagnostic ONLY on a non-git / no-shell checkout (where there is no worktree primitive) rather than silently running unisolated. contextDiff:true (FOR REVIEW AGENTS) injects the engine-computed REAL git diff (since run start) as model-only context, and refuses the review (degrades to null) when that diff is empty — so a reviewer reviews what is actually ON DISK, never narrative-only claims. The diff does not change the resume cache key, so a reviewer still replays its verdict on resume. On a non-git checkout it is inert (the review runs with no diff). verifyDiff (FOR FIX/IMPLEMENT AGENTS) is a post-condition the engine checks AFTER the agent settles, against GIT/DISK truth — NOT the agent's self-report. verifyDiff:true (or {}) asserts the unit's git diff is non-empty (the agent actually wrote to disk); verifyDiff:{check:'<cmd>'} runs <cmd> (e.g. a test) and asserts exit 0. On failure the result is downgraded to null (so it re-runs on resume); it does NOT change the resume cache key. Best-effort: it proves something is on disk or a command passed, not that the work is correct. Inert on a non-git checkout.
 - pipeline(items, stage1, stage2, ...) → Promise<any[]> — run each item through all stages with NO barrier between stages: item A can be in stage 3 while item B is in stage 1. DEFAULT to this for multi-stage work. Each stage receives (prevResult, originalItem, index). A throwing stage drops that item to null.
 - parallel(thunks) → Promise<any[]> — run thunks (() => Promise) concurrently with a BARRIER: awaits all before returning; a failed thunk yields null, the call never rejects. Use ONLY when a later step genuinely needs ALL results together (dedup, cross-item comparison, early-exit on count).
 - phase(title) — start a progress group for subsequent agent() calls.
@@ -247,6 +257,17 @@ Lifetime cap of 1000 agent() calls per run (cached replays count); 4096 items ma
 ## Resume and saved workflows
 
 Every successful agent() result is journaled. Relaunch with resume_from_run_id and every agent() call whose (prompt, opts) key matches a journaled call replays from cache (instant, zero tokens), matched per-item by key + occurrence — independent of position, so editing one item still replays unchanged items (including expensive siblings) for free; only changed, new, and previously-failed calls run live. N byte-identical calls replay their N journaled results, then the N+1th runs live. Replay returns the FROZEN journaled result; a call that re-runs live may legitimately return a different answer — agents are non-deterministic. Same script + same args → full cache hit; failures are never cached (they re-run). Survives opencode restarts. Saved workflows live at .opencode/workflows/<name>.js (or .mjs) in the project and are invoked by name.
+
+## Patterns
+
+Six composable shapes — name the pattern in the script and the orchestration sharpens. Each is "spawn isolated agents, then combine"; mix them freely.
+
+- classify-and-act — one agent classifies the input, then branch/route to a specialist agent per class (or classify the OUTPUT at the end to shape it). Mixed backlogs, triage.
+- fan-out-and-synthesize — split into independent steps, agent() per step (clean context each, no cross-contamination), then a BARRIER synthesis step (parallel, then merge the structured outputs). Per-file audits, multi-angle research.
+- adversarial-verification — for each finding, spawn a SEPARATE agent whose only job is to refute it against a rubric; producer and skeptic never share a context, which kills self-preference. A finding survives only if the skeptic cannot knock it down. Security findings, factual claims. (The minimal example below is this shape.)
+- generate-and-filter — overgenerate N candidates, then a judge agent keeps only the rubric-passers. The generator and the judge MUST be different agents — a generator grading its own output is self-preference again. Naming, design exploration.
+- tournament — N agents attempt the SAME task with different approaches; a judge compares them PAIRWISE ("is A better than B?") until one wins — comparative judgment is more reliable than absolute 1–10 scoring. The deterministic JS loop holds the bracket; only the running order stays in context. Taste-based ranking, sorting 1000+ items. There is no tournament() primitive: use agent() + a plain loop — keeping the bracket in JS is exactly what preserves resume.
+- loop-until-done — for unknown-size work, loop spawning agents until a stop condition is met (no new findings for K rounds, no errors left in the logs) instead of a fixed pass count; pair with the budget guard as a ceiling. Bug hunts, log-driven root-cause.
 
 ## Minimal example
 

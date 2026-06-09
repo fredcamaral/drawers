@@ -55,6 +55,16 @@ interface Target {
 
 const TARGETS: Target[] = [
 	{
+		pkgDir: "packages/cadence",
+		entries: [
+			{
+				entry: "src/index.ts",
+				outName: "index.js",
+				external: SERVER_EXTERNALS,
+			},
+		],
+	},
+	{
 		pkgDir: "packages/background-agents",
 		entries: [
 			{

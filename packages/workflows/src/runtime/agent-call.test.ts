@@ -408,6 +408,38 @@ describe("createAgentPrimitive — structured output (schema)", () => {
 		expect(runner.launches[0]?.directory).toBe("/tmp/wt-abc");
 	});
 
+	test("opts.tools enables the named tools on launch (Task 2.1.1)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
+		const { agent } = harness({ runner });
+		await agent("research it", { tools: ["websearch", "webfetch"] });
+		expect(runner.launches[0]?.toolsOverride).toEqual({
+			websearch: true,
+			webfetch: true,
+		});
+	});
+
+	test("opts.tools composes with the structured-output override (Task 2.1.1)", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_t",
+			onLaunched: () => registry.store("ses_t", { n: 1 }),
+		});
+		const { agent } = harness({ runner, registry });
+		await agent("do it", { schema: SCHEMA, tools: ["websearch"] });
+		expect(runner.launches[0]?.toolsOverride).toEqual({
+			structured_output: true,
+			websearch: true,
+		});
+	});
+
+	test("no schema and no tools leaves toolsOverride absent (inert)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
+		const { agent } = harness({ runner });
+		await agent("do it");
+		expect(runner.launches[0]?.toolsOverride).toBeUndefined();
+	});
+
 	test("absent deps.directory leaves runner.launch directory undefined", async () => {
 		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
 		const { agent } = harness({ runner });

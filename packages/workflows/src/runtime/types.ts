@@ -23,6 +23,16 @@ export interface AgentOpts {
 	/** Custom subagent type from the same registry as the `Agent` tool. */
 	agentType?: string;
 	/**
+	 * Tool names to ENABLE for this spawned agent (Epic 2.1) — e.g. web
+	 * search/fetch for a research agent. Each name is forwarded as a
+	 * `toolsOverride` flag onto the launch and composes with the structured-
+	 * output override when a `schema` is also set. Names are ENVIRONMENT-
+	 * DEPENDENT (the platform/MCP servers decide them; this package defines
+	 * none); an unknown name is a no-op at the platform layer. Empty or absent →
+	 * the agent inherits the session's tools, fully inert.
+	 */
+	tools?: string[];
+	/**
 	 * Inject the engine-computed REAL git diff (since run start) as model-only
 	 * context, and refuse the review when that diff is genuinely empty (Epic 4.1).
 	 * Opt-in; absent → today's behavior. For REVIEW agents: a reviewer of narrative-

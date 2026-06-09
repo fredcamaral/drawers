@@ -70,9 +70,14 @@ import {
 	type Checkpointer,
 	createGitCheckpointer,
 } from "./git-checkpoint";
+import { BUILTIN_WORKFLOWS } from "./builtins";
 import { createWorktreeManager, type WorktreeManager } from "./git-worktree";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
+import {
+	type RunLookup,
+	saveRunAsWorkflow,
+} from "./tools/workflow-save";
 import {
 	createSessionStatsCollector,
 	type SessionStatsCollector,
@@ -541,6 +546,7 @@ export function createWorkflowEngine(
 	const resolveSubWorkflow = createSourceResolver({
 		directory: opts.directory,
 		fs,
+		builtins: BUILTIN_WORKFLOWS,
 	});
 
 	/** The journal file path for a runId (under the journals subdir). */
@@ -625,11 +631,10 @@ export function createWorkflowEngine(
 	// Engine-owned per-agent worktree manager (Epic H.1.6). Constructed ONCE from the
 	// host `$` bound to the project root (sibling to the checkpointer's shared probe),
 	// then threaded through every run's WorkflowRunDeps → AgentPrimitiveDeps so the
-	// future isolation mint-point (Epic H.1.2) can reach it. ABSENT shell → a documented
-	// no-op (`create` returns null), so isolation requests degrade-to-null as today
-	// (Epic 0.4). The manager probes the work-tree lazily on first use (its own latch),
-	// so no extra startup probe is needed here. UNUSED today — this task wires the handle
-	// only (no behavior change until H.1.2 consumes it).
+	// isolation mint-point (Epic H.1.2) calls it at the `isolation:'worktree'` seam. An ABSENT shell → a documented
+	// no-op (`create` returns null), so isolation requests degrade-to-null on a
+	// no-shell engine. The manager probes the work-tree lazily on first use (its own latch),
+	// so no extra startup probe is needed here.
 	const worktreeManager: WorktreeManager = createWorktreeManager({
 		shell: opts.shell,
 		directory: opts.directory,
@@ -700,6 +705,28 @@ export function createWorkflowEngine(
 				});
 			}
 			stopRun(runId);
+		},
+		// Save the run's script as a named workflow (Epic 4.2). The TUI viewer drops
+		// a `<runId>.save` sentinel whose body is the name; we reuse the same shared,
+		// validated path as the `workflow_save_run` tool. The channel is one-way, so
+		// the outcome is logged here (the viewer toasts optimistically on keypress).
+		onSave: async (runId, name) => {
+			const lookup: RunLookup = { statusOf: (id) => runs.get(id), runs };
+			const result = await saveRunAsWorkflow(
+				{ engine: lookup, fs, directory: opts.directory },
+				{ runId, name },
+			);
+			if (result.ok) {
+				logger?.info?.(`saved run ${runId} as workflow "${name}"`, {
+					runId,
+					path: result.path,
+				});
+			} else {
+				logger?.warn?.(`save of run ${runId} as "${name}" refused`, {
+					runId,
+					reason: result.error,
+				});
+			}
 		},
 	});
 	control.start();
