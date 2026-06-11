@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/fredcamaral/opencode-drawers/compare/v1.4.0...v1.4.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **core:** make SDK errors throw, harden the task lifecycle, and type the shared seam ([1bfd4c0](https://github.com/fredcamaral/opencode-drawers/commit/1bfd4c0784b20caa1903e383dca7e9bff13e3900))
+
 # [1.4.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.3.0...v1.4.0) (2026-06-11)
 
 
