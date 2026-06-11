@@ -1,3 +1,11 @@
+# [1.5.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.4.1...v1.5.0) (2026-06-11)
+
+
+### Features
+
+* **statusline:** add opencode-drawer-statusline plugin ([963fe82](https://github.com/fredcamaral/opencode-drawers/commit/963fe826fc78c074d2009877dfb3a7c107f9f723))
+* **workflows:** add shell() primitive to runtime API ([71cb36b](https://github.com/fredcamaral/opencode-drawers/commit/71cb36bb55f39e3d20ce4648fe9620cc7eca7d4b))
+
 ## [1.4.1](https://github.com/fredcamaral/opencode-drawers/compare/v1.4.0...v1.4.1) (2026-06-11)
 
 

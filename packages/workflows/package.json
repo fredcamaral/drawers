@@ -1,6 +1,6 @@
 {
 	"name": "opencode-drawer-workflows",
-	"version": "1.4.1",
+	"version": "1.5.0",
 	"description": "Deterministic multi-agent workflows for OpenCode — script agent/pipeline/parallel/phase with journaled replay, plus a native /workflows-style TUI viewer.",
 	"type": "module",
 	"license": "MIT",

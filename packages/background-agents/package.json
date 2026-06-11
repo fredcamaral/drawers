@@ -1,6 +1,6 @@
 {
 	"name": "opencode-drawer-agents",
-	"version": "1.4.1",
+	"version": "1.5.0",
 	"description": "Fire-and-forget background agents for OpenCode — bg_task/bg_output/bg_cancel/bg_list over a race-correct completion gate.",
 	"type": "module",
 	"license": "MIT",
