@@ -7,7 +7,7 @@
 	],
 	"scripts": {
 		"test": "bun test",
-		"typecheck": "bunx tsc --noEmit -p packages/core && bunx tsc --noEmit -p packages/background-agents && bunx tsc --noEmit -p packages/workflows && bunx tsc --noEmit -p packages/workflows/tsconfig.tui.json && bunx tsc --noEmit -p packages/cadence",
+		"typecheck": "bunx tsc --noEmit -p packages/core && bunx tsc --noEmit -p packages/background-agents && bunx tsc --noEmit -p packages/workflows && bunx tsc --noEmit -p packages/workflows/tsconfig.tui.json && bunx tsc --noEmit -p packages/cadence && bunx tsc --noEmit -p packages/statusline && bunx tsc --noEmit -p packages/statusline/tsconfig.tui.json",
 		"lint": "biome check .",
 		"build": "bun run scripts/build.ts",
 		"release:prepare": "bun run scripts/release-prepare.ts",

@@ -95,6 +95,22 @@ const TARGETS: Target[] = [
 			},
 		],
 	},
+	{
+		pkgDir: "packages/statusline",
+		entries: [
+			{
+				entry: "src/index.ts",
+				outName: "index.js",
+				external: SERVER_EXTERNALS,
+			},
+			{
+				entry: "src/tui/index.tsx",
+				outName: "tui.js",
+				external: [...SERVER_EXTERNALS, ...TUI_PEER_EXTERNALS],
+				plugins: [solidPlugin],
+			},
+		],
+	},
 ];
 
 let failed = false;

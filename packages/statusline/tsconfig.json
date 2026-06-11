@@ -1,0 +1,6 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"include": ["src"],
+	"// jsx note": "the `src/tui` surface (the `./tui` plugin) is type-checked by tsconfig.tui.json (jsx:preserve + jsxImportSource @opentui/solid). It is excluded here because its `.tsx` files need the jsx setting the base config deliberately omits.",
+	"exclude": ["src/tui"]
+}
