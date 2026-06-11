@@ -1,3 +1,37 @@
+# [1.4.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.3.0...v1.4.0) (2026-06-11)
+
+
+### Bug Fixes
+
+* **background-agents:** coalesce undefined transcript part text in bg_output ([8ade99f](https://github.com/fredcamaral/opencode-drawers/commit/8ade99f2e38b7ec940fdcdc41372171045a551c9))
+* **background-agents:** point smoke harness at the engine's tasks store leaf ([2d08778](https://github.com/fredcamaral/opencode-drawers/commit/2d087786b9ee084a4b44aea00525ec14efa60e23))
+* **background-agents:** surface failed parent-transcript fetch instead of forking blind ([55bd6b0](https://github.com/fredcamaral/opencode-drawers/commit/55bd6b0a9cced6b898ca14c4069c0426686c1a25))
+* **cadence:** require an arming baseline and honor dispose mid-await ([670516c](https://github.com/fredcamaral/opencode-drawers/commit/670516cbfe795677bca05221443dbd248e047905))
+* **cadence:** validate numeric fields in load() so the iteration cap holds ([1726c4f](https://github.com/fredcamaral/opencode-drawers/commit/1726c4f65925bb8d6e82bebca7445673df7bd3e4))
+* **cadence:** wire the SDK client through core's adaptSdkClient ([43797f0](https://github.com/fredcamaral/opencode-drawers/commit/43797f0235794f26ca1300b21e576e0a5e839754))
+* **core:** release the slot when cancel races an immediate acquire ([9fe2cc1](https://github.com/fredcamaral/opencode-drawers/commit/9fe2cc1587630680ab9b2c3ee1d21d0182ff3ecf))
+* **core:** tear down the slot on promote-to-running persist failure; distinguish queue-timeout cancels ([98e77f3](https://github.com/fredcamaral/opencode-drawers/commit/98e77f32a7b661e6b7ddb91feee712db9b3081f4))
+* **workflows:** drop cosmetic label/phase from agent cache key ([fa466c9](https://github.com/fredcamaral/opencode-drawers/commit/fa466c98d00e7ff3fbbfcd46cafdd73bfe6c1fdf))
+* **workflows:** guard TUI token math against partial feed tokens ([876d355](https://github.com/fredcamaral/opencode-drawers/commit/876d35560d0f4e796166006bf87542a047de0520))
+* **workflows:** harden git-truth seam, rolling-wave gates, and skills injection ([9ef6fb1](https://github.com/fredcamaral/opencode-drawers/commit/9ef6fb1be06f51b3e61ea45ee0b8f111ec7b0ff6))
+
+
+### Features
+
+* **cadence:** add the loop and goal orchestration plugin ([ca326d0](https://github.com/fredcamaral/opencode-drawers/commit/ca326d0c6b8ffad7a588def6ff7b816a86a866eb))
+* **core:** add optional stat/lstat/realpath to FsFacade ([5f5f8bb](https://github.com/fredcamaral/opencode-drawers/commit/5f5f8bb1f45e37c7b55b8d17d7d75c747d3994c3))
+* **workflows:** add skills injection, run digest, and TUI details ([0faa7f5](https://github.com/fredcamaral/opencode-drawers/commit/0faa7f549b8bec7d163d8a71ac0ad19f874fe90d))
+* **workflows:** ground engine results in git truth and isolate verified agents ([5d95229](https://github.com/fredcamaral/opencode-drawers/commit/5d95229699b770537d1f45c087b595d751c5fb51))
+* **workflows:** name the six patterns, ship deep-research, save runs as commands ([24d6052](https://github.com/fredcamaral/opencode-drawers/commit/24d6052f1e654137f480839c55b1c08e025f8dc6))
+* **workflows:** teach LLM-authored scripts to use the git-truth review API ([c3214ec](https://github.com/fredcamaral/opencode-drawers/commit/c3214ec12ade8ca19ddfbd5434036954de8839a3))
+
+
+### Performance Improvements
+
+* **core:** index tasks by session id for O(1) gate lookup ([5b12dd0](https://github.com/fredcamaral/opencode-drawers/commit/5b12dd0a8d6047f295a8b4d7055c038fcd32b674)), closes [hi#frequency](https://github.com/hi/issues/frequency)
+* **core:** prune notify dedup keys on flush ([46d30ce](https://github.com/fredcamaral/opencode-drawers/commit/46d30cecf87ed6d25533f8eab9b396f51ab19df3))
+* **workflows:** index live runs by parentSessionID for the digest hot path ([de50f10](https://github.com/fredcamaral/opencode-drawers/commit/de50f10017173a96276b95f42773ca9ff3cc9463))
+
 # [1.3.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.2.0...v1.3.0) (2026-06-09)
 
 
