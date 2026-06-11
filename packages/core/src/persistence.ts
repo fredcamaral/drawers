@@ -18,11 +18,14 @@
 
 import {
 	appendFile,
+	lstat,
 	mkdir,
 	readdir,
 	readFile,
+	realpath,
 	rename,
 	rm,
+	stat,
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -50,6 +53,28 @@ export interface FsFacade {
 	 * the type.
 	 */
 	appendFile?(path: string, data: string, enc: "utf-8"): Promise<void>;
+	/**
+	 * Optional stat probe (follows symlinks). The workflows engine's `probePath`
+	 * already reached this on the production node facade via a structural cast —
+	 * this member formalizes that exact shape (same signature, so the cast keeps
+	 * working). In-memory test facades may omit it; callers must fall back.
+	 */
+	stat?(path: string): Promise<{ isDirectory(): boolean }>;
+	/**
+	 * Optional lstat probe (does NOT follow symlinks) — lets a directory walk
+	 * tell a symlink from a real entry. Optional like {@link stat}.
+	 */
+	lstat?(path: string): Promise<{
+		isDirectory(): boolean;
+		isSymbolicLink(): boolean;
+	}>;
+	/**
+	 * Optional canonical-path resolution. A recursive walk uses it to keep a
+	 * visited-set of REAL paths, turning a cyclic symlink into a no-op revisit
+	 * instead of an unbounded recursion. Facades without it must rely on a
+	 * depth cap instead.
+	 */
+	realpath?(path: string): Promise<string>;
 }
 
 const defaultFs: FsFacade = {
@@ -60,6 +85,9 @@ const defaultFs: FsFacade = {
 	rename: (from, to) => rename(from, to),
 	rm: (path, opts) => rm(path, opts),
 	appendFile: (path, data, enc) => appendFile(path, data, enc),
+	stat: (path) => stat(path),
+	lstat: (path) => lstat(path),
+	realpath: (path) => realpath(path),
 };
 
 export interface TaskStoreLogger {
