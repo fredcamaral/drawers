@@ -1,23 +1,27 @@
 {
-	"name": "opencode-drawers",
+	"name": "drawers",
 	"private": true,
 	"type": "module",
 	"workspaces": [
-		"packages/*"
+		"packages/*/*"
 	],
 	"scripts": {
 		"test": "bun test",
-		"typecheck": "bunx tsc --noEmit -p packages/core && bunx tsc --noEmit -p packages/background-agents && bunx tsc --noEmit -p packages/workflows && bunx tsc --noEmit -p packages/workflows/tsconfig.tui.json && bunx tsc --noEmit -p packages/cadence && bunx tsc --noEmit -p packages/statusline && bunx tsc --noEmit -p packages/statusline/tsconfig.tui.json",
+		"typecheck": "bunx tsc --noEmit -p packages/opencode/core && bunx tsc --noEmit -p packages/opencode/background-agents && bunx tsc --noEmit -p packages/opencode/workflows && bunx tsc --noEmit -p packages/opencode/workflows/tsconfig.tui.json && bunx tsc --noEmit -p packages/opencode/cadence && bunx tsc --noEmit -p packages/opencode/statusline && bunx tsc --noEmit -p packages/opencode/statusline/tsconfig.tui.json && bunx tsc --noEmit -p packages/pi/statusline && bunx tsc --noEmit -p packages/pi/core && bunx tsc --noEmit -p packages/pi/cadence && bunx tsc --noEmit -p packages/pi/background-agents && bunx tsc --noEmit -p packages/pi/workflows",
 		"lint": "biome check .",
 		"build": "bun run scripts/build.ts",
 		"release:prepare": "bun run scripts/release-prepare.ts",
 		"release:publish": "bun run scripts/release-publish.ts",
-		"smoke": "bun packages/core/test-harness/run-smoke.ts",
-		"smoke:agents": "bun packages/background-agents/test-harness/run-smoke.ts",
-		"smoke:workflows": "bun run packages/workflows/test-harness/run-smoke.ts"
+		"smoke": "bun packages/opencode/core/test-harness/run-smoke.ts",
+		"smoke:agents": "bun packages/opencode/background-agents/test-harness/run-smoke.ts",
+		"smoke:workflows": "bun run packages/opencode/workflows/test-harness/run-smoke.ts",
+		"smoke:pi-runner": "PI_RUNNER_SMOKE=1 bun run packages/pi/core/test-harness/run-runner-smoke.ts",
+		"smoke:pi-agents": "PI_AGENTS_SMOKE=1 bun run packages/pi/background-agents/test-harness/run-agents-smoke.ts",
+		"smoke:pi-workflows": "PI_WORKFLOWS_SMOKE=1 bun run packages/pi/workflows/test-harness/run-workflows-smoke.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.4.16",
+		"@earendil-works/pi-coding-agent": "0.79.3",
 		"@opentui/solid": "0.3.2",
 		"@semantic-release/changelog": "6.0.3",
 		"@semantic-release/exec": "7.1.0",

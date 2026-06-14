@@ -55,7 +55,7 @@ interface Target {
 
 const TARGETS: Target[] = [
 	{
-		pkgDir: "packages/cadence",
+		pkgDir: "packages/opencode/cadence",
 		entries: [
 			{
 				entry: "src/index.ts",
@@ -65,7 +65,7 @@ const TARGETS: Target[] = [
 		],
 	},
 	{
-		pkgDir: "packages/background-agents",
+		pkgDir: "packages/opencode/background-agents",
 		entries: [
 			{
 				entry: "src/index.ts",
@@ -75,7 +75,7 @@ const TARGETS: Target[] = [
 		],
 	},
 	{
-		pkgDir: "packages/workflows",
+		pkgDir: "packages/opencode/workflows",
 		entries: [
 			{
 				entry: "src/plugin/index.ts",
@@ -96,7 +96,7 @@ const TARGETS: Target[] = [
 		],
 	},
 	{
-		pkgDir: "packages/statusline",
+		pkgDir: "packages/opencode/statusline",
 		entries: [
 			{
 				entry: "src/index.ts",

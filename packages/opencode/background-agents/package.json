@@ -1,0 +1,36 @@
+{
+	"name": "opencode-drawer-agents",
+	"version": "1.5.0",
+	"description": "Fire-and-forget background agents for OpenCode — bg_task/bg_output/bg_cancel/bg_list over a race-correct completion gate.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/fredcamaral/drawers.git",
+		"directory": "packages/opencode/background-agents"
+	},
+	"keywords": [
+		"opencode",
+		"opencode-plugin",
+		"agents",
+		"background"
+	],
+	"exports": {
+		".": "./dist/index.js"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"dependencies": {
+		"@opencode-ai/plugin": "1.16.2"
+	},
+	"devDependencies": {
+		"@drawers/core": "workspace:*",
+		"@opencode-ai/sdk": "1.16.2",
+		"bun-types": "1.3.14"
+	}
+}

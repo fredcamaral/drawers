@@ -1,0 +1,65 @@
+{
+	"name": "opencode-drawer-workflows",
+	"version": "1.5.0",
+	"description": "Deterministic multi-agent workflows for OpenCode — script agent/pipeline/parallel/phase with journaled replay, plus a native /workflows-style TUI viewer.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/fredcamaral/drawers.git",
+		"directory": "packages/opencode/workflows"
+	},
+	"keywords": [
+		"opencode",
+		"opencode-plugin",
+		"workflows",
+		"agents",
+		"tui"
+	],
+	"exports": {
+		".": "./dist/index.js",
+		"./lib": "./dist/lib.js",
+		"./tui": "./dist/tui.js"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"dependencies": {
+		"@opencode-ai/plugin": "1.16.2",
+		"acorn": "8.16.0",
+		"ajv": "8.20.0"
+	},
+	"peerDependencies": {
+		"@opentui/core": "0.3.2",
+		"@opentui/keymap": "0.3.2",
+		"@opentui/solid": "0.3.2",
+		"solid-js": "1.9.12"
+	},
+	"peerDependenciesMeta": {
+		"@opentui/core": {
+			"optional": true
+		},
+		"@opentui/keymap": {
+			"optional": true
+		},
+		"@opentui/solid": {
+			"optional": true
+		},
+		"solid-js": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@drawers/core": "workspace:*",
+		"@opencode-ai/sdk": "1.16.2",
+		"@opentui/core": "0.3.2",
+		"@opentui/keymap": "0.3.2",
+		"@opentui/solid": "0.3.2",
+		"bun-types": "1.3.14",
+		"solid-js": "1.9.12"
+	}
+}
