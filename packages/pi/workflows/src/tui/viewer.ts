@@ -85,13 +85,6 @@ const FEED_SUFFIX = ".jsonl";
  */
 const RUN_POLL_MS = 1500;
 
-/**
- * How often the header's relative-age segment (`· 3m`) re-ticks. The reducer holds no
- * clock, so the viewer owns "now": a 1s interval bumps `nowMs` and re-renders, advancing
- * the age while a run sits idle. 1s is the finest band {@link formatRelativeTime} shows.
- */
-const NOW_TICK_MS = 1000;
-
 /** Tree pane is ~3/5 of the width (opencode `flexGrow={3}` of 5); detail gets the rest. */
 const TREE_FRACTION = 3 / 5;
 
@@ -477,13 +470,10 @@ export class WorkflowsViewer implements Component {
 	private selected = 0;
 	/** Auto-follow latch: false → follow the running agent; the first ↑/↓ flips it true. */
 	private userHasScrolled = false;
-	/** "Now" for the header relative-age segment, ticked on `NOW_TICK_MS`. */
-	private nowMs = Date.now();
 	/** Manual tree scroll offset (replaces opentui `<scrollbox>` `scrollTop`). */
 	private scrollTop = 0;
 
 	private pollTimer: ReturnType<typeof setInterval> | undefined;
-	private nowTimer: ReturnType<typeof setInterval> | undefined;
 	/**
 	 * Set in `dispose`. `openRun`'s async `tailer.start()` awaits; if the viewer is
 	 * disposed mid-await, this lets the started tailer be stopped after the await.
@@ -505,7 +495,7 @@ export class WorkflowsViewer implements Component {
 		this.start();
 	}
 
-	/** Resolve the first run + arm the dir poll + the now tick (port of opencode `onMount`). */
+	/** Resolve the first run + arm the dir poll (port of opencode `onMount`). */
 	private start(): void {
 		void (async () => {
 			await this.refreshRuns();
@@ -520,17 +510,16 @@ export class WorkflowsViewer implements Component {
 			}
 			this.openRun(id);
 		})();
-		// Poll the dir so a run started in ANOTHER session shows up in `←/→` live.
+		// Poll the dir so a run started in ANOTHER session shows up in `←/→` live. The
+		// poll only re-renders when the run LIST actually changed (see refreshRuns) —
+		// a metronomic re-render would force a full screen clear whenever the viewer
+		// over-renders past the viewport (the header sits above the fold), the exact
+		// per-second flicker the removed now-tick caused. "Now" is read fresh inside
+		// render() instead, so the header age stays current without a timer.
 		this.pollTimer = setInterval(() => {
 			void this.refreshRuns();
 		}, RUN_POLL_MS);
 		(this.pollTimer as { unref?: () => void }).unref?.();
-		// Advance "now" so the header age re-renders on a live run with no new events.
-		this.nowTimer = setInterval(() => {
-			this.nowMs = Date.now();
-			this.tui.requestRender();
-		}, NOW_TICK_MS);
-		(this.nowTimer as { unref?: () => void }).unref?.();
 	}
 
 	/**
@@ -573,8 +562,15 @@ export class WorkflowsViewer implements Component {
 		if (this.disposed) {
 			return;
 		}
+		// Only re-render when the LIST actually changed — an unchanged poll must not
+		// force a repaint (and, given the over-render geometry, a full screen clear).
+		const changed =
+			ids.length !== this.runIds.length ||
+			ids.some((id, i) => id !== this.runIds[i]);
 		this.runIds = ids;
-		this.tui.requestRender();
+		if (changed) {
+			this.tui.requestRender();
+		}
 	}
 
 	/** `←/→` step through `runIds` (freshest at 0), clamped — opening the landed run. */
@@ -716,6 +712,9 @@ export class WorkflowsViewer implements Component {
 
 	render(width: number): string[] {
 		const theme = this.theme;
+		// "Now" is read at paint time (no metronomic timer): the header age is current
+		// whenever a real event or input triggers a render, with zero idle repaints.
+		const nowMs = Date.now();
 		const view = this.reducer.state();
 		const agents = flatAgents(view);
 		const followed = clamp(
@@ -746,7 +745,7 @@ export class WorkflowsViewer implements Component {
 				this.runId,
 				runIndex,
 				this.runIds.length,
-				this.nowMs,
+				nowMs,
 				width,
 			),
 		);
@@ -836,10 +835,6 @@ export class WorkflowsViewer implements Component {
 		if (this.pollTimer !== undefined) {
 			clearInterval(this.pollTimer);
 			this.pollTimer = undefined;
-		}
-		if (this.nowTimer !== undefined) {
-			clearInterval(this.nowTimer);
-			this.nowTimer = undefined;
 		}
 	}
 }
