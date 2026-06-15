@@ -1,3 +1,18 @@
+# [1.6.0](https://github.com/fredcamaral/drawers/compare/v1.5.0...v1.6.0) (2026-06-15)
+
+
+### Bug Fixes
+
+* **workflows/pi:** stop the /workflows viewer repainting every second ([b2a9e78](https://github.com/fredcamaral/drawers/commit/b2a9e7845e9375546514456235e8c7ac2be7b8d9))
+* **workflows:** collapse checkpoint commits to baseline on success ([ef5a332](https://github.com/fredcamaral/drawers/commit/ef5a332cd6e75e701f707a696744bdfa2d948793))
+
+
+### Features
+
+* add multiple core pi extensions and update plugin dev skill ([a2eb48a](https://github.com/fredcamaral/drawers/commit/a2eb48ad3b22db12d7040a39c3c18c9211a32235))
+* **ci:** publish the pi packages to npm ([551b261](https://github.com/fredcamaral/drawers/commit/551b261efdc604d0a78303e35cb2d6fb3a4c6259))
+* **pi:** port the drawer plugin suite to pi ([2b7b3cb](https://github.com/fredcamaral/drawers/commit/2b7b3cb71488e00e031a8ab300b33556c658abe3))
+
 # [1.5.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.4.1...v1.5.0) (2026-06-11)
 
 

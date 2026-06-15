@@ -1,6 +1,6 @@
 {
 	"name": "pi-drawer-cadence",
-	"version": "0.1.0",
+	"version": "1.6.0",
 	"description": "Session-level orchestration for pi — loop (interval-driven re-prompts) and goal (completion gating).",
 	"type": "module",
 	"license": "MIT",

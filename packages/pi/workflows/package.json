@@ -1,6 +1,6 @@
 {
 	"name": "pi-drawer-workflows",
-	"version": "0.1.0",
+	"version": "1.6.0",
 	"description": "Deterministic multi-agent orchestration for pi — author a workflow as JavaScript that fans out child pi sessions, runs barriers and conditionals, and returns schema-conforming results.",
 	"type": "module",
 	"license": "MIT",

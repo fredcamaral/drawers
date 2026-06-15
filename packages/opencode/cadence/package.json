@@ -1,6 +1,6 @@
 {
 	"name": "opencode-drawer-cadence",
-	"version": "1.1.0",
+	"version": "1.6.0",
 	"description": "Session-level orchestration for OpenCode — loop (interval-driven re-prompts) and goal (idle-driven completion gating).",
 	"type": "module",
 	"license": "MIT",

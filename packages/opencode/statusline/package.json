@@ -1,6 +1,6 @@
 {
 	"name": "opencode-drawer-statusline",
-	"version": "0.1.0",
+	"version": "1.6.0",
 	"description": "A compact prompt status line for OpenCode — directory, worktree, branch, session status, and OpenCode version under every prompt.",
 	"type": "module",
 	"license": "MIT",

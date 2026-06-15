@@ -1,6 +1,6 @@
 {
 	"name": "pi-drawer-agents",
-	"version": "0.1.0",
+	"version": "1.6.0",
 	"description": "Fire-and-forget background agents for pi — launch a task in a child pi session and pull its output later, without blocking the main loop.",
 	"type": "module",
 	"license": "MIT",
