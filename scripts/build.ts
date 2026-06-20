@@ -1,5 +1,11 @@
 /**
- * Publish bundler for the two opencode plugins.
+ * Publish bundler for the opencode plugins (cadence, background-agents,
+ * workflows, statusline).
+ *
+ * pi plugins are intentionally absent: pi loads their `.ts` source directly via
+ * jiti, so there is nothing to bundle — `bun install` links them as workspaces
+ * and `bun run typecheck` is their build gate. Only opencode bundles, because its
+ * private `@drawers/core` engine must be inlined for the published tarball.
  *
  * `@drawers/core` is npm-private (never published) so it is INLINED into each
  * plugin's bundle; every real npm dependency is EXTERNAL (npm installs it). The
